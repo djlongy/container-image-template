@@ -190,6 +190,80 @@ targets, switched by one variable.
 | `PROD_PUSH_REGISTRY_USER` | Prod push user |
 | `PROD_PUSH_REGISTRY_PASSWORD` | Prod push password (masked) |
 
+### Closed-network / air-gap deployment
+
+Every runtime dependency the pipeline downloads is variable-driven,
+with defaults pointing at public sources (Docker Hub, GitHub releases,
+dl-cdn.alpinelinux.org). In a closed network where runners have no
+direct internet access, override the variables below to point at
+internal Artifactory / Nexus mirrors. Nothing else in the pipeline
+needs to change.
+
+**1. Job container images** — pulled by the GitLab runner / Bamboo
+agent for each stage. Must come from your Docker Hub proxy:
+
+| Variable | Default | Example override |
+|---|---|---|
+| `DOCKER_CLI_IMAGE` | `docker:27-cli` | `dockerhub.artifactory.example.com/library/docker:27-cli` |
+| `DOCKER_DIND_IMAGE` | `docker:27-dind` | `dockerhub.artifactory.example.com/library/docker:27-dind` |
+| `ALPINE_IMAGE` | `alpine:3.20` | `dockerhub.artifactory.example.com/library/alpine:3.20` |
+
+**2. Upstream base image** — pulled by `docker buildx` inside the
+build stage. Set via the existing `UPSTREAM_REGISTRY` variable:
+
+```
+UPSTREAM_REGISTRY=dockerhub.artifactory.example.com/library
+UPSTREAM_IMAGE=nginx
+# Dockerfile's FROM resolves to:
+#   dockerhub.artifactory.example.com/library/nginx:${UPSTREAM_TAG}
+```
+
+**3. Alpine apk packages** — both inside the Dockerfile's remediate
+stage AND inside the CI job containers that need `apk add bash git
+curl …`. Single variable covers both:
+
+| Variable | Default | Example override |
+|---|---|---|
+| `APK_MIRROR` | (unset → dl-cdn) | `https://nexus.example.com/repository/alpine-proxy` |
+
+When set, `sed` rewrites `/etc/apk/repositories` before any `apk`
+command, preserving `v3.20/main`, `v3.20/community`, etc.
+
+**4. Tool binaries** (crane, buildx, syft, grype, cosign, jf) — most
+closed networks whitelist `github.com` releases and
+`raw.githubusercontent.com`, so the defaults often work untouched. If
+your network blocks those too, override each URL to point at an
+Artifactory generic repo that mirrors the binary:
+
+| Variable | Default |
+|---|---|
+| `BUILDX_URL` | `https://github.com/docker/buildx/releases/download/v0.17.1/buildx-v0.17.1.linux-amd64` |
+| `CRANE_URL` | `https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz` |
+| `SYFT_INSTALLER_URL` | `https://raw.githubusercontent.com/anchore/syft/main/install.sh` |
+| `GRYPE_INSTALLER_URL` | `https://raw.githubusercontent.com/anchore/grype/main/install.sh` |
+| `COSIGN_URL` | `https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64` |
+| `JF_INSTALLER_URL` | `https://install-cli.jfrog.io` |
+
+**5. Nothing else.** The pipeline does not call any other network
+endpoint at runtime. Git checkout comes from GitLab itself (already
+on your internal network), `cosign sign` talks to your registry (not
+Sigstore — `--tlog-upload=false` is set), and SBOM ingestion talks
+only to whichever sink you configured (`ARTIFACTORY_SBOM_REPO`
+reuses the push credentials).
+
+**Suggested closed-network group CI variable block** (paste into
+GitLab group settings → CI/CD → Variables; all are `raw=true` so
+GitLab doesn't mangle `$` references):
+
+```
+DOCKER_CLI_IMAGE      = dockerhub.artifactory.example.com/library/docker:27-cli
+DOCKER_DIND_IMAGE     = dockerhub.artifactory.example.com/library/docker:27-dind
+ALPINE_IMAGE          = dockerhub.artifactory.example.com/library/alpine:3.20
+UPSTREAM_REGISTRY     = dockerhub.artifactory.example.com/library
+APK_MIRROR            = https://artifactory.example.com/artifactory/alpine-proxy
+# Tool URLs optional if GitHub is whitelisted; override per above table if not.
+```
+
 ## Pipeline flow
 
 ```

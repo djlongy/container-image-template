@@ -81,23 +81,58 @@ variables:
   # don't mount /certs/client between dind service and job container.
   DOCKER_HOST: tcp://docker:2375
   DOCKER_TLS_CERTDIR: ""
-  # Buildx enables dynamic OCI labels (base.digest, source, etc.).
   DOCKER_BUILDKIT: "1"
-  BUILDX_VERSION: "v0.17.1"
-  # Tool versions — pin explicitly, pulled via curl in before_script.
+
+  # ── Closed-network / air-gap configuration ──────────────────────
+  # Every runtime dependency below can be overridden via CI variables
+  # at group or project level. Defaults point at public sources so
+  # fresh clones with internet access work out of the box. In a
+  # closed network, override them to point at internal mirrors.
+  #
+  # 1) Docker images pulled by GitLab for the job containers.
+  #    In a closed network, set these to your Artifactory proxy:
+  #      DOCKER_CLI_IMAGE: dockerhub.artifactory.example.com/library/docker:27-cli
+  #      DOCKER_DIND_IMAGE: dockerhub.artifactory.example.com/library/docker:27-dind
+  #      ALPINE_IMAGE: dockerhub.artifactory.example.com/library/alpine:3.20
+  DOCKER_CLI_IMAGE: "docker:27-cli"
+  DOCKER_DIND_IMAGE: "docker:27-dind"
+  ALPINE_IMAGE: "alpine:3.20"
+
+  # 2) Tool binary download URLs. In most closed networks, GitHub
+  #    releases are whitelisted so these defaults just work —
+  #    Docker Hub is the common blocker, not github.com. Override
+  #    here if your network also blocks GitHub and you've mirrored
+  #    the binaries to an Artifactory generic repo.
+  BUILDX_URL: "https://github.com/docker/buildx/releases/download/v0.17.1/buildx-v0.17.1.linux-amd64"
+  CRANE_URL: "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz"
+  SYFT_INSTALLER_URL: "https://raw.githubusercontent.com/anchore/syft/main/install.sh"
   SYFT_VERSION: "v1.14.0"
+  GRYPE_INSTALLER_URL: "https://raw.githubusercontent.com/anchore/grype/main/install.sh"
   GRYPE_VERSION: "v0.82.0"
-  COSIGN_VERSION: "v2.4.1"
-  CRANE_VERSION: "v0.20.2"
+  COSIGN_URL: "https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64"
+  JF_INSTALLER_URL: "https://install-cli.jfrog.io"
+
+  # 3) Alpine package mirror. Replaces dl-cdn.alpinelinux.org in
+  #    /etc/apk/repositories for every `apk add` / `apk upgrade` call
+  #    in the pipeline (both CI-stage tool installs and the build's
+  #    remediate stage). Set to your Artifactory/Nexus raw-proxy URL
+  #    for dl-cdn.alpinelinux.org/alpine. Version paths (v3.20/main,
+  #    v3.20/community, …) are preserved automatically.
+  #      APK_MIRROR: https://nexus.example.com/repository/alpine-proxy
+  APK_MIRROR: ""
 
 # ── Shared before_script: install tools used by most jobs ──────────
 .install-tools: &install-tools
+  - |
+    # Apply the APK mirror rewrite before any apk command runs.
+    if [ -n "${APK_MIRROR:-}" ]; then
+      sed -i "s|https\?://dl-cdn.alpinelinux.org/alpine|${APK_MIRROR}|g" /etc/apk/repositories
+    fi
   - apk add --no-cache bash git curl openssl jq
   - |
     # crane — used by build.sh for base digest + by promote for crane copy
     if ! command -v crane >/dev/null 2>&1; then
-      curl -sL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
-        | tar xz -C /usr/local/bin/ crane
+      curl -sL "${CRANE_URL}" | tar xz -C /usr/local/bin/ crane
     fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -105,17 +140,16 @@ variables:
 # ═══════════════════════════════════════════════════════════════════
 build:
   stage: build
-  image: docker:27-cli
+  image: ${DOCKER_CLI_IMAGE}
   services:
-    - name: docker:27-dind
+    - name: ${DOCKER_DIND_IMAGE}
       alias: docker
   before_script:
     - *install-tools
     # buildx plugin for docker:27-cli (not shipped by default)
     - |
       mkdir -p /root/.docker/cli-plugins
-      curl -sL -o /root/.docker/cli-plugins/docker-buildx \
-        "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-amd64"
+      curl -sL -o /root/.docker/cli-plugins/docker-buildx "${BUILDX_URL}"
       chmod +x /root/.docker/cli-plugins/docker-buildx
       docker buildx version
   script:
@@ -130,7 +164,7 @@ build:
     - |
       if [ "${REGISTRY_KIND:-}" = "artifactory" ]; then
         if ! command -v jf >/dev/null 2>&1; then
-          curl -fL https://install-cli.jfrog.io | sh
+          curl -fL "${JF_INSTALLER_URL}" | sh
           mv jf /usr/local/bin/ 2>/dev/null || true
         fi
         jf --version
@@ -163,7 +197,7 @@ build:
 # Grype consumes it, cosign attests it, sbom-post.sh ships it.
 sbom:
   stage: scan
-  image: alpine:3.20
+  image: ${ALPINE_IMAGE}
   needs:
     - job: build
       artifacts: true
@@ -171,8 +205,7 @@ sbom:
     - *install-tools
     - |
       if ! command -v syft >/dev/null 2>&1; then
-        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-          | sh -s -- -b /usr/local/bin "${SYFT_VERSION}"
+        curl -sSfL "${SYFT_INSTALLER_URL}" | sh -s -- -b /usr/local/bin "${SYFT_VERSION}"
       fi
       syft version
   script:
@@ -238,7 +271,7 @@ sbom:
 # replacement for Trivy while Trivy is banned for business use.
 grype:
   stage: scan
-  image: alpine:3.20
+  image: ${ALPINE_IMAGE}
   needs:
     - job: build
       artifacts: true
@@ -248,8 +281,7 @@ grype:
     - *install-tools
     - |
       if ! command -v grype >/dev/null 2>&1; then
-        curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
-          | sh -s -- -b /usr/local/bin "${GRYPE_VERSION}"
+        curl -sSfL "${GRYPE_INSTALLER_URL}" | sh -s -- -b /usr/local/bin "${GRYPE_VERSION}"
       fi
       grype version
   script:
@@ -336,7 +368,7 @@ grype:
 # AND scanned state at any time via `cosign verify-attestation`.
 cosign-sign:
   stage: sign
-  image: alpine:3.20
+  image: ${ALPINE_IMAGE}
   needs:
     - job: build
       artifacts: true
@@ -348,8 +380,7 @@ cosign-sign:
     - *install-tools
     - |
       if ! command -v cosign >/dev/null 2>&1; then
-        curl -sL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" \
-          -o /usr/local/bin/cosign
+        curl -sL "${COSIGN_URL}" -o /usr/local/bin/cosign
         chmod +x /usr/local/bin/cosign
       fi
       cosign version
@@ -420,13 +451,17 @@ cosign-sign:
 # before the business picks an SBOM platform.
 sbom-ingest:
   stage: ingest
-  image: alpine:3.20
+  image: ${ALPINE_IMAGE}
   needs:
     - job: build
       artifacts: true
     - job: sbom
       artifacts: true
   before_script:
+    - |
+      if [ -n "${APK_MIRROR:-}" ]; then
+        sed -i "s|https\?://dl-cdn.alpinelinux.org/alpine|${APK_MIRROR}|g" /etc/apk/repositories
+      fi
     - apk add --no-cache bash curl jq
   script:
     - bash ./scripts/sbom-post.sh sbom.cdx.json
@@ -443,7 +478,7 @@ sbom-ingest:
 # without a prod registry don't show a red manual gate.
 promote-prod:
   stage: promote
-  image: alpine:3.20
+  image: ${ALPINE_IMAGE}
   needs:
     - job: build
       artifacts: true

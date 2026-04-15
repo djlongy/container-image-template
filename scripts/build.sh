@@ -184,6 +184,7 @@ BUILD_ARGS=(
   --build-arg "INJECT_CERTS=${INJECT_CERTS}"
   --build-arg "REMEDIATE=${REMEDIATE}"
   --build-arg "ORIGINAL_USER=${ORIGINAL_USER}"
+  --build-arg "APK_MIRROR=${APK_MIRROR:-}"
 )
 
 # Label policy: preserve upstream, append ours. See Dockerfile for

@@ -28,6 +28,7 @@ ARG UPSTREAM_TAG=1.25.3-alpine
 ARG INJECT_CERTS=false
 ARG REMEDIATE=true
 ARG ORIGINAL_USER=root
+ARG APK_MIRROR=""
 
 # ── Upstream base ────────────────────────────────────────────────────
 FROM ${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG} AS base
@@ -92,8 +93,12 @@ FROM certs-${INJECT_CERTS} AS with-certs
 FROM with-certs AS remediate-false
 
 FROM with-certs AS remediate-true
+ARG APK_MIRROR
 USER root
 RUN set -eux; \
+    if [ -n "${APK_MIRROR}" ]; then \
+      sed -i "s|https\?://dl-cdn.alpinelinux.org/alpine|${APK_MIRROR}|g" /etc/apk/repositories; \
+    fi; \
     apk update; \
     apk upgrade --no-cache; \
     rm -rf /var/cache/apk/*
