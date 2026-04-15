@@ -76,6 +76,26 @@ stages:
   - ingest
   - promote
 
+# ── Path gate ──────────────────────────────────────────────────────
+# A pipeline only runs when something that actually affects the image
+# changes. Editing README.md, LICENSE, renovate.json, bamboo-specs/,
+# or .gitignore won't trigger a build. Tag pushes and FORCE_ALL=true
+# bypass the gate for deliberate re-runs.
+.build-changes: &build-changes
+  - Dockerfile
+  - VERSION
+  - scripts/**/*
+  - certs/**/*
+  - .gitlab-ci.yml
+
+.build-rules: &build-rules
+  - if: '$FORCE_ALL == "true"'
+  - if: '$CI_COMMIT_TAG'
+  - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    changes: *build-changes
+  - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    changes: *build-changes
+
 variables:
   # docker:dind TLS — disabled; matches internal GitLab runners that
   # don't mount /certs/client between dind service and job container.
@@ -184,10 +204,7 @@ build:
     reports:
       dotenv: build.env
     expire_in: 1 week
-  rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    - if: '$CI_COMMIT_TAG'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  rules: *build-rules
 
 # ═══════════════════════════════════════════════════════════════════
 # SCAN — SBOM generation
@@ -258,10 +275,7 @@ sbom:
     reports:
       cyclonedx: sbom.cdx.json
     expire_in: 1 month
-  rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    - if: '$CI_COMMIT_TAG'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  rules: *build-rules
 
 # ═══════════════════════════════════════════════════════════════════
 # SCAN — vulnerability scanning (Grype, SBOM-first)
@@ -318,10 +332,7 @@ grype:
     paths:
       - grype-report.json
     expire_in: 1 month
-  rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    - if: '$CI_COMMIT_TAG'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  rules: *build-rules
 
 # ═══════════════════════════════════════════════════════════════════
 # SCAN — Trivy (DISABLED: banned for business use)
@@ -439,8 +450,10 @@ cosign-sign:
           --type vuln --predicate grype-report.json "${TARGET}"
       fi
   rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$FORCE_ALL == "true"'
     - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes: *build-changes
 
 # ═══════════════════════════════════════════════════════════════════
 # INGEST — post SBOM to configured sinks
@@ -513,8 +526,12 @@ promote-prod:
     - if: '$ENABLE_PROD_PROMOTE != "true"'
       when: never
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes: *build-changes
       when: manual
       allow_failure: true
     - if: '$CI_COMMIT_TAG'
+      when: manual
+      allow_failure: true
+    - if: '$FORCE_ALL == "true"'
       when: manual
       allow_failure: true

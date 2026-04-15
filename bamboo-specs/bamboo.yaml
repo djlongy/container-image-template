@@ -116,6 +116,26 @@ build:
         body: |
           set -euo pipefail
 
+          # ── Path gate ────────────────────────────────────────────
+          # Skip the full build/scan/sign flow if no image-relevant
+          # file changed in the last commit. Editing README, LICENSE,
+          # renovate.json, .gitignore etc. writes SKIP=true to
+          # build.env and exits cleanly — every downstream job checks
+          # SKIP and no-ops when set. FORCE_ALL=true bypasses the gate.
+          if [ "${bamboo_FORCE_ALL:-false}" != "true" ]; then
+            CHANGED=$(git diff --name-only HEAD~1 HEAD \
+              -- Dockerfile VERSION scripts/ certs/ bamboo-specs/bamboo.yaml 2>/dev/null \
+              || git diff --name-only HEAD \
+              -- Dockerfile VERSION scripts/ certs/ bamboo-specs/bamboo.yaml)
+            if [ -z "$CHANGED" ]; then
+              echo "No image-relevant changes — skipping"
+              echo "SKIP=true" > build.env
+              exit 0
+            fi
+            echo "Changed image-relevant files:"
+            echo "$CHANGED" | sed 's/^/  /'
+          fi
+
           # Relay plan vars into shell env so build.sh picks them up.
           for var in PUSH_REGISTRY PUSH_PROJECT PUSH_REGISTRY_USER PUSH_REGISTRY_PASSWORD \
                      VENDOR CA_CERT UPSTREAM_REGISTRY UPSTREAM_IMAGE UPSTREAM_TAG \
