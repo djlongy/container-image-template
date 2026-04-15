@@ -42,63 +42,64 @@ fleet fabric:
 
 ## Quick start — fork and rebrand
 
-**Three files define what this repo builds. Nothing else needs to change.**
-
-| File | What it declares | Who bumps it |
-|---|---|---|
-| `Dockerfile` | Upstream base image (`ARG UPSTREAM_REGISTRY` / `UPSTREAM_IMAGE` / `UPSTREAM_TAG`) + LABEL policy | Renovate bumps `UPSTREAM_TAG` via the `# renovate:` hint; you edit the rest on fork |
-| `image.env.example` | Per-image behavior flags: `IMAGE_NAME`, `REMEDIATE`, `INJECT_CERTS`, `ORIGINAL_USER` | You, on any behavior change |
-| `VERSION` | Internal semver (independent of upstream) | You, on each internal release |
-
-Everything else — push registry host, credentials, cosign keys, SBOM
-sinks, air-gap mirrors — is a **CI variable**, not a file in the
-repo. That keeps secrets out of git and lets the same repo push to
-Harbor in dev and Artifactory in prod without a code change.
+**One file defines what this repo builds.** Everything about the
+image — internal semver, upstream registry/image/tag, behavior
+toggles — lives in a single `image.env.example`. The Dockerfile and
+`scripts/build.sh` are generic; they read this file and pass values
+through as `--build-arg`.
 
 ```bash
 # 1. Clone as a new per-image repo
 git clone <this-repo-url> my-app
 cd my-app
 
-# 2. Point the Dockerfile at your upstream
-$EDITOR Dockerfile
-#    Only the ARG block at the top needs editing:
-#      ARG UPSTREAM_REGISTRY=docker.io/library
-#      ARG UPSTREAM_IMAGE=nginx
-#      # renovate: datasource=docker depName=library/nginx
-#      ARG UPSTREAM_TAG=1.25.3-alpine
-#    For non-Alpine bases, also swap the `apk upgrade` line in
-#    the remediate-true stage for apt-get / dnf / microdnf.
-
-# 3. Edit per-image toggles
+# 2. Edit THE ONE FILE
 $EDITOR image.env.example
-#    Set IMAGE_NAME, REMEDIATE, INJECT_CERTS, ORIGINAL_USER.
-#    You can edit this file directly (it's the tracked version), OR
-#    copy it to image.env for local-only experimentation:
-#      cp image.env.example image.env   # image.env is gitignored
+#    VERSION              internal semver (1.0.0)
+#    UPSTREAM_REGISTRY    docker.io/library (or your Artifactory proxy)
+#    UPSTREAM_IMAGE       nginx
+#    UPSTREAM_TAG         1.25.3-alpine  (Renovate auto-bumps via hint)
+#    IMAGE_NAME           optional — defaults to UPSTREAM_IMAGE
+#    REMEDIATE            true / false
+#    INJECT_CERTS         true / false
+#    ORIGINAL_USER        root / nginx / whatever upstream expects
 
-# 4. Reset the internal version
-echo "1.0.0" > VERSION
+# 3. (Optional) If the upstream isn't Alpine-based, swap the
+#    `apk upgrade` line in the Dockerfile's remediate-true stage
+#    for apt-get / dnf / microdnf. Other than that, the Dockerfile
+#    is generic and doesn't need edits.
 
-# 5. Sanity-check locally (no push)
+# 4. Sanity-check locally (no push)
 ./scripts/build.sh
 
-# 6. Push to your own GitLab / Bamboo / GitHub and set CI variables
+# 5. Push to your own GitLab / Bamboo / GitHub and set CI variables
 #    (PUSH_REGISTRY, PUSH_PROJECT, credentials — see below)
 ```
 
 ### image.env resolution order
 
-`build.sh` resolves image settings from **three layers** (increasing precedence):
+| Layer | File | Purpose |
+|---|---|---|
+| 1 (fallback) | `image.env.example` *(tracked)* | Canonical template; what CI and fresh clones see |
+| 2 (override) | `image.env` *(gitignored)* | Optional per-dev file for local experimentation |
+| 3 (top) | shell / CI environment | Always wins; used by CI variable overrides |
 
-1. `image.env.example` — the tracked template, the default fallback
-2. `image.env` — a gitignored local override, if present
-3. Shell environment / CI variables — always win, regardless of file
+Fresh clones build with zero setup — `build.sh` falls through to
+`image.env.example` when no local `image.env` exists. Devs can
+`cp image.env.example image.env` and edit freely without touching
+committed state. CI overrides anything via plain env variables.
 
-This means fresh clones work with zero setup (build falls through to
-the example). Devs can experiment locally via `image.env` without
-touching committed state. CI can override anything via environment
-variables without editing files.
+### What you edit when forking, vs. what stays generic
+
+| File | Edit when forking? | Notes |
+|---|---|---|
+| `image.env.example` | **Always** | The whole image definition lives here |
+| `Dockerfile` | Only if upstream is non-Alpine or you're changing build stages | Generic template; no image-specific values hardcoded |
+| `scripts/build.sh` | Never | Reads `image.env`, invokes buildx, handles backend dispatch |
+| `scripts/sbom-post.sh` | Only to add new SBOM sinks | Generic; 3 sinks built in |
+| `scripts/push-backends/artifactory.sh` | Never | Ported from monorepo, same layout templates |
+| `.gitlab-ci.yml`, `bamboo-specs/bamboo.yaml` | Only to change pipeline structure | Default flow: build → sbom → grype → sign → ingest → promote |
+| `renovate.json` | Only to add more Renovate hints | Custom manager already wired for `UPSTREAM_TAG` in `image.env` |
 
 ## Required CI variables
 
@@ -370,11 +371,10 @@ never needs a commit-SHA edit.
 
 ```
 container-image-template/
-├── Dockerfile                 # Multi-stage: base → certs → remediate → final
-├── image.env.example          # Per-image behavior flags (tracked template)
+├── image.env.example          # ★ THE file — everything about the image
 ├── image.env                  # Local override (gitignored — optional)
-├── VERSION                    # Internal semver (human/release-please bumped)
-├── renovate.json              # Tracks upstream tag in Dockerfile
+├── Dockerfile                 # Generic multi-stage: base → certs → remediate → final
+├── renovate.json              # Custom manager tracks UPSTREAM_TAG in image.env
 ├── certs/                     # Gitignored *.crt; populated at build time
 │   └── .gitkeep               # keeps the directory present for COPY
 ├── scripts/

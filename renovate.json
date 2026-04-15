@@ -8,10 +8,22 @@
   "dockerfile": {
     "enabled": true
   },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Bump UPSTREAM_TAG in image.env.example via the `# renovate:` hint",
+      "fileMatch": [
+        "(^|/)image\\.env(\\.example)?$"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: versioning=(?<versioning>\\S+))?\\s*\\nUPSTREAM_TAG=\"?(?<currentValue>[^\"\\s]+)\"?"
+      ]
+    }
+  ],
   "packageRules": [
     {
       "description": "Upstream base image bumps — auto-open MRs",
-      "matchManagers": ["dockerfile"],
+      "matchManagers": ["dockerfile", "custom.regex"],
       "matchUpdateTypes": ["major", "minor", "patch"],
       "labels": ["upstream-bump", "dependencies"],
       "automerge": false

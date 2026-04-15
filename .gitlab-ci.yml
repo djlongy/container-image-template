@@ -82,10 +82,9 @@ stages:
 # or .gitignore won't trigger a build. Tag pushes and FORCE_ALL=true
 # bypass the gate for deliberate re-runs.
 .build-changes: &build-changes
-  - Dockerfile
   - image.env
   - image.env.example
-  - VERSION
+  - Dockerfile
   - scripts/**/*
   - certs/**/*
   - .gitlab-ci.yml

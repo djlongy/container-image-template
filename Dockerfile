@@ -21,10 +21,14 @@
 # source control shouldn't require bumping commit SHAs in LABEL lines.
 
 # ── Global ARGs (available to FROM lines of all stages) ──────────────
-ARG UPSTREAM_REGISTRY=docker.io/library
-ARG UPSTREAM_IMAGE=nginx
-# renovate: datasource=docker depName=library/nginx
-ARG UPSTREAM_TAG=1.25.3-alpine
+#
+# No hardcoded defaults. Values are supplied by scripts/build.sh from
+# image.env. The Renovate hint for UPSTREAM_TAG lives in image.env
+# (matched by a customManagers regex in renovate.json), not here —
+# keeping all image-specific values in one place.
+ARG UPSTREAM_REGISTRY
+ARG UPSTREAM_IMAGE
+ARG UPSTREAM_TAG
 ARG INJECT_CERTS=false
 ARG REMEDIATE=true
 ARG ORIGINAL_USER=root

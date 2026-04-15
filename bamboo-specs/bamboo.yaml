@@ -124,9 +124,9 @@ build:
           # SKIP and no-ops when set. FORCE_ALL=true bypasses the gate.
           if [ "${bamboo_FORCE_ALL:-false}" != "true" ]; then
             CHANGED=$(git diff --name-only HEAD~1 HEAD \
-              -- Dockerfile image.env image.env.example VERSION scripts/ certs/ bamboo-specs/bamboo.yaml 2>/dev/null \
+              -- image.env image.env.example Dockerfile scripts/ certs/ bamboo-specs/bamboo.yaml 2>/dev/null \
               || git diff --name-only HEAD \
-              -- Dockerfile image.env image.env.example VERSION scripts/ certs/ bamboo-specs/bamboo.yaml)
+              -- image.env image.env.example Dockerfile scripts/ certs/ bamboo-specs/bamboo.yaml)
             if [ -z "$CHANGED" ]; then
               echo "No image-relevant changes — skipping"
               echo "SKIP=true" > build.env

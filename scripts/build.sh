@@ -49,25 +49,22 @@ cd "${REPO_ROOT}"
 
 # ── Config resolution ────────────────────────────────────────────────
 #
-# Config comes from three layers, in increasing precedence:
+# image.env is the single source of truth for everything about the
+# image: VERSION, IMAGE_NAME, UPSTREAM_REGISTRY, UPSTREAM_IMAGE,
+# UPSTREAM_TAG, REMEDIATE, INJECT_CERTS, ORIGINAL_USER. One file,
+# three-layer precedence:
 #
-#   1. Dockerfile ARG defaults   — upstream pin (UPSTREAM_REGISTRY,
-#                                  UPSTREAM_IMAGE, UPSTREAM_TAG with
-#                                  Renovate's `# renovate:` hint)
-#   2. image.env                 — per-image toggles (IMAGE_NAME,
-#                                  REMEDIATE, INJECT_CERTS, ORIGINAL_USER)
-#   3. Shell environment / CI    — anything exported before running
-#                                  build.sh wins over the other two,
-#                                  useful for CI overrides and testing
+#   1. image.env.example  — tracked, canonical, the template
+#   2. image.env          — gitignored, local override for dev work
+#   3. Shell / CI env     — always wins, for pipeline overrides
 #
-# We snapshot the shell env first, then source image.env, then re-apply
-# the snapshot so user exports still take precedence. If an image.env
-# isn't present, we error — a fresh fork of this template MUST have
-# one because it's where "what this image is" gets declared.
+# We snapshot the shell env first, then source image.env, then
+# re-apply the snapshot so exports still take precedence.
 
 __SHELL_OVERRIDES=""
-for __v in IMAGE_NAME REMEDIATE INJECT_CERTS ORIGINAL_USER \
+for __v in VERSION IMAGE_NAME \
            UPSTREAM_REGISTRY UPSTREAM_IMAGE UPSTREAM_TAG \
+           REMEDIATE INJECT_CERTS ORIGINAL_USER \
            VENDOR PLATFORM APK_MIRROR CA_CERT \
            REGISTRY_KIND \
            ARTIFACTORY_URL ARTIFACTORY_USER ARTIFACTORY_PASSWORD ARTIFACTORY_TOKEN \
@@ -80,10 +77,6 @@ for __v in IMAGE_NAME REMEDIATE INJECT_CERTS ORIGINAL_USER \
 done
 unset __v
 
-# image.env resolution: prefer a local (gitignored) image.env for
-# per-dev overrides, fall back to the tracked image.env.example.
-# This lets fresh clones build without any cp step AND lets devs
-# experiment locally without touching committed state.
 _image_env_file=""
 if [ -f image.env ]; then
   _image_env_file="image.env"
@@ -92,7 +85,6 @@ elif [ -f image.env.example ]; then
 else
   echo "ERROR: neither image.env nor image.env.example found at repo root" >&2
   echo "       One of these files declares what image the repo builds." >&2
-  echo "       See image.env.example in the template for the expected shape." >&2
   exit 1
 fi
 echo "→ Sourcing ${_image_env_file}"
@@ -110,45 +102,27 @@ if [ -n "${__SHELL_OVERRIDES}" ]; then
 fi
 unset __SHELL_OVERRIDES
 
-# Upstream pin defaults — read out of the Dockerfile so the `# renovate:`
-# hint on ARG UPSTREAM_TAG stays the canonical version source. Shell env
-# still wins (set above via the snapshot) if someone overrides them.
-_read_arg_default() {
-  awk -F'=' -v name="$1" '$0 ~ "^ARG "name"=" { gsub(/[[:space:]]/,"",$2); print $2; exit }' Dockerfile
-}
-UPSTREAM_REGISTRY="${UPSTREAM_REGISTRY:-$(_read_arg_default UPSTREAM_REGISTRY)}"
-UPSTREAM_REGISTRY="${UPSTREAM_REGISTRY:-docker.io/library}"
-UPSTREAM_IMAGE="${UPSTREAM_IMAGE:-$(_read_arg_default UPSTREAM_IMAGE)}"
-UPSTREAM_IMAGE="${UPSTREAM_IMAGE:-nginx}"
-UPSTREAM_TAG="${UPSTREAM_TAG:-$(_read_arg_default UPSTREAM_TAG)}"
-if [ -z "${UPSTREAM_TAG}" ]; then
-  echo "ERROR: UPSTREAM_TAG not set and no default in Dockerfile" >&2
-  exit 1
-fi
+# Required fields — hard-fail with a clear message if image.env is
+# missing any of these.
+: "${VERSION:?VERSION must be set in image.env}"
+: "${UPSTREAM_REGISTRY:?UPSTREAM_REGISTRY must be set in image.env}"
+: "${UPSTREAM_IMAGE:?UPSTREAM_IMAGE must be set in image.env}"
+: "${UPSTREAM_TAG:?UPSTREAM_TAG must be set in image.env}"
 
-# Required-from-image.env sanity check (all of these should come from
-# image.env; error if the file was edited badly).
-: "${IMAGE_NAME:?IMAGE_NAME must be set in image.env}"
-: "${REMEDIATE:=true}"
-: "${INJECT_CERTS:=false}"
-: "${ORIGINAL_USER:=root}"
-
-# Org-wide defaults (can be set via CI variable instead of image.env).
+# Optional with sane defaults.
+IMAGE_NAME="${IMAGE_NAME:-${UPSTREAM_IMAGE}}"
+REMEDIATE="${REMEDIATE:-true}"
+INJECT_CERTS="${INJECT_CERTS:-false}"
+ORIGINAL_USER="${ORIGINAL_USER:-root}"
 VENDOR="${VENDOR:-example.com}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 
 # ── Versioning ───────────────────────────────────────────────────────
-# Two independent version axes:
-#   - VERSION file: internal semver, human-bumped via PR
+# Two independent version axes both live in image.env now:
+#   - VERSION:     internal semver, human-bumped via PR
 #   - UPSTREAM_TAG: upstream version pin, Renovate-bumped via the
-#                   `# renovate:` hint in the Dockerfile
+#                   `# renovate:` hint next to it in image.env
 # Final tag embeds both plus the commit SHA for bit-for-bit traceability.
-
-if [ ! -f VERSION ]; then
-  echo "ERROR: VERSION file missing" >&2
-  exit 1
-fi
-VERSION=$(tr -d '[:space:]' < VERSION)
 
 if ! git rev-parse HEAD >/dev/null 2>&1; then
   GIT_SHA="unknown"
