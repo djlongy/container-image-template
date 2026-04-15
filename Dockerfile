@@ -32,7 +32,9 @@ ARG UPSTREAM_TAG
 ARG INJECT_CERTS=false
 ARG REMEDIATE=true
 ARG ORIGINAL_USER=root
+ARG DISTRO=alpine
 ARG APK_MIRROR=""
+ARG APT_MIRROR=""
 
 # ── Upstream base ────────────────────────────────────────────────────
 FROM ${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG} AS base
@@ -87,25 +89,29 @@ RUN set -eux; \
 ARG INJECT_CERTS
 FROM certs-${INJECT_CERTS} AS with-certs
 
-# ── CVE remediation (optional) ───────────────────────────────────────
-# Runs the in-place package upgrade for the base distro. Alpine default
-# shown. For apt-based bases, replace with:
-#   apt-get update && apt-get -y --only-upgrade upgrade && \
-#     rm -rf /var/lib/apt/lists/*
-# For UBI/RHEL, replace with:
-#   microdnf -y update && microdnf clean all
+# ── CVE remediation (optional, distro-aware) ─────────────────────────
+# When REMEDIATE=true, copies the scripts/remediate/ directory into
+# the image and executes /tmp/remediate/${DISTRO}.sh. Four distros
+# ship in the template by default: alpine, debian, ubuntu, ubi.
+# Add a new distro by dropping a script at scripts/remediate/<name>.sh
+# and setting DISTRO=<name> in image.env.
+#
+# The script inherits APK_MIRROR and APT_MIRROR as env vars so a
+# single CI variable can point all upgrade operations at a
+# closed-network proxy.
 FROM with-certs AS remediate-false
 
 FROM with-certs AS remediate-true
+ARG DISTRO
 ARG APK_MIRROR
+ARG APT_MIRROR
 USER root
+COPY scripts/remediate/ /tmp/remediate/
 RUN set -eux; \
-    if [ -n "${APK_MIRROR}" ]; then \
-      sed -i "s|https\?://dl-cdn.alpinelinux.org/alpine|${APK_MIRROR}|g" /etc/apk/repositories; \
-    fi; \
-    apk update; \
-    apk upgrade --no-cache; \
-    rm -rf /var/cache/apk/*
+    chmod +x /tmp/remediate/${DISTRO}.sh; \
+    APK_MIRROR="${APK_MIRROR}" APT_MIRROR="${APT_MIRROR}" \
+      /tmp/remediate/${DISTRO}.sh; \
+    rm -rf /tmp/remediate
 
 ARG REMEDIATE
 FROM remediate-${REMEDIATE} AS final

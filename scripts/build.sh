@@ -61,10 +61,10 @@ cd "${REPO_ROOT}"
 # re-apply the snapshot so exports still take precedence.
 
 __SHELL_OVERRIDES=""
-for __v in IMAGE_NAME \
+for __v in IMAGE_NAME DISTRO \
            UPSTREAM_REGISTRY UPSTREAM_IMAGE UPSTREAM_TAG \
            REMEDIATE INJECT_CERTS ORIGINAL_USER \
-           VENDOR PLATFORM APK_MIRROR CA_CERT \
+           VENDOR PLATFORM APK_MIRROR APT_MIRROR CA_CERT \
            REGISTRY_KIND \
            ARTIFACTORY_URL ARTIFACTORY_USER ARTIFACTORY_PASSWORD ARTIFACTORY_TOKEN \
            ARTIFACTORY_TEAM ARTIFACTORY_ENVIRONMENT ARTIFACTORY_PUSH_HOST \
@@ -109,11 +109,23 @@ unset __SHELL_OVERRIDES
 
 # Optional with sane defaults.
 IMAGE_NAME="${IMAGE_NAME:-${UPSTREAM_IMAGE}}"
+DISTRO="${DISTRO:-alpine}"
 REMEDIATE="${REMEDIATE:-true}"
 INJECT_CERTS="${INJECT_CERTS:-false}"
 ORIGINAL_USER="${ORIGINAL_USER:-root}"
 VENDOR="${VENDOR:-example.com}"
 PLATFORM="${PLATFORM:-linux/amd64}"
+
+# Validate DISTRO against the scripts shipped in scripts/remediate/.
+# Forkers can add a new distro by dropping scripts/remediate/<name>.sh
+# and referencing it from image.env — no build.sh edit needed.
+if [ "${REMEDIATE}" = "true" ] && [ ! -f "scripts/remediate/${DISTRO}.sh" ]; then
+  echo "ERROR: REMEDIATE=true but scripts/remediate/${DISTRO}.sh does not exist" >&2
+  echo "       Available distros: $(ls scripts/remediate/ | sed 's/\.sh$//' | tr '\n' ' ')" >&2
+  echo "       Either add a script for '${DISTRO}', set DISTRO to a supported" >&2
+  echo "       value in image.env, or set REMEDIATE=false." >&2
+  exit 1
+fi
 
 # ── Tag computation ──────────────────────────────────────────────────
 # Tag format matches the container-images monorepo:
@@ -202,9 +214,12 @@ echo "  Upstream digest:    ${BASE_DIGEST:-<not resolved>}"
 echo "  Git commit:         ${GIT_SHORT} (${GIT_SHA})"
 echo "  Created (UTC):      ${CREATED}"
 echo "  Platform:           ${PLATFORM}"
-echo "  Remediate:          ${REMEDIATE}"
+echo "  Distro:             ${DISTRO}"
+echo "  Remediate:          ${REMEDIATE}$([ "${REMEDIATE}" = "true" ] && echo " (scripts/remediate/${DISTRO}.sh)" || echo "")"
 echo "  Inject certs:       ${INJECT_CERTS}"
 echo "  Original user:      ${ORIGINAL_USER}"
+echo "  APK mirror:         ${APK_MIRROR:-<none>}"
+echo "  APT mirror:         ${APT_MIRROR:-<none>}"
 echo "  Vendor:             ${VENDOR}"
 echo "  Source URL:         ${SOURCE_URL:-<none>}"
 echo "=========================================="
@@ -222,7 +237,9 @@ BUILD_ARGS=(
   --build-arg "INJECT_CERTS=${INJECT_CERTS}"
   --build-arg "REMEDIATE=${REMEDIATE}"
   --build-arg "ORIGINAL_USER=${ORIGINAL_USER}"
+  --build-arg "DISTRO=${DISTRO}"
   --build-arg "APK_MIRROR=${APK_MIRROR:-}"
+  --build-arg "APT_MIRROR=${APT_MIRROR:-}"
 )
 
 # Label policy: preserve upstream, append ours. See Dockerfile for

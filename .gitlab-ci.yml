@@ -157,6 +157,13 @@ variables:
   #      APK_MIRROR: https://nexus.example.com/repository/alpine-proxy
   APK_MIRROR: ""
 
+  # 4) Debian / Ubuntu apt mirror. Used by the remediate stage inside
+  #    the Dockerfile when DISTRO=debian or DISTRO=ubuntu — rewrites
+  #    /etc/apt/sources.list* before apt-get update. Not needed for
+  #    alpine bases. Example:
+  #      APT_MIRROR: https://nexus.example.com/repository/ubuntu-proxy
+  APT_MIRROR: ""
+
 # ── Shared before_script: install tools used by most jobs ──────────
 .install-tools: &install-tools
   - |

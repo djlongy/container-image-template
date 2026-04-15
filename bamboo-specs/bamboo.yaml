@@ -140,8 +140,8 @@ build:
           # Relay plan vars into shell env so build.sh picks them up.
           for var in PUSH_REGISTRY PUSH_PROJECT PUSH_REGISTRY_USER PUSH_REGISTRY_PASSWORD \
                      VENDOR CA_CERT UPSTREAM_REGISTRY UPSTREAM_IMAGE UPSTREAM_TAG \
-                     IMAGE_NAME INJECT_CERTS REMEDIATE ORIGINAL_USER PLATFORM \
-                     APK_MIRROR \
+                     IMAGE_NAME DISTRO INJECT_CERTS REMEDIATE ORIGINAL_USER PLATFORM \
+                     APK_MIRROR APT_MIRROR \
                      BUILDX_URL CRANE_URL SYFT_INSTALLER_URL GRYPE_INSTALLER_URL \
                      COSIGN_URL JF_INSTALLER_URL \
                      REGISTRY_KIND \

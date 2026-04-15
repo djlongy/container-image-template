@@ -18,8 +18,10 @@ scan, cosign signing, and pluggable SBOM ingestion.
 Features — everything in the monorepo's fleet pipeline, minus the
 fleet fabric:
 
-- **Remediate**: optional CVE package upgrade stage (alpine by default,
-  one-line swap for debian/ubuntu/ubi)
+- **Remediate**: distro-aware CVE package upgrade stage. Four
+  distros ship in the template (`alpine`, `debian`, `ubuntu`, `ubi`),
+  each with its own script under `scripts/remediate/`. Pick which
+  one runs via `DISTRO` in `image.env`
 - **Cert injection**: optional CA cert stage, picks up anything in
   `certs/` or a PEM string from the `CA_CERT` CI variable
 - **Upstream-version tagging**: pushes at
@@ -62,14 +64,15 @@ $EDITOR image.env.example
 #    UPSTREAM_IMAGE       nginx
 #    UPSTREAM_TAG         1.25.3-alpine  (Renovate auto-bumps via hint)
 #    IMAGE_NAME           optional — defaults to UPSTREAM_IMAGE
+#    DISTRO               alpine | debian | ubuntu | ubi
 #    REMEDIATE            true / false
 #    INJECT_CERTS         true / false
 #    ORIGINAL_USER        root / nginx / whatever upstream expects
 
-# 3. (Optional) If the upstream isn't Alpine-based, swap the
-#    `apk upgrade` line in the Dockerfile's remediate-true stage
-#    for apt-get / dnf / microdnf. Other than that, the Dockerfile
-#    is generic and doesn't need edits.
+# 3. (Optional) If your upstream uses a distro family not covered
+#    by the four shipped scripts, drop a new
+#    scripts/remediate/<distro>.sh and set DISTRO=<distro>.
+#    The Dockerfile doesn't need any edit.
 
 # 4. Sanity-check locally (no push)
 ./scripts/build.sh
@@ -322,6 +325,40 @@ Trivy is unbanned for business use, uncomment the `trivy:` job in
 `bamboo-specs/bamboo.yaml`, and re-enable the `- trivy` stage
 reference. Grype covers the same ground via the SBOM scan in the
 meantime — no gap.
+
+## Distro-aware remediation
+
+`REMEDIATE=true` runs `scripts/remediate/${DISTRO}.sh` inside the
+image during build. Four distros ship in the template out of the box:
+
+| `DISTRO` | Script | What it runs |
+|---|---|---|
+| `alpine` | `scripts/remediate/alpine.sh` | `apk update && apk upgrade --no-cache`, honors `APK_MIRROR` |
+| `debian` | `scripts/remediate/debian.sh` | `apt-get -y --only-upgrade upgrade`, rewrites `deb.debian.org` / `security.debian.org` via `APT_MIRROR` |
+| `ubuntu` | `scripts/remediate/ubuntu.sh` | `apt-get -y --only-upgrade upgrade`, rewrites `archive.ubuntu.com` / `security.ubuntu.com` / `ports.ubuntu.com` via `APT_MIRROR` |
+| `ubi` | `scripts/remediate/ubi.sh` | `microdnf -y update` (falls back to `dnf` / `yum` for older UBI / RHEL bases) |
+
+**Adding a new distro family** is a two-step change:
+
+1. Drop a new `scripts/remediate/<name>.sh` (plain POSIX shell, reads
+   `APK_MIRROR` / `APT_MIRROR` from env if relevant)
+2. Set `DISTRO=<name>` in `image.env`
+
+The Dockerfile never needs an edit — it's generic: `COPY scripts/remediate/`
++ `RUN /tmp/remediate/${DISTRO}.sh`. `build.sh` validates that the
+script for the selected `DISTRO` exists before invoking buildx, so
+typos fail fast with a clear error instead of deep inside the build.
+
+**For images where OS-level remediation doesn't apply** (distroless,
+scratch, busybox, statically-linked bases), set `REMEDIATE=false` in
+`image.env` and the stage is skipped entirely — `DISTRO` becomes
+irrelevant.
+
+**Closed-network note**: `APK_MIRROR` and `APT_MIRROR` are passed
+through as `--build-arg` so a single CI variable (set at group
+level) rewires all apk and apt traffic through your Artifactory /
+Nexus proxies inside the build. See "Closed-network deployment"
+below for the full list.
 
 ## Tagging convention
 
