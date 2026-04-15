@@ -48,25 +48,92 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
 # ── Config resolution ────────────────────────────────────────────────
+#
+# Config comes from three layers, in increasing precedence:
+#
+#   1. Dockerfile ARG defaults   — upstream pin (UPSTREAM_REGISTRY,
+#                                  UPSTREAM_IMAGE, UPSTREAM_TAG with
+#                                  Renovate's `# renovate:` hint)
+#   2. image.env                 — per-image toggles (IMAGE_NAME,
+#                                  REMEDIATE, INJECT_CERTS, ORIGINAL_USER)
+#   3. Shell environment / CI    — anything exported before running
+#                                  build.sh wins over the other two,
+#                                  useful for CI overrides and testing
+#
+# We snapshot the shell env first, then source image.env, then re-apply
+# the snapshot so user exports still take precedence. If an image.env
+# isn't present, we error — a fresh fork of this template MUST have
+# one because it's where "what this image is" gets declared.
 
-UPSTREAM_REGISTRY="${UPSTREAM_REGISTRY:-docker.io/library}"
-UPSTREAM_IMAGE="${UPSTREAM_IMAGE:-nginx}"
-
-# Read the default UPSTREAM_TAG out of the Dockerfile if not overridden.
-# This keeps Renovate's `# renovate: datasource=docker ...` comment as
-# the canonical upstream version pin.
-if [ -z "${UPSTREAM_TAG:-}" ]; then
-  UPSTREAM_TAG=$(awk -F'=' '/^ARG UPSTREAM_TAG=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' Dockerfile)
-  if [ -z "${UPSTREAM_TAG}" ]; then
-    echo "ERROR: UPSTREAM_TAG not set and no default found in Dockerfile" >&2
-    exit 1
+__SHELL_OVERRIDES=""
+for __v in IMAGE_NAME REMEDIATE INJECT_CERTS ORIGINAL_USER \
+           UPSTREAM_REGISTRY UPSTREAM_IMAGE UPSTREAM_TAG \
+           VENDOR PLATFORM APK_MIRROR CA_CERT \
+           REGISTRY_KIND \
+           ARTIFACTORY_URL ARTIFACTORY_USER ARTIFACTORY_PASSWORD ARTIFACTORY_TOKEN \
+           ARTIFACTORY_TEAM ARTIFACTORY_ENVIRONMENT ARTIFACTORY_PUSH_HOST \
+           ARTIFACTORY_IMAGE_REF ARTIFACTORY_MANIFEST_PATH \
+           ARTIFACTORY_BUILD_NAME ARTIFACTORY_BUILD_NUMBER ARTIFACTORY_PROPERTIES; do
+  if [ "${!__v+set}" = "set" ]; then
+    __SHELL_OVERRIDES="${__SHELL_OVERRIDES}${__v}=$(printf '%q' "${!__v}")"$'\n'
   fi
+done
+unset __v
+
+# image.env resolution: prefer a local (gitignored) image.env for
+# per-dev overrides, fall back to the tracked image.env.example.
+# This lets fresh clones build without any cp step AND lets devs
+# experiment locally without touching committed state.
+_image_env_file=""
+if [ -f image.env ]; then
+  _image_env_file="image.env"
+elif [ -f image.env.example ]; then
+  _image_env_file="image.env.example"
+else
+  echo "ERROR: neither image.env nor image.env.example found at repo root" >&2
+  echo "       One of these files declares what image the repo builds." >&2
+  echo "       See image.env.example in the template for the expected shape." >&2
+  exit 1
+fi
+echo "→ Sourcing ${_image_env_file}"
+# shellcheck disable=SC1090
+. "./${_image_env_file}"
+unset _image_env_file
+
+# Re-apply shell overrides on top of the image.env values.
+if [ -n "${__SHELL_OVERRIDES}" ]; then
+  while IFS= read -r __line; do
+    [ -z "${__line}" ] && continue
+    eval "export ${__line}"
+  done <<< "${__SHELL_OVERRIDES}"
+  unset __line
+fi
+unset __SHELL_OVERRIDES
+
+# Upstream pin defaults — read out of the Dockerfile so the `# renovate:`
+# hint on ARG UPSTREAM_TAG stays the canonical version source. Shell env
+# still wins (set above via the snapshot) if someone overrides them.
+_read_arg_default() {
+  awk -F'=' -v name="$1" '$0 ~ "^ARG "name"=" { gsub(/[[:space:]]/,"",$2); print $2; exit }' Dockerfile
+}
+UPSTREAM_REGISTRY="${UPSTREAM_REGISTRY:-$(_read_arg_default UPSTREAM_REGISTRY)}"
+UPSTREAM_REGISTRY="${UPSTREAM_REGISTRY:-docker.io/library}"
+UPSTREAM_IMAGE="${UPSTREAM_IMAGE:-$(_read_arg_default UPSTREAM_IMAGE)}"
+UPSTREAM_IMAGE="${UPSTREAM_IMAGE:-nginx}"
+UPSTREAM_TAG="${UPSTREAM_TAG:-$(_read_arg_default UPSTREAM_TAG)}"
+if [ -z "${UPSTREAM_TAG}" ]; then
+  echo "ERROR: UPSTREAM_TAG not set and no default in Dockerfile" >&2
+  exit 1
 fi
 
-IMAGE_NAME="${IMAGE_NAME:-${UPSTREAM_IMAGE}}"
-INJECT_CERTS="${INJECT_CERTS:-false}"
-REMEDIATE="${REMEDIATE:-true}"
-ORIGINAL_USER="${ORIGINAL_USER:-root}"
+# Required-from-image.env sanity check (all of these should come from
+# image.env; error if the file was edited badly).
+: "${IMAGE_NAME:?IMAGE_NAME must be set in image.env}"
+: "${REMEDIATE:=true}"
+: "${INJECT_CERTS:=false}"
+: "${ORIGINAL_USER:=root}"
+
+# Org-wide defaults (can be set via CI variable instead of image.env).
 VENDOR="${VENDOR:-example.com}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 

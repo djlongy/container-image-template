@@ -2,6 +2,13 @@
 build.env
 *.log
 
+# Local image.env override. image.env.example is the tracked template
+# and the fallback when no override is present. Copy and edit for
+# per-dev experiments without touching the committed version:
+#   cp image.env.example image.env
+#   $EDITOR image.env
+image.env
+
 # CA certificates injected at build time — never committed
 certs/*.crt
 certs/*.pem

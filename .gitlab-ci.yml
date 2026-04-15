@@ -83,6 +83,8 @@ stages:
 # bypass the gate for deliberate re-runs.
 .build-changes: &build-changes
   - Dockerfile
+  - image.env
+  - image.env.example
   - VERSION
   - scripts/**/*
   - certs/**/*

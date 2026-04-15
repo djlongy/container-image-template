@@ -42,25 +42,63 @@ fleet fabric:
 
 ## Quick start — fork and rebrand
 
+**Three files define what this repo builds. Nothing else needs to change.**
+
+| File | What it declares | Who bumps it |
+|---|---|---|
+| `Dockerfile` | Upstream base image (`ARG UPSTREAM_REGISTRY` / `UPSTREAM_IMAGE` / `UPSTREAM_TAG`) + LABEL policy | Renovate bumps `UPSTREAM_TAG` via the `# renovate:` hint; you edit the rest on fork |
+| `image.env.example` | Per-image behavior flags: `IMAGE_NAME`, `REMEDIATE`, `INJECT_CERTS`, `ORIGINAL_USER` | You, on any behavior change |
+| `VERSION` | Internal semver (independent of upstream) | You, on each internal release |
+
+Everything else — push registry host, credentials, cosign keys, SBOM
+sinks, air-gap mirrors — is a **CI variable**, not a file in the
+repo. That keeps secrets out of git and lets the same repo push to
+Harbor in dev and Artifactory in prod without a code change.
+
 ```bash
 # 1. Clone as a new per-image repo
 git clone <this-repo-url> my-app
 cd my-app
 
-# 2. Point the Dockerfile at your upstream image
+# 2. Point the Dockerfile at your upstream
 $EDITOR Dockerfile
-# - Change ARG UPSTREAM_IMAGE and UPSTREAM_TAG
-# - Adjust the LABEL block (title, description, licenses)
-# - For non-Alpine bases, change the remediate-true RUN line
+#    Only the ARG block at the top needs editing:
+#      ARG UPSTREAM_REGISTRY=docker.io/library
+#      ARG UPSTREAM_IMAGE=nginx
+#      # renovate: datasource=docker depName=library/nginx
+#      ARG UPSTREAM_TAG=1.25.3-alpine
+#    For non-Alpine bases, also swap the `apk upgrade` line in
+#    the remediate-true stage for apt-get / dnf / microdnf.
 
-# 3. Reset the version
+# 3. Edit per-image toggles
+$EDITOR image.env.example
+#    Set IMAGE_NAME, REMEDIATE, INJECT_CERTS, ORIGINAL_USER.
+#    You can edit this file directly (it's the tracked version), OR
+#    copy it to image.env for local-only experimentation:
+#      cp image.env.example image.env   # image.env is gitignored
+
+# 4. Reset the internal version
 echo "1.0.0" > VERSION
 
-# 4. Build locally to sanity-check
+# 5. Sanity-check locally (no push)
 ./scripts/build.sh
 
-# 5. Push to your own GitLab / Bamboo / GitHub and set CI variables
+# 6. Push to your own GitLab / Bamboo / GitHub and set CI variables
+#    (PUSH_REGISTRY, PUSH_PROJECT, credentials — see below)
 ```
+
+### image.env resolution order
+
+`build.sh` resolves image settings from **three layers** (increasing precedence):
+
+1. `image.env.example` — the tracked template, the default fallback
+2. `image.env` — a gitignored local override, if present
+3. Shell environment / CI variables — always win, regardless of file
+
+This means fresh clones work with zero setup (build falls through to
+the example). Devs can experiment locally via `image.env` without
+touching committed state. CI can override anything via environment
+variables without editing files.
 
 ## Required CI variables
 
@@ -333,14 +371,18 @@ never needs a commit-SHA edit.
 ```
 container-image-template/
 ├── Dockerfile                 # Multi-stage: base → certs → remediate → final
+├── image.env.example          # Per-image behavior flags (tracked template)
+├── image.env                  # Local override (gitignored — optional)
 ├── VERSION                    # Internal semver (human/release-please bumped)
 ├── renovate.json              # Tracks upstream tag in Dockerfile
 ├── certs/                     # Gitignored *.crt; populated at build time
 │   └── .gitkeep               # keeps the directory present for COPY
 ├── scripts/
 │   ├── build.sh               # Resolves tags + OCI labels, invokes buildx
-│   └── sbom-post.sh           # Posts CycloneDX SBOM to webhook / Dependency-Track
-├── .gitlab-ci.yml             # GitLab pipeline (inline, ~300 lines)
+│   ├── sbom-post.sh           # Ships CycloneDX SBOM to webhook / DT / Artifactory
+│   └── push-backends/
+│       └── artifactory.sh     # REGISTRY_KIND=artifactory backend (layout templates)
+├── .gitlab-ci.yml             # GitLab pipeline — inline, path-gated via workflow:rules
 ├── bamboo-specs/
 │   └── bamboo.yaml            # Bamboo plan spec (1:1 parity with GitLab)
 ├── .gitignore
