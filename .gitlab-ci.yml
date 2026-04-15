@@ -96,6 +96,20 @@ stages:
   - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     changes: *build-changes
 
+# Pipeline-level gate. Without this, GitLab still creates an empty
+# "container" pipeline when all jobs are filtered out by path rules,
+# and marks it failed because there's nothing to run. workflow:rules:
+# matches the build-rules above so pushes that touch no watched file
+# produce no pipeline at all — not even an empty red one.
+workflow:
+  rules:
+    - if: '$FORCE_ALL == "true"'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes: *build-changes
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *build-changes
+
 variables:
   # docker:dind TLS — disabled; matches internal GitLab runners that
   # don't mount /certs/client between dind service and job container.
