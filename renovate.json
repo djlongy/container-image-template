@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    ":dependencyDashboard"
+  ],
+  "dockerfile": {
+    "enabled": true
+  },
+  "packageRules": [
+    {
+      "description": "Upstream base image bumps — auto-open MRs",
+      "matchManagers": ["dockerfile"],
+      "matchUpdateTypes": ["major", "minor", "patch"],
+      "labels": ["upstream-bump", "dependencies"],
+      "automerge": false
+    }
+  ],
+  "labels": ["dependencies"],
+  "commitMessagePrefix": "chore(deps):",
+  "prBodyTemplate": "{{{header}}}\n\n{{{table}}}\n\n{{{notes}}}\n\n{{{changelogs}}}\n\n{{{configDescription}}}\n\n{{{controls}}}\n\n{{{footer}}}"
+}

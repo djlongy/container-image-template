@@ -1,0 +1,427 @@
+# container-image-template — Bamboo plan spec
+#
+# 1:1 parity with .gitlab-ci.yml. Same stages, same scripts/build.sh
+# entry point, same SBOM → Grype → Cosign → Ingest → Promote flow.
+# Runs on a Bamboo agent with docker installed (system.docker.executable
+# capability) — no dind dance needed.
+#
+# Required Bamboo plan variables (Settings → Plan Variables):
+#
+#   # Build + push baseline
+#   PUSH_REGISTRY             destination registry host
+#   PUSH_PROJECT              destination project / path
+#   PUSH_REGISTRY_USER        registry push username
+#   PUSH_REGISTRY_PASSWORD    registry push password (masked)
+#   VENDOR                    vendor label value
+#
+#   # Optional: CA trust for internal proxies
+#   CA_CERT                   PEM content of a corp CA (auto-triggers
+#                             INJECT_CERTS=true inside build.sh)
+#
+#   # Optional: cosign signing
+#   COSIGN_KEY                private key path or env: reference
+#
+#   # Optional: SBOM ingestion (either or both — sbom-post.sh is a
+#   # no-op if unset)
+#   SBOM_WEBHOOK_URL          generic CycloneDX webhook endpoint
+#   SBOM_WEBHOOK_AUTH_HEADER  optional auth header for the webhook
+#   DEPENDENCY_TRACK_URL      OWASP Dependency-Track base URL
+#   DEPENDENCY_TRACK_API_KEY  DT BOM-upload API key
+#   DEPENDENCY_TRACK_PROJECT  DT project name
+#
+#   # Optional: Artifactory push backend (same switch as the monorepo)
+#   REGISTRY_KIND             unset = Harbor; "artifactory" = delegate
+#                             to scripts/push-backends/artifactory.sh
+#   ARTIFACTORY_URL           https://artifactory.example.com
+#   ARTIFACTORY_USER          team user with Deploy rights
+#   ARTIFACTORY_TOKEN         access token (preferred) OR
+#   ARTIFACTORY_PASSWORD      basic-auth password
+#   ARTIFACTORY_TEAM          team acronym for layout templates
+#   ARTIFACTORY_ENVIRONMENT   dev | prod
+#   ARTIFACTORY_PUSH_HOST     docker push host (subdomain layouts)
+#   ARTIFACTORY_IMAGE_REF     docker push URL template
+#   ARTIFACTORY_MANIFEST_PATH REST path template for set-props
+#   ARTIFACTORY_BUILD_NAME    defaults to image name
+#   ARTIFACTORY_BUILD_NUMBER  defaults to buildResultKey / timestamp
+#   ARTIFACTORY_PROPERTIES    extra ;-separated props
+#   ARTIFACTORY_SBOM_REPO     Xray-indexed generic repo for SBOM import
+#
+#   # Optional: production promotion
+#   PROD_PUSH_REGISTRY        production registry host
+#   PROD_PUSH_PROJECT         prod project / path
+#   PROD_PUSH_REGISTRY_USER   prod push username
+#   PROD_PUSH_REGISTRY_PASSWORD  prod push password (masked)
+#
+# The pipeline reads VERSION and Dockerfile from the repo so the
+# internal semver and upstream pin travel with the code — no plan
+# variables needed for either.
+
+---
+version: 2
+
+plan:
+  project-key: DEVOPS
+  key: CIT
+  name: Container Image Template
+
+triggers:
+  - polling:
+      period: 60
+      repositories:
+        - container-image-template
+
+stages:
+  - Build:
+      jobs:
+        - build
+  - Scan:
+      jobs:
+        - sbom
+        - grype
+        # - trivy   # Disabled: banned for business use. Re-enable alongside the trivy job block.
+  - Sign:
+      jobs:
+        - cosign-sign
+  - Ingest:
+      jobs:
+        - sbom-ingest
+  - Promote:
+      manual: true
+      jobs:
+        - promote-prod
+
+# ═══════════════════════════════════════════════════════════════════
+# BUILD
+# ═══════════════════════════════════════════════════════════════════
+build:
+  tasks:
+    - checkout:
+        repository: container-image-template
+    - script:
+        interpreter: /bin/bash
+        description: buildx build and push
+        body: |
+          set -euo pipefail
+
+          # Relay plan vars into shell env so build.sh picks them up.
+          for var in PUSH_REGISTRY PUSH_PROJECT PUSH_REGISTRY_USER PUSH_REGISTRY_PASSWORD \
+                     VENDOR CA_CERT UPSTREAM_REGISTRY UPSTREAM_IMAGE UPSTREAM_TAG \
+                     IMAGE_NAME INJECT_CERTS REMEDIATE ORIGINAL_USER PLATFORM \
+                     REGISTRY_KIND \
+                     ARTIFACTORY_URL ARTIFACTORY_USER ARTIFACTORY_PASSWORD ARTIFACTORY_TOKEN \
+                     ARTIFACTORY_TEAM ARTIFACTORY_ENVIRONMENT ARTIFACTORY_PUSH_HOST \
+                     ARTIFACTORY_IMAGE_REF ARTIFACTORY_MANIFEST_PATH \
+                     ARTIFACTORY_BUILD_NAME ARTIFACTORY_BUILD_NUMBER ARTIFACTORY_PROPERTIES; do
+            bv="bamboo_${var}"
+            eval "val=\${${bv}:-}"
+            [ -n "${val}" ] && export "${var}=${val}"
+          done
+
+          # Log into push target (default Harbor path)
+          if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ]; then
+            echo "${PUSH_REGISTRY_PASSWORD}" | docker login "${PUSH_REGISTRY}" \
+              -u "${PUSH_REGISTRY_USER}" --password-stdin
+          fi
+
+          # Artifactory backend prep (jf CLI + docker login to push host)
+          if [ "${REGISTRY_KIND:-}" = "artifactory" ]; then
+            if ! command -v jf >/dev/null 2>&1; then
+              curl -fL https://install-cli.jfrog.io | sh
+              mv jf "${HOME}/.local/bin/" 2>/dev/null || sudo mv jf /usr/local/bin/ 2>/dev/null || true
+              export PATH="${HOME}/.local/bin:${PATH}"
+            fi
+            jf --version
+            ART_HOST="${ARTIFACTORY_PUSH_HOST:-}"
+            if [ -z "${ART_HOST}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
+              ART_HOST="${ARTIFACTORY_URL#https://}"
+              ART_HOST="${ART_HOST#http://}"
+              ART_HOST="${ART_HOST%%/*}"
+            fi
+            if [ -n "${ART_HOST}" ] && [ -n "${ARTIFACTORY_USER:-}" ]; then
+              echo "${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}" \
+                | docker login "${ART_HOST}" -u "${ARTIFACTORY_USER}" --password-stdin
+            fi
+          fi
+
+          # Ensure crane is on PATH (used by build.sh for base.digest)
+          if ! command -v crane >/dev/null 2>&1; then
+            curl -sL "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz" \
+              | tar xz -C "${HOME}/.local/bin/" crane 2>/dev/null \
+              || { mkdir -p "${HOME}/.local/bin"; \
+                   curl -sL "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz" \
+                   | tar xz -C "${HOME}/.local/bin/" crane; }
+            export PATH="${HOME}/.local/bin:${PATH}"
+          fi
+
+          bash ./scripts/build.sh --push
+  artifacts:
+    - name: build-env
+      location: .
+      pattern: build.env
+      shared: true
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# SCAN — SBOM generation (Syft → CycloneDX)
+# ═══════════════════════════════════════════════════════════════════
+sbom:
+  tasks:
+    - artifact-download:
+        artifacts:
+          - name: build-env
+            destination: .
+    - script:
+        interpreter: /bin/bash
+        description: Generate CycloneDX SBOM with Syft
+        body: |
+          set -euo pipefail
+          . ./build.env
+
+          for var in PUSH_REGISTRY_USER PUSH_REGISTRY_PASSWORD PUSH_REGISTRY; do
+            bv="bamboo_${var}"
+            eval "val=\${${bv}:-}"
+            [ -n "${val}" ] && export "${var}=${val}"
+          done
+
+          if ! command -v syft >/dev/null 2>&1; then
+            curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+              | sh -s -- -b "${HOME}/.local/bin" v1.14.0
+            export PATH="${HOME}/.local/bin:${PATH}"
+          fi
+
+          if [ -n "${PUSH_REGISTRY_USER:-}" ]; then
+            echo "${PUSH_REGISTRY_PASSWORD}" | docker login "${PUSH_REGISTRY}" \
+              -u "${PUSH_REGISTRY_USER}" --password-stdin
+          fi
+
+          SCAN_TARGET="${IMAGE_DIGEST:-${IMAGE_REF}}"
+          echo "→ Generating SBOM for ${SCAN_TARGET}"
+          syft "${SCAN_TARGET}" \
+            -o cyclonedx-json=sbom.cdx.json \
+            -o spdx-json=sbom.spdx.json \
+            -o syft-json=sbom.syft.json
+          ls -la sbom.*.json
+  artifacts:
+    - name: sbom
+      location: .
+      pattern: 'sbom.*.json'
+      shared: true
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# SCAN — Grype vulnerability scan (SBOM-first)
+# ═══════════════════════════════════════════════════════════════════
+grype:
+  tasks:
+    - artifact-download:
+        artifacts:
+          - name: build-env
+            destination: .
+          - name: sbom
+            destination: .
+    - script:
+        interpreter: /bin/bash
+        description: Grype scan of the SBOM
+        body: |
+          set -euo pipefail
+          . ./build.env
+
+          if ! command -v grype >/dev/null 2>&1; then
+            curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+              | sh -s -- -b "${HOME}/.local/bin" v0.82.0
+            export PATH="${HOME}/.local/bin:${PATH}"
+          fi
+
+          echo "→ Scanning SBOM for vulnerabilities"
+          grype sbom:sbom.cdx.json --output json --file grype-report.json --fail-on "" || true
+          grype sbom:sbom.cdx.json --output table || true
+
+          if command -v jq >/dev/null 2>&1; then
+            echo ""
+            echo "→ Vulnerability summary:"
+            for sev in Critical High Medium Low Negligible Unknown; do
+              count=$(jq "[.matches[] | select(.vulnerability.severity==\"${sev}\")] | length" grype-report.json)
+              echo "    ${sev}: ${count}"
+            done
+          fi
+  artifacts:
+    - name: grype-report
+      location: .
+      pattern: grype-report.json
+      shared: true
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# SCAN — Trivy (DISABLED: banned for business use)
+# ═══════════════════════════════════════════════════════════════════
+# Uncomment the job block below AND the stage reference above when
+# Trivy is re-permitted. Grype covers the same ground via the SBOM
+# scan so pipelines remain green without it.
+#
+# trivy:
+#   tasks:
+#     - artifact-download:
+#         artifacts:
+#           - name: build-env
+#             destination: .
+#     - script:
+#         interpreter: /bin/bash
+#         description: Trivy vulnerability scan
+#         body: |
+#           set -euo pipefail
+#           . ./build.env
+#           if ! command -v trivy >/dev/null 2>&1; then
+#             curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+#               | sh -s -- -b "${HOME}/.local/bin" v0.56.2
+#             export PATH="${HOME}/.local/bin:${PATH}"
+#           fi
+#           trivy image --format json --output trivy-report.json \
+#             --severity CRITICAL,HIGH,MEDIUM \
+#             "${IMAGE_DIGEST:-${IMAGE_REF}}"
+#           trivy image --severity CRITICAL,HIGH "${IMAGE_DIGEST:-${IMAGE_REF}}"
+#   artifacts:
+#     - name: trivy-report
+#       location: .
+#       pattern: trivy-report.json
+#       shared: true
+#   requirements:
+#     - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# SIGN — cosign sign + SBOM attestation
+# ═══════════════════════════════════════════════════════════════════
+cosign-sign:
+  tasks:
+    - artifact-download:
+        artifacts:
+          - name: build-env
+            destination: .
+          - name: sbom
+            destination: .
+          - name: grype-report
+            destination: .
+    - script:
+        interpreter: /bin/bash
+        description: Cosign sign + attest SBOM + attest vulns
+        body: |
+          set -euo pipefail
+          . ./build.env
+
+          for var in PUSH_REGISTRY_USER PUSH_REGISTRY_PASSWORD PUSH_REGISTRY COSIGN_KEY; do
+            bv="bamboo_${var}"
+            eval "val=\${${bv}:-}"
+            [ -n "${val}" ] && export "${var}=${val}"
+          done
+
+          if [ -z "${COSIGN_KEY:-}" ]; then
+            echo "SKIPPED: COSIGN_KEY not set"
+            exit 0
+          fi
+
+          if ! command -v cosign >/dev/null 2>&1; then
+            curl -sL "https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64" \
+              -o "${HOME}/.local/bin/cosign"
+            chmod +x "${HOME}/.local/bin/cosign"
+            export PATH="${HOME}/.local/bin:${PATH}"
+          fi
+
+          if [ -n "${PUSH_REGISTRY_USER:-}" ]; then
+            echo "${PUSH_REGISTRY_PASSWORD}" | docker login "${PUSH_REGISTRY}" \
+              -u "${PUSH_REGISTRY_USER}" --password-stdin
+          fi
+
+          TARGET="${IMAGE_DIGEST:-${IMAGE_REF}}"
+          cosign sign --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+            -a "ci.build=${bamboo_buildResultKey}" \
+            -a "ci.plan=${bamboo_planKey}" \
+            -a "git.commit=${GIT_SHA}" \
+            "${TARGET}"
+
+          if [ -f sbom.cdx.json ]; then
+            cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+              --type cyclonedx --predicate sbom.cdx.json "${TARGET}"
+          fi
+          if [ -f grype-report.json ]; then
+            cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+              --type vuln --predicate grype-report.json "${TARGET}"
+          fi
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# INGEST — SBOM post to configured sinks
+# ═══════════════════════════════════════════════════════════════════
+sbom-ingest:
+  tasks:
+    - artifact-download:
+        artifacts:
+          - name: build-env
+            destination: .
+          - name: sbom
+            destination: .
+    - script:
+        interpreter: /bin/bash
+        description: Post SBOM to configured sinks
+        body: |
+          set -euo pipefail
+          for var in SBOM_WEBHOOK_URL SBOM_WEBHOOK_AUTH_HEADER \
+                     DEPENDENCY_TRACK_URL DEPENDENCY_TRACK_API_KEY DEPENDENCY_TRACK_PROJECT \
+                     ARTIFACTORY_URL ARTIFACTORY_USER ARTIFACTORY_PASSWORD ARTIFACTORY_TOKEN \
+                     ARTIFACTORY_SBOM_REPO; do
+            bv="bamboo_${var}"
+            eval "val=\${${bv}:-}"
+            [ -n "${val}" ] && export "${var}=${val}"
+          done
+          bash ./scripts/sbom-post.sh sbom.cdx.json
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# PROMOTE — crane copy to production (manual)
+# ═══════════════════════════════════════════════════════════════════
+promote-prod:
+  tasks:
+    - artifact-download:
+        artifacts:
+          - name: build-env
+            destination: .
+    - script:
+        interpreter: /bin/bash
+        description: Promote built image to production registry
+        body: |
+          set -euo pipefail
+          . ./build.env
+
+          for var in PUSH_REGISTRY PUSH_REGISTRY_USER PUSH_REGISTRY_PASSWORD \
+                     PROD_PUSH_REGISTRY PROD_PUSH_PROJECT \
+                     PROD_PUSH_REGISTRY_USER PROD_PUSH_REGISTRY_PASSWORD; do
+            bv="bamboo_${var}"
+            eval "val=\${${bv}:-}"
+            [ -n "${val}" ] && export "${var}=${val}"
+          done
+
+          if [ -z "${PROD_PUSH_REGISTRY:-}" ] || [ -z "${IMAGE_DIGEST:-}" ]; then
+            echo "ERROR: need PROD_PUSH_REGISTRY and IMAGE_DIGEST" >&2
+            exit 1
+          fi
+
+          if ! command -v crane >/dev/null 2>&1; then
+            curl -sL "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz" \
+              | tar xz -C "${HOME}/.local/bin/" crane
+            export PATH="${HOME}/.local/bin:${PATH}"
+          fi
+
+          [ -n "${PUSH_REGISTRY_USER:-}" ] && \
+            crane auth login "${PUSH_REGISTRY}" -u "${PUSH_REGISTRY_USER}" -p "${PUSH_REGISTRY_PASSWORD}"
+          [ -n "${PROD_PUSH_REGISTRY_USER:-}" ] && \
+            crane auth login "${PROD_PUSH_REGISTRY}" -u "${PROD_PUSH_REGISTRY_USER}" -p "${PROD_PUSH_REGISTRY_PASSWORD}"
+
+          DEST_PROJECT="${PROD_PUSH_PROJECT:-${PUSH_PROJECT}}"
+          DST="${PROD_PUSH_REGISTRY}/${DEST_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}"
+          crane copy "${IMAGE_DIGEST}" "${DST}"
+          echo "Promoted: ${DST}"
+  requirements:
+    - system.docker.executable

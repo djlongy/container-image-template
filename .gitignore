@@ -1,0 +1,29 @@
+# Build artifacts
+build.env
+*.log
+
+# CA certificates injected at build time — never committed
+certs/*.crt
+certs/*.pem
+
+# Local workspace for credentials, test runners, private scratchpads.
+# Source scripts from here (gitignored so hostnames/tokens stay local).
+local/
+
+# SBOM / scan outputs — produced by the pipeline, not committed
+sbom*.json
+sbom*.xml
+grype-report.json
+trivy-report.json
+vulnerabilities.json
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Python scratch (for test helpers if any)
+__pycache__/
+*.pyc
+.venv/

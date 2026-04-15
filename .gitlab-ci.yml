@@ -1,0 +1,443 @@
+# container-image-template — GitLab CI pipeline
+#
+# Single-image build and DevSecOps pipeline. Everything inline —
+# no includes, no template indirection. Designed so a newcomer can
+# read this one file and see the entire promotion flow.
+#
+# Pipeline shape:
+#   build → sbom → grype → cosign-sign → sbom-ingest → promote (manual)
+#
+#   (trivy stages are present but commented out — uncomment when
+#    Trivy is unbanned for business use. Grype covers the SBOM-first
+#    vulnerability scanning in the meantime.)
+#
+# Variable precedence (CI sources of truth):
+#   - Group-level CI/CD variables: hostnames, registry creds, vault roles
+#   - Project-level CI/CD variables: team acronyms, project-specific overrides
+#   - Pipeline runtime variables: tag bumps, manual overrides
+#   - The VERSION file in the repo root: internal semver (bump via PR)
+#   - The Dockerfile's `# renovate:` comment on ARG UPSTREAM_TAG:
+#     upstream version pin (bumped by Renovate PRs)
+#
+# Required CI variables (typically set at group level):
+#   PUSH_REGISTRY             — destination registry host
+#   PUSH_PROJECT              — destination project / path
+#   PUSH_REGISTRY_USER        — push user
+#   PUSH_REGISTRY_PASSWORD    — push password (masked)
+#
+# Optional CI variables:
+#   CA_CERT                   — PEM content of corp CA, injects into image
+#                               (auto-flips INJECT_CERTS=true in build.sh)
+#   VENDOR                    — company name for OCI vendor label
+#   PLATFORM                  — default linux/amd64
+#   COSIGN_KEY                — cosign private key (file: reference, e.g. vault:...)
+#                               leave unset to skip signing
+#
+#   # ── Push backend switch ─────────────────────────────────────
+#   REGISTRY_KIND             — unset (default) = plain docker push
+#                               to PUSH_REGISTRY (Harbor baseline).
+#                               "artifactory" = delegate to the
+#                               scripts/push-backends/artifactory.sh
+#                               backend for layout-template resolution
+#                               and jf rt metadata.
+#   ARTIFACTORY_URL           — https://artifactory.example.com (REST)
+#   ARTIFACTORY_USER          — team/service user with Deploy
+#   ARTIFACTORY_TOKEN         — access token (preferred), OR
+#   ARTIFACTORY_PASSWORD      — basic-auth password
+#   ARTIFACTORY_TEAM          — team acronym (referenced by layout templates)
+#   ARTIFACTORY_ENVIRONMENT   — dev|prod; drives ARTIFACTORY_REPO_SUFFIX
+#   ARTIFACTORY_PUSH_HOST     — docker push hostname (subdomain layouts)
+#   ARTIFACTORY_IMAGE_REF     — docker push URL template
+#   ARTIFACTORY_MANIFEST_PATH — REST storage path template for set-props
+#   ARTIFACTORY_BUILD_NAME    — defaults to image name
+#   ARTIFACTORY_BUILD_NUMBER  — defaults to CI_JOB_ID / CI_PIPELINE_ID
+#   ARTIFACTORY_PROPERTIES    — extra ;-separated props
+#
+#   # ── SBOM ingestion (scripts/sbom-post.sh picks whichever are set) ─
+#   SBOM_WEBHOOK_URL          — generic SBOM ingestion endpoint
+#   SBOM_WEBHOOK_AUTH_HEADER  — optional auth header for the webhook
+#   DEPENDENCY_TRACK_URL      — OWASP Dependency-Track base URL
+#   DEPENDENCY_TRACK_API_KEY  — DT BOM-upload API key
+#   DEPENDENCY_TRACK_PROJECT  — DT project name
+#   ARTIFACTORY_SBOM_REPO     — JFrog Xray generic repo for SBOM
+#                               import (reuses ARTIFACTORY_URL /
+#                               ARTIFACTORY_USER / ARTIFACTORY_TOKEN
+#                               from the artifactory push backend).
+#
+#   PROD_PUSH_REGISTRY        — production registry for the promote stage
+#   PROD_PUSH_REGISTRY_USER   — prod push user
+#   PROD_PUSH_REGISTRY_PASSWORD — prod push password
+#   ENABLE_PROD_PROMOTE       — set to "true" to show the manual promote job
+
+stages:
+  - build
+  - scan
+  - sign
+  - ingest
+  - promote
+
+variables:
+  # docker:dind TLS — disabled; matches internal GitLab runners that
+  # don't mount /certs/client between dind service and job container.
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
+  # Buildx enables dynamic OCI labels (base.digest, source, etc.).
+  DOCKER_BUILDKIT: "1"
+  BUILDX_VERSION: "v0.17.1"
+  # Tool versions — pin explicitly, pulled via curl in before_script.
+  SYFT_VERSION: "v1.14.0"
+  GRYPE_VERSION: "v0.82.0"
+  COSIGN_VERSION: "v2.4.1"
+  CRANE_VERSION: "v0.20.2"
+
+# ── Shared before_script: install tools used by most jobs ──────────
+.install-tools: &install-tools
+  - apk add --no-cache bash git curl openssl jq
+  - |
+    # crane — used by build.sh for base digest + by promote for crane copy
+    if ! command -v crane >/dev/null 2>&1; then
+      curl -sL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+        | tar xz -C /usr/local/bin/ crane
+    fi
+
+# ═══════════════════════════════════════════════════════════════════
+# BUILD
+# ═══════════════════════════════════════════════════════════════════
+build:
+  stage: build
+  image: docker:27-cli
+  services:
+    - name: docker:27-dind
+      alias: docker
+  before_script:
+    - *install-tools
+    # buildx plugin for docker:27-cli (not shipped by default)
+    - |
+      mkdir -p /root/.docker/cli-plugins
+      curl -sL -o /root/.docker/cli-plugins/docker-buildx \
+        "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-amd64"
+      chmod +x /root/.docker/cli-plugins/docker-buildx
+      docker buildx version
+  script:
+    # Log into the Harbor-style push registry (default path).
+    - |
+      if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ]; then
+        echo "${PUSH_REGISTRY_PASSWORD}" | docker login "${PUSH_REGISTRY}" \
+          -u "${PUSH_REGISTRY_USER}" --password-stdin
+      fi
+    # Artifactory backend: install jf CLI and log into the Artifactory
+    # push host. build.sh's backend dispatch takes care of the rest.
+    - |
+      if [ "${REGISTRY_KIND:-}" = "artifactory" ]; then
+        if ! command -v jf >/dev/null 2>&1; then
+          curl -fL https://install-cli.jfrog.io | sh
+          mv jf /usr/local/bin/ 2>/dev/null || true
+        fi
+        jf --version
+        ART_HOST="${ARTIFACTORY_PUSH_HOST:-}"
+        if [ -z "${ART_HOST}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
+          ART_HOST="${ARTIFACTORY_URL#https://}"
+          ART_HOST="${ART_HOST#http://}"
+          ART_HOST="${ART_HOST%%/*}"
+        fi
+        if [ -n "${ART_HOST}" ] && [ -n "${ARTIFACTORY_USER:-}" ]; then
+          echo "${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}" \
+            | docker login "${ART_HOST}" -u "${ARTIFACTORY_USER}" --password-stdin
+        fi
+      fi
+    - bash ./scripts/build.sh --push
+  artifacts:
+    reports:
+      dotenv: build.env
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# ═══════════════════════════════════════════════════════════════════
+# SCAN — SBOM generation
+# ═══════════════════════════════════════════════════════════════════
+# Syft generates the CycloneDX SBOM from the pushed image digest.
+# This is the single source of truth for the rest of the pipeline:
+# Grype consumes it, cosign attests it, sbom-post.sh ships it.
+sbom:
+  stage: scan
+  image: alpine:3.20
+  needs:
+    - job: build
+      artifacts: true
+  before_script:
+    - *install-tools
+    - |
+      if ! command -v syft >/dev/null 2>&1; then
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+          | sh -s -- -b /usr/local/bin "${SYFT_VERSION}"
+      fi
+      syft version
+  script:
+    # Log in so syft can pull the image manifest by digest.
+    - |
+      if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ]; then
+        mkdir -p ~/.docker
+        AUTH=$(printf '%s' "${PUSH_REGISTRY_USER}:${PUSH_REGISTRY_PASSWORD}" | base64 -w0)
+        printf '{"auths":{"%s":{"auth":"%s"}}}\n' "${PUSH_REGISTRY}" "${AUTH}" > ~/.docker/config.json
+      fi
+    - |
+      echo "→ Generating SBOM for ${IMAGE_DIGEST:-${IMAGE_REF}}"
+      SCAN_TARGET="${IMAGE_DIGEST:-${IMAGE_REF}}"
+      syft "${SCAN_TARGET}" \
+        -o cyclonedx-json=sbom.cdx.json \
+        -o spdx-json=sbom.spdx.json \
+        -o syft-json=sbom.syft.json
+      echo "→ SBOM generated:"
+      ls -la sbom.*.json
+      # Quick component count for the pipeline log
+      if command -v jq >/dev/null 2>&1; then
+        echo "  components: $(jq '.components | length' sbom.cdx.json)"
+      fi
+  artifacts:
+    paths:
+      - sbom.cdx.json
+      - sbom.spdx.json
+      - sbom.syft.json
+    reports:
+      cyclonedx: sbom.cdx.json
+    expire_in: 1 month
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# ═══════════════════════════════════════════════════════════════════
+# SCAN — vulnerability scanning (Grype, SBOM-first)
+# ═══════════════════════════════════════════════════════════════════
+# Grype reads the CycloneDX SBOM directly (no image re-pull) and
+# matches components against its vulnerability database. This is the
+# replacement for Trivy while Trivy is banned for business use.
+grype:
+  stage: scan
+  image: alpine:3.20
+  needs:
+    - job: build
+      artifacts: true
+    - job: sbom
+      artifacts: true
+  before_script:
+    - *install-tools
+    - |
+      if ! command -v grype >/dev/null 2>&1; then
+        curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+          | sh -s -- -b /usr/local/bin "${GRYPE_VERSION}"
+      fi
+      grype version
+  script:
+    - |
+      echo "→ Scanning SBOM for vulnerabilities (Grype)"
+      # Full JSON for downstream ingestion / cosign attestation
+      grype sbom:sbom.cdx.json \
+        --output json \
+        --file grype-report.json \
+        --fail-on "" \
+        || true
+      # Human-readable table for the pipeline log
+      grype sbom:sbom.cdx.json --output table || true
+
+      # Count by severity for the log summary
+      if command -v jq >/dev/null 2>&1; then
+        echo ""
+        echo "→ Vulnerability summary:"
+        for sev in Critical High Medium Low Negligible Unknown; do
+          count=$(jq "[.matches[] | select(.vulnerability.severity==\"${sev}\")] | length" grype-report.json)
+          echo "    ${sev}: ${count}"
+        done
+      fi
+
+      # Gate: fail the pipeline on new Critical CVEs (tune as needed).
+      # Uncomment when you want the gate to actually block:
+      #
+      # CRIT=$(jq '[.matches[] | select(.vulnerability.severity=="Critical")] | length' grype-report.json)
+      # if [ "${CRIT}" -gt 0 ]; then
+      #   echo "ERROR: ${CRIT} critical vulnerabilities found" >&2
+      #   exit 1
+      # fi
+  artifacts:
+    paths:
+      - grype-report.json
+    expire_in: 1 month
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# ═══════════════════════════════════════════════════════════════════
+# SCAN — Trivy (DISABLED: banned for business use)
+# ═══════════════════════════════════════════════════════════════════
+# Uncomment this entire block when Trivy is re-permitted. Grype
+# coverage overlaps heavily, so running both is optional — keep this
+# scaffold here so re-enablement is a single block uncomment.
+#
+# trivy:
+#   stage: scan
+#   image: alpine:3.20
+#   needs:
+#     - job: build
+#       artifacts: true
+#   before_script:
+#     - *install-tools
+#     - |
+#       if ! command -v trivy >/dev/null 2>&1; then
+#         curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+#           | sh -s -- -b /usr/local/bin v0.56.2
+#       fi
+#       trivy --version
+#   script:
+#     - |
+#       echo "→ Scanning image with Trivy"
+#       trivy image --format json --output trivy-report.json \
+#         --severity CRITICAL,HIGH,MEDIUM \
+#         "${IMAGE_DIGEST:-${IMAGE_REF}}"
+#       trivy image --severity CRITICAL,HIGH "${IMAGE_DIGEST:-${IMAGE_REF}}"
+#   artifacts:
+#     paths:
+#       - trivy-report.json
+#     expire_in: 1 month
+#   rules:
+#     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+#     - if: '$CI_COMMIT_TAG'
+
+# ═══════════════════════════════════════════════════════════════════
+# SIGN — cosign sign + SBOM attestation
+# ═══════════════════════════════════════════════════════════════════
+# Signs the image by digest (tag reassignment can't invalidate the
+# signature) and attests the CycloneDX SBOM + Grype report as
+# predicates, so downstream consumers can verify both provenance
+# AND scanned state at any time via `cosign verify-attestation`.
+cosign-sign:
+  stage: sign
+  image: alpine:3.20
+  needs:
+    - job: build
+      artifacts: true
+    - job: sbom
+      artifacts: true
+    - job: grype
+      artifacts: true
+  before_script:
+    - *install-tools
+    - |
+      if ! command -v cosign >/dev/null 2>&1; then
+        curl -sL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" \
+          -o /usr/local/bin/cosign
+        chmod +x /usr/local/bin/cosign
+      fi
+      cosign version
+  script:
+    - |
+      if [ -z "${COSIGN_KEY:-}" ]; then
+        echo "SKIPPED: COSIGN_KEY not set — image will be unsigned"
+        echo "  Set COSIGN_KEY as a CI variable (file: type preferred) to enable signing"
+        exit 0
+      fi
+    - |
+      if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ]; then
+        mkdir -p ~/.docker
+        AUTH=$(printf '%s' "${PUSH_REGISTRY_USER}:${PUSH_REGISTRY_PASSWORD}" | base64 -w0)
+        printf '{"auths":{"%s":{"auth":"%s"}}}\n' "${PUSH_REGISTRY}" "${AUTH}" > ~/.docker/config.json
+      fi
+    - |
+      TARGET="${IMAGE_DIGEST:-${IMAGE_REF}}"
+      echo "→ cosign sign ${TARGET}"
+      cosign sign --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+        -a "ci.build=${CI_JOB_ID}" \
+        -a "ci.pipeline=${CI_PIPELINE_ID}" \
+        -a "git.commit=${CI_COMMIT_SHA}" \
+        "${TARGET}"
+
+      if [ -f sbom.cdx.json ]; then
+        echo "→ cosign attest (CycloneDX SBOM)"
+        cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+          --type cyclonedx --predicate sbom.cdx.json "${TARGET}"
+      fi
+
+      if [ -f grype-report.json ]; then
+        echo "→ cosign attest (Grype vulnerability report)"
+        cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+          --type vuln --predicate grype-report.json "${TARGET}"
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+
+# ═══════════════════════════════════════════════════════════════════
+# INGEST — post SBOM to configured sinks
+# ═══════════════════════════════════════════════════════════════════
+# Runs scripts/sbom-post.sh which ships the CycloneDX JSON to whatever
+# sink is configured (generic webhook or OWASP Dependency-Track).
+# No-op if no sink env vars are set — safe to leave enabled even
+# before the business picks an SBOM platform.
+sbom-ingest:
+  stage: ingest
+  image: alpine:3.20
+  needs:
+    - job: build
+      artifacts: true
+    - job: sbom
+      artifacts: true
+  before_script:
+    - apk add --no-cache bash curl jq
+  script:
+    - bash ./scripts/sbom-post.sh sbom.cdx.json
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+  allow_failure: true
+
+# ═══════════════════════════════════════════════════════════════════
+# PROMOTE — crane copy to production registry (manual)
+# ═══════════════════════════════════════════════════════════════════
+# Byte-for-byte identical promotion using `crane copy`. No rebuild,
+# same digest. Gated behind ENABLE_PROD_PROMOTE=true so fresh clones
+# without a prod registry don't show a red manual gate.
+promote-prod:
+  stage: promote
+  image: alpine:3.20
+  needs:
+    - job: build
+      artifacts: true
+  before_script:
+    - *install-tools
+  script:
+    - |
+      if [ -z "${PROD_PUSH_REGISTRY:-}" ]; then
+        echo "ERROR: PROD_PUSH_REGISTRY not set" >&2
+        exit 1
+      fi
+      if [ -z "${IMAGE_DIGEST:-}" ]; then
+        echo "ERROR: IMAGE_DIGEST not available from build stage" >&2
+        exit 1
+      fi
+    - |
+      if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ]; then
+        crane auth login "${PUSH_REGISTRY}" -u "${PUSH_REGISTRY_USER}" -p "${PUSH_REGISTRY_PASSWORD}"
+      fi
+      if [ -n "${PROD_PUSH_REGISTRY_USER:-}" ] && [ -n "${PROD_PUSH_REGISTRY_PASSWORD:-}" ]; then
+        crane auth login "${PROD_PUSH_REGISTRY}" -u "${PROD_PUSH_REGISTRY_USER}" -p "${PROD_PUSH_REGISTRY_PASSWORD}"
+      fi
+    - |
+      DEST_PROJECT="${PROD_PUSH_PROJECT:-${PUSH_PROJECT}}"
+      DST="${PROD_PUSH_REGISTRY}/${DEST_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}"
+      echo "→ crane copy ${IMAGE_DIGEST} → ${DST}"
+      crane copy "${IMAGE_DIGEST}" "${DST}"
+      echo "→ promoted"
+      echo "  source digest: $(crane digest ${IMAGE_DIGEST})"
+      echo "  dest digest:   $(crane digest ${DST})"
+  rules:
+    - if: '$ENABLE_PROD_PROMOTE != "true"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true
+    - if: '$CI_COMMIT_TAG'
+      when: manual
+      allow_failure: true
