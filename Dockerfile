@@ -32,15 +32,26 @@ ARG ORIGINAL_USER=root
 # ── Upstream base ────────────────────────────────────────────────────
 FROM ${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG} AS base
 
-# ── Static provenance labels ─────────────────────────────────────────
-# These never change build-to-build. Dynamic labels (version, revision,
-# created, base.digest, source, url) are set via --label in build.sh.
-LABEL org.opencontainers.image.title="nginx" \
-      org.opencontainers.image.description="Upstream nginx rebuilt with CVE remediation and OCI provenance" \
-      org.opencontainers.image.vendor="example.com" \
-      org.opencontainers.image.licenses="BSD-2-Clause" \
-      org.opencontainers.image.authors="Platform Engineering" \
-      org.opencontainers.image.documentation="https://nginx.org/en/docs/"
+# ── Label policy: preserve upstream, append ours ─────────────────────
+#
+# We intentionally do NOT set static LABEL lines here. Docker's label
+# inheritance model is "later LABELs override earlier ones by key" —
+# so any LABEL we wrote would silently clobber whatever the upstream
+# image already carried (maintainer strings, upstream title,
+# maintainer-authored annotations, license declarations, etc).
+#
+# Instead, all labels are added via `docker buildx build --label ...`
+# in scripts/build.sh, which ALSO follows override semantics but is
+# a much shorter list of explicitly-chosen keys:
+#
+#   - ours: vendor, authors (team identity — we intentionally override)
+#   - dynamic: version, revision, created, base.name, base.digest,
+#              source, url (never collide with upstream in practice)
+#
+# Upstream labels for title, description, licenses, documentation,
+# maintainer, and any image-specific ones flow through untouched.
+# Forkers can add their own LABEL lines here if they want to override
+# a specific upstream value — but the default is to preserve.
 
 # ── Cert injection (optional) ────────────────────────────────────────
 # When INJECT_CERTS=true, copy everything from certs/ into the system

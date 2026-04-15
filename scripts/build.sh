@@ -186,12 +186,18 @@ BUILD_ARGS=(
   --build-arg "ORIGINAL_USER=${ORIGINAL_USER}"
 )
 
+# Label policy: preserve upstream, append ours. See Dockerfile for
+# the reasoning. We explicitly set only the labels we want to own:
+#   - dynamic provenance (version/revision/created/base.*/source/url)
+#   - team identity (vendor/authors) which is intentional override
+# Everything else from the upstream image flows through untouched.
 LABEL_ARGS=(
   --label "org.opencontainers.image.version=${VERSION}"
   --label "org.opencontainers.image.revision=${GIT_SHA}"
   --label "org.opencontainers.image.created=${CREATED}"
   --label "org.opencontainers.image.base.name=${UPSTREAM_REF}"
   --label "org.opencontainers.image.vendor=${VENDOR}"
+  --label "org.opencontainers.image.authors=${AUTHORS:-Platform Engineering}"
 )
 if [ -n "${BASE_DIGEST}" ]; then
   LABEL_ARGS+=(--label "org.opencontainers.image.base.digest=${BASE_DIGEST}")
