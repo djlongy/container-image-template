@@ -364,3 +364,5 @@ docker login "${PUSH_REGISTRY}"
 ## License
 
 MIT — see `LICENSE`.
+
+<!-- path-gate smoke test: this comment should NOT trigger a pipeline -->
