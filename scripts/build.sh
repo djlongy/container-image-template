@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Single-image build + push driver.
 #
-# Computes a semver-qualified tag from VERSION + upstream tag + git SHA,
-# pulls the upstream base digest for supply-chain labels, invokes
+# Computes the pushed tag as <UPSTREAM_TAG>-<gitShort>, pulls the
+# upstream base digest for supply-chain labels, invokes
 # `docker buildx build` with the full OCI label set, optionally pushes,
 # and emits build.env for downstream CI stages.
 #
@@ -38,9 +38,8 @@
 #                       as the monorepo — the image is built locally
 #                       (--load), then the backend retags and pushes.
 #
-# Everything else is derived: VERSION from the VERSION file, GIT_SHA
-# from git, CREATED from `date -u`, BASE_DIGEST from `crane digest` on
-# the upstream reference.
+# Everything else is derived: GIT_SHA from git, CREATED from
+# `date -u`, BASE_DIGEST from `crane digest` on the upstream reference.
 
 set -euo pipefail
 
@@ -50,9 +49,9 @@ cd "${REPO_ROOT}"
 # ── Config resolution ────────────────────────────────────────────────
 #
 # image.env is the single source of truth for everything about the
-# image: VERSION, IMAGE_NAME, UPSTREAM_REGISTRY, UPSTREAM_IMAGE,
-# UPSTREAM_TAG, REMEDIATE, INJECT_CERTS, ORIGINAL_USER. One file,
-# three-layer precedence:
+# image: IMAGE_NAME, UPSTREAM_REGISTRY, UPSTREAM_IMAGE, UPSTREAM_TAG,
+# REMEDIATE, INJECT_CERTS, ORIGINAL_USER. One file, three-layer
+# precedence:
 #
 #   1. image.env.example  — tracked, canonical, the template
 #   2. image.env          — gitignored, local override for dev work
@@ -62,7 +61,7 @@ cd "${REPO_ROOT}"
 # re-apply the snapshot so exports still take precedence.
 
 __SHELL_OVERRIDES=""
-for __v in VERSION IMAGE_NAME \
+for __v in IMAGE_NAME \
            UPSTREAM_REGISTRY UPSTREAM_IMAGE UPSTREAM_TAG \
            REMEDIATE INJECT_CERTS ORIGINAL_USER \
            VENDOR PLATFORM APK_MIRROR CA_CERT \
@@ -104,7 +103,6 @@ unset __SHELL_OVERRIDES
 
 # Required fields — hard-fail with a clear message if image.env is
 # missing any of these.
-: "${VERSION:?VERSION must be set in image.env}"
 : "${UPSTREAM_REGISTRY:?UPSTREAM_REGISTRY must be set in image.env}"
 : "${UPSTREAM_IMAGE:?UPSTREAM_IMAGE must be set in image.env}"
 : "${UPSTREAM_TAG:?UPSTREAM_TAG must be set in image.env}"
@@ -117,12 +115,12 @@ ORIGINAL_USER="${ORIGINAL_USER:-root}"
 VENDOR="${VENDOR:-example.com}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 
-# ── Versioning ───────────────────────────────────────────────────────
-# Two independent version axes both live in image.env now:
-#   - VERSION:     internal semver, human-bumped via PR
-#   - UPSTREAM_TAG: upstream version pin, Renovate-bumped via the
-#                   `# renovate:` hint next to it in image.env
-# Final tag embeds both plus the commit SHA for bit-for-bit traceability.
+# ── Tag computation ──────────────────────────────────────────────────
+# Tag format matches the container-images monorepo:
+#   <UPSTREAM_TAG>-<gitShort>
+# The upstream tag IS the semver; the git SHA differentiates builds
+# of the same upstream version (remediation changes, cert rotation,
+# etc). No internal version axis.
 
 if ! git rev-parse HEAD >/dev/null 2>&1; then
   GIT_SHA="unknown"
@@ -133,7 +131,7 @@ else
 fi
 
 CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-FULL_TAG="${VERSION}-${UPSTREAM_TAG}-${GIT_SHORT}"
+FULL_TAG="${UPSTREAM_TAG}-${GIT_SHORT}"
 
 # ── Cert materialisation ─────────────────────────────────────────────
 # If CA_CERT is set, write it to certs/ so the certs-true stage can
@@ -201,7 +199,6 @@ echo "=========================================="
 echo "  Image:              ${FULL_IMAGE}"
 echo "  Upstream:           ${UPSTREAM_REF}"
 echo "  Upstream digest:    ${BASE_DIGEST:-<not resolved>}"
-echo "  Internal version:   ${VERSION}"
 echo "  Git commit:         ${GIT_SHORT} (${GIT_SHA})"
 echo "  Created (UTC):      ${CREATED}"
 echo "  Platform:           ${PLATFORM}"
@@ -234,7 +231,7 @@ BUILD_ARGS=(
 #   - team identity (vendor/authors) which is intentional override
 # Everything else from the upstream image flows through untouched.
 LABEL_ARGS=(
-  --label "org.opencontainers.image.version=${VERSION}"
+  --label "org.opencontainers.image.version=${FULL_TAG}"
   --label "org.opencontainers.image.revision=${GIT_SHA}"
   --label "org.opencontainers.image.created=${CREATED}"
   --label "org.opencontainers.image.base.name=${UPSTREAM_REF}"
@@ -291,7 +288,7 @@ echo "→ build complete: ${FULL_IMAGE}"
 
 # Export derived values so the backend script can pull them in via
 # parameter expansion when building build.env.
-export VERSION UPSTREAM_TAG UPSTREAM_REF BASE_DIGEST GIT_SHA CREATED
+export UPSTREAM_TAG UPSTREAM_REF BASE_DIGEST GIT_SHA CREATED
 
 # ── Push + emit build.env ────────────────────────────────────────────
 
@@ -324,7 +321,6 @@ IMAGE_REF=${FULL_IMAGE}
 IMAGE_TAG=${FULL_TAG}
 IMAGE_DIGEST=${IMAGE_DIGEST}
 IMAGE_NAME=${IMAGE_NAME}
-INTERNAL_VERSION=${VERSION}
 UPSTREAM_TAG=${UPSTREAM_TAG}
 UPSTREAM_REF=${UPSTREAM_REF}
 BASE_DIGEST=${BASE_DIGEST}

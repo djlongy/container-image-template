@@ -22,8 +22,10 @@ fleet fabric:
   one-line swap for debian/ubuntu/ubi)
 - **Cert injection**: optional CA cert stage, picks up anything in
   `certs/` or a PEM string from the `CA_CERT` CI variable
-- **Semver tagging**: internal `VERSION` file + upstream tag +
-  commit SHA → `1.0.0-1.25.3-alpine-a1b2c3d`
+- **Upstream-version tagging**: pushes at
+  `<image>:<UPSTREAM_TAG>-<gitShort>` (e.g. `nginx:1.25.3-alpine-a1b2c3d`).
+  The upstream tag IS the version — no second version axis. Matches
+  the container-images monorepo convention exactly.
 - **Full OCI label coverage via BuildKit**: static labels in the
   Dockerfile, dynamic labels (revision, created, base.digest, source)
   passed via `docker buildx build --label`
@@ -43,10 +45,11 @@ fleet fabric:
 ## Quick start — fork and rebrand
 
 **One file defines what this repo builds.** Everything about the
-image — internal semver, upstream registry/image/tag, behavior
-toggles — lives in a single `image.env.example`. The Dockerfile and
-`scripts/build.sh` are generic; they read this file and pass values
-through as `--build-arg`.
+image — upstream registry/image/tag, behavior toggles — lives in a
+single `image.env.example`. The Dockerfile and `scripts/build.sh` are
+generic; they read this file and pass values through as `--build-arg`.
+The upstream tag IS the version; the pushed tag is
+`<UPSTREAM_TAG>-<gitShort>`. No internal semver.
 
 ```bash
 # 1. Clone as a new per-image repo
@@ -55,7 +58,6 @@ cd my-app
 
 # 2. Edit THE ONE FILE
 $EDITOR image.env.example
-#    VERSION              internal semver (1.0.0)
 #    UPSTREAM_REGISTRY    docker.io/library (or your Artifactory proxy)
 #    UPSTREAM_IMAGE       nginx
 #    UPSTREAM_TAG         1.25.3-alpine  (Renovate auto-bumps via hint)
@@ -321,40 +323,44 @@ Trivy is unbanned for business use, uncomment the `trivy:` job in
 reference. Grype covers the same ground via the SBOM scan in the
 meantime — no gap.
 
-## The two version axes
+## Tagging convention
 
-This template keeps upstream and internal versions independent:
-
-- **`VERSION` file** — your internal semver. Bump manually via PR, or
-  wire up a release-please job to do it. Breaks in your remediate stage
-  or your cert injection bump the internal version even when the upstream
-  tag is unchanged.
-- **`ARG UPSTREAM_TAG` in Dockerfile** — the upstream version pin.
-  Bumped by Renovate automatically via the `# renovate:` comment hint.
-
-The computed image tag combines both plus the commit SHA:
+We're not the upstream — we're a **variant** of the upstream. We
+pulled `nginx:1.25.3-alpine`, remediated its CVEs, optionally
+injected a corp CA, and produced something that's no longer
+bit-for-bit identical to what's on Docker Hub. The tagging
+convention makes that delineation explicit.
 
 ```
-<registry>/<project>/<image>:<VERSION>-<UPSTREAM_TAG>-<gitShort>
+<registry>/<project>/<image>:<UPSTREAM_TAG>-<gitShort>
 
 # Example:
-harbor.example.com/base-images/nginx:1.0.0-1.25.3-alpine-a1b2c3d
+harbor.example.com/base-images/nginx:1.25.3-alpine-a1b2c3d
 ```
 
-This means (a) no tag collisions ever, (b) each build is bit-for-bit
-traceable to a single commit, and (c) the human-readable portion tells
-you both "which upstream" and "which of our revisions" at a glance.
+- **`UPSTREAM_TAG`** tells the consumer which upstream release this
+  started from. Bumped by Renovate via the `# renovate:` hint in
+  `image.env.example` when new upstream releases drop.
+- **`gitShort`** is the 7-char commit SHA of the build. Every commit
+  produces a uniquely-tagged image — so changes to remediation
+  logic, cert rotation, label tweaks, etc. each get their own
+  traceable artifact even when the upstream tag is unchanged.
+
+Matches the container-images monorepo convention exactly. The OCI
+`org.opencontainers.image.version` label on the image is **also**
+set to `<UPSTREAM_TAG>-<gitShort>` (not just the bare upstream tag)
+so tools inspecting the image can tell at a glance that it's a
+rebuild, not an untouched upstream.
 
 ## OCI labels
 
-The Dockerfile sets the **static** provenance labels — ones that only
-change when the Dockerfile itself changes (title, description, vendor,
-authors, licenses, documentation). The build script adds the
-**dynamic** ones via `docker buildx build --label`:
+The build script adds dynamic labels via `docker buildx build --label`.
+Upstream labels (like `maintainer`) flow through untouched — we only
+set keys we explicitly want to own:
 
 | Label | Source |
 |---|---|
-| `org.opencontainers.image.version` | `VERSION` file |
+| `org.opencontainers.image.version` | `${UPSTREAM_TAG}-${gitShort}` — matches the pushed tag exactly. This makes it explicit that the image is a **variant** of the upstream (remediated / cert-injected), not the untouched upstream |
 | `org.opencontainers.image.revision` | `git rev-parse HEAD` |
 | `org.opencontainers.image.created` | `date -u` at build time |
 | `org.opencontainers.image.base.name` | `UPSTREAM_REGISTRY/UPSTREAM_IMAGE:UPSTREAM_TAG` |
@@ -362,10 +368,11 @@ authors, licenses, documentation). The build script adds the
 | `org.opencontainers.image.source` | `CI_PROJECT_URL` / git remote |
 | `org.opencontainers.image.url` | same |
 | `org.opencontainers.image.vendor` | `VENDOR` variable |
+| `org.opencontainers.image.authors` | `AUTHORS` variable (default `Platform Engineering`) |
 
-This matches the DevSecOps convention: source control holds the
-static story, build invocation stamps the dynamic one. The Dockerfile
-never needs a commit-SHA edit.
+This matches the DevSecOps convention: upstream provenance is
+preserved, our provenance is appended. The `image.version` label
+reports the upstream tag, which is what OCI consumers expect.
 
 ## Repository structure
 

@@ -130,7 +130,6 @@ IMAGE_REF=${target}
 IMAGE_TAG=${IMAGE_TAG}
 IMAGE_DIGEST=${digest_ref}
 IMAGE_NAME=${IMAGE_NAME}
-INTERNAL_VERSION=${VERSION:-unknown}
 UPSTREAM_TAG=${UPSTREAM_TAG:-unknown}
 UPSTREAM_REF=${UPSTREAM_REF:-unknown}
 BASE_DIGEST=${BASE_DIGEST:-}
@@ -236,7 +235,7 @@ _artifactory_set_props() {
   local props="environment=${env};build.name=${build_name};build.number=${build_number}"
   [ -n "${ARTIFACTORY_TEAM:-}" ] && props="${props};team=${ARTIFACTORY_TEAM}"
   [ -n "${GIT_SHA:-}" ]          && props="${props};git.commit=${GIT_SHA}"
-  [ -n "${INTERNAL_VERSION:-}" ] && props="${props};internal.version=${INTERNAL_VERSION}"
+  [ -n "${UPSTREAM_TAG:-}" ]     && props="${props};upstream.tag=${UPSTREAM_TAG}"
   [ -n "${ARTIFACTORY_PROPERTIES:-}" ] && props="${props};${ARTIFACTORY_PROPERTIES}"
 
   if ! jf rt set-props "${manifest_path}" "${props}" 2>/dev/null; then

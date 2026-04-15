@@ -14,10 +14,11 @@
 # Variable precedence (CI sources of truth):
 #   - Group-level CI/CD variables: hostnames, registry creds, vault roles
 #   - Project-level CI/CD variables: team acronyms, project-specific overrides
-#   - Pipeline runtime variables: tag bumps, manual overrides
-#   - The VERSION file in the repo root: internal semver (bump via PR)
-#   - The Dockerfile's `# renovate:` comment on ARG UPSTREAM_TAG:
-#     upstream version pin (bumped by Renovate PRs)
+#   - Pipeline runtime variables: manual overrides
+#   - image.env.example at the repo root: upstream pin, image name,
+#     behavior flags. Renovate's `# renovate:` hint next to
+#     UPSTREAM_TAG is what bumps the upstream version pin via PRs.
+#     The upstream tag IS the image version — no separate semver.
 #
 # Required CI variables (typically set at group level):
 #   PUSH_REGISTRY             — destination registry host

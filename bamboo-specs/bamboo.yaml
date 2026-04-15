@@ -65,9 +65,10 @@
 #   PROD_PUSH_REGISTRY_USER   prod push username
 #   PROD_PUSH_REGISTRY_PASSWORD  prod push password (masked)
 #
-# The pipeline reads VERSION and Dockerfile from the repo so the
-# internal semver and upstream pin travel with the code — no plan
-# variables needed for either.
+# The pipeline reads image.env.example from the repo so the upstream
+# pin and behavior flags travel with the code — no plan variables
+# needed for either. The upstream tag is also the image version (no
+# separate semver).
 
 ---
 version: 2

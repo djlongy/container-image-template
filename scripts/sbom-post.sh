@@ -74,8 +74,8 @@ if [ -n "${SBOM_WEBHOOK_URL:-}" ]; then
   if [ -n "${IMAGE_DIGEST:-}" ]; then
     HEADERS+=(-H "X-Image-Digest: ${IMAGE_DIGEST}")
   fi
-  if [ -n "${INTERNAL_VERSION:-}" ]; then
-    HEADERS+=(-H "X-Image-Version: ${INTERNAL_VERSION}")
+  if [ -n "${UPSTREAM_TAG:-}" ]; then
+    HEADERS+=(-H "X-Image-Version: ${UPSTREAM_TAG}")
   fi
   if curl -fsSL -X POST "${HEADERS[@]}" --data-binary "@${SBOM_FILE}" "${SBOM_WEBHOOK_URL}" -o /tmp/webhook-response.txt 2>&1; then
     echo "  ✓ posted ($(wc -c < /tmp/webhook-response.txt) bytes response)"
@@ -94,7 +94,7 @@ if [ -n "${DEPENDENCY_TRACK_URL:-}" ] && [ -n "${DEPENDENCY_TRACK_API_KEY:-}" ];
     echo "  ✗ DEPENDENCY_TRACK_PROJECT not set — skipping" >&2
     failures=$((failures + 1))
   else
-    DT_VERSION="${INTERNAL_VERSION:-latest}"
+    DT_VERSION="${UPSTREAM_TAG:-latest}"
     # DT /api/v1/bom expects a JSON body with base64-encoded bom.
     # `jq -Rs .` handles the escaping for us reliably.
     if command -v jq >/dev/null 2>&1; then
@@ -139,7 +139,7 @@ if [ -n "${ARTIFACTORY_URL:-}" ] && [ -n "${ARTIFACTORY_USER:-}" ] \
     failures=$((failures + 1))
   else
     IMG="${IMAGE_NAME:-image}"
-    VER="${INTERNAL_VERSION:-latest}"
+    VER="${UPSTREAM_TAG:-latest}"
     DEPLOY_PATH="${ARTIFACTORY_SBOM_REPO}/${IMG}/${VER}/sbom.cdx.json"
     DEPLOY_URL="${ARTIFACTORY_URL%/}/artifactory/${DEPLOY_PATH}"
     echo "→ Upload SBOM to Artifactory Xray: ${DEPLOY_PATH}"
