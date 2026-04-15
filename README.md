@@ -366,3 +366,5 @@ docker login "${PUSH_REGISTRY}"
 MIT — see `LICENSE`.
 
 <!-- path-gate smoke test: this comment should NOT trigger a pipeline -->
+
+<!-- smoke test #2: with workflow:rules, this should NOT create a pipeline at all -->
