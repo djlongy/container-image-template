@@ -150,6 +150,30 @@ If you've already configured layouts in the monorepo, the same
 template strings work here unchanged — just paste them into your
 group-level CI variables.
 
+> **⚠️ GitLab CI variable-expansion gotcha.** GitLab performs variable
+> substitution on CI variable **values** before injecting them into
+> the job shell. That means a literal `${IMAGE_NAME}` inside
+> `ARTIFACTORY_IMAGE_REF` gets expanded to an empty string (since
+> `IMAGE_NAME` isn't a CI variable — it's a runtime shell variable set
+> by `build.sh`). Three ways to avoid this:
+>
+> 1. **Set the variable with `raw=true`** (the clean fix). When
+>    creating the CI variable via the GitLab UI, check "Expand variable
+>    reference" → off. Via the API, pass `"raw": true`. This tells
+>    GitLab to leave the value untouched.
+> 2. **Escape the dollar signs with `$$`** when triggering pipelines
+>    via the `/projects/:id/pipeline` API or when the `raw` flag isn't
+>    available (older GitLab versions). GitLab collapses `$$` to `$`
+>    without substituting the reference. Example:
+>    `$${ARTIFACTORY_PUSH_HOST}/$${ARTIFACTORY_TEAM}/$${IMAGE_NAME}:$${IMAGE_TAG}`
+> 3. **Set the templates in `global.env`** (gitignored local file) or
+>    directly in `scripts/push-backends/artifactory.sh` — those are
+>    read by bash directly and never pass through GitLab's
+>    substitution step.
+>
+> Bamboo doesn't have this gotcha — it relays plan variables as
+> literal strings.
+
 **Recommended homelab workflow**: don't set `REGISTRY_KIND` at all
 (defaults to Harbor). **Recommended production workflow**: set
 `REGISTRY_KIND=artifactory` as a group-level CI variable on the

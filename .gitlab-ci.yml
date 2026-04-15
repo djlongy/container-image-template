@@ -178,11 +178,32 @@ sbom:
   script:
     # Log in so syft can pull the image manifest by digest.
     - |
+      # Write a config.json that covers BOTH Harbor and (optionally)
+      # Artifactory. Downstream tools (syft, cosign) use this to
+      # authenticate image pulls regardless of which backend the build
+      # stage pushed to. Order doesn't matter — each host key points
+      # to a separate auth entry.
+      mkdir -p ~/.docker
+      AUTHS=""
       if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ]; then
-        mkdir -p ~/.docker
-        AUTH=$(printf '%s' "${PUSH_REGISTRY_USER}:${PUSH_REGISTRY_PASSWORD}" | base64 -w0)
-        printf '{"auths":{"%s":{"auth":"%s"}}}\n' "${PUSH_REGISTRY}" "${AUTH}" > ~/.docker/config.json
+        A=$(printf '%s' "${PUSH_REGISTRY_USER}:${PUSH_REGISTRY_PASSWORD}" | base64 -w0)
+        AUTHS="${AUTHS}\"${PUSH_REGISTRY}\":{\"auth\":\"${A}\"},"
       fi
+      if [ "${REGISTRY_KIND:-}" = "artifactory" ] && [ -n "${ARTIFACTORY_USER:-}" ]; then
+        ART_SECRET="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
+        ART_HOST="${ARTIFACTORY_PUSH_HOST:-}"
+        if [ -z "${ART_HOST}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
+          ART_HOST="${ARTIFACTORY_URL#https://}"
+          ART_HOST="${ART_HOST#http://}"
+          ART_HOST="${ART_HOST%%/*}"
+        fi
+        if [ -n "${ART_HOST}" ] && [ -n "${ART_SECRET}" ]; then
+          A=$(printf '%s' "${ARTIFACTORY_USER}:${ART_SECRET}" | base64 -w0)
+          AUTHS="${AUTHS}\"${ART_HOST}\":{\"auth\":\"${A}\"},"
+        fi
+      fi
+      AUTHS="${AUTHS%,}"
+      printf '{"auths":{%s}}\n' "${AUTHS}" > ~/.docker/config.json
     - |
       echo "→ Generating SBOM for ${IMAGE_DIGEST:-${IMAGE_REF}}"
       SCAN_TARGET="${IMAGE_DIGEST:-${IMAGE_REF}}"
@@ -340,11 +361,32 @@ cosign-sign:
         exit 0
       fi
     - |
+      # Write a config.json that covers BOTH Harbor and (optionally)
+      # Artifactory. Downstream tools (syft, cosign) use this to
+      # authenticate image pulls regardless of which backend the build
+      # stage pushed to. Order doesn't matter — each host key points
+      # to a separate auth entry.
+      mkdir -p ~/.docker
+      AUTHS=""
       if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ]; then
-        mkdir -p ~/.docker
-        AUTH=$(printf '%s' "${PUSH_REGISTRY_USER}:${PUSH_REGISTRY_PASSWORD}" | base64 -w0)
-        printf '{"auths":{"%s":{"auth":"%s"}}}\n' "${PUSH_REGISTRY}" "${AUTH}" > ~/.docker/config.json
+        A=$(printf '%s' "${PUSH_REGISTRY_USER}:${PUSH_REGISTRY_PASSWORD}" | base64 -w0)
+        AUTHS="${AUTHS}\"${PUSH_REGISTRY}\":{\"auth\":\"${A}\"},"
       fi
+      if [ "${REGISTRY_KIND:-}" = "artifactory" ] && [ -n "${ARTIFACTORY_USER:-}" ]; then
+        ART_SECRET="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
+        ART_HOST="${ARTIFACTORY_PUSH_HOST:-}"
+        if [ -z "${ART_HOST}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
+          ART_HOST="${ARTIFACTORY_URL#https://}"
+          ART_HOST="${ART_HOST#http://}"
+          ART_HOST="${ART_HOST%%/*}"
+        fi
+        if [ -n "${ART_HOST}" ] && [ -n "${ART_SECRET}" ]; then
+          A=$(printf '%s' "${ARTIFACTORY_USER}:${ART_SECRET}" | base64 -w0)
+          AUTHS="${AUTHS}\"${ART_HOST}\":{\"auth\":\"${A}\"},"
+        fi
+      fi
+      AUTHS="${AUTHS%,}"
+      printf '{"auths":{%s}}\n' "${AUTHS}" > ~/.docker/config.json
     - |
       TARGET="${IMAGE_DIGEST:-${IMAGE_REF}}"
       echo "→ cosign sign ${TARGET}"
