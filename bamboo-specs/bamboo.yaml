@@ -24,7 +24,6 @@
 #   # the agent has no outbound internet.
 #   APK_MIRROR                Alpine apk raw-proxy URL (replaces
 #                             dl-cdn.alpinelinux.org/alpine)
-#   BUILDX_URL                docker buildx linux-amd64 binary URL
 #   CRANE_URL                 go-containerregistry tarball URL
 #   SYFT_INSTALLER_URL        Syft install.sh URL
 #   GRYPE_INSTALLER_URL       Grype install.sh URL
@@ -113,7 +112,7 @@ build:
         repository: container-image-template
     - script:
         interpreter: /bin/bash
-        description: buildx build and push
+        description: build and push
         body: |
           set -euo pipefail
 
@@ -140,9 +139,9 @@ build:
           # Relay plan vars into shell env so build.sh picks them up.
           for var in PUSH_REGISTRY PUSH_PROJECT PUSH_REGISTRY_USER PUSH_REGISTRY_PASSWORD \
                      VENDOR CA_CERT UPSTREAM_REGISTRY UPSTREAM_IMAGE UPSTREAM_TAG \
-                     IMAGE_NAME DISTRO INJECT_CERTS REMEDIATE ORIGINAL_USER PLATFORM \
+                     IMAGE_NAME DISTRO INJECT_CERTS REMEDIATE ORIGINAL_USER \
                      APK_MIRROR APT_MIRROR \
-                     BUILDX_URL CRANE_URL SYFT_INSTALLER_URL GRYPE_INSTALLER_URL \
+                     CRANE_URL SYFT_INSTALLER_URL GRYPE_INSTALLER_URL \
                      COSIGN_URL JF_INSTALLER_URL \
                      REGISTRY_KIND \
                      ARTIFACTORY_URL ARTIFACTORY_USER ARTIFACTORY_PASSWORD ARTIFACTORY_TOKEN \

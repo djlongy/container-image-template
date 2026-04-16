@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 #
 # Single-image template Dockerfile.
 #
@@ -14,7 +13,7 @@
 #
 # Dynamic OCI labels (version, revision, created, base.digest, source,
 # etc.) are intentionally NOT set here with LABEL. They're passed by
-# scripts/build.sh via `docker buildx build --label ...`, which is the
+# scripts/build.sh via `docker build --label ...`, which is the
 # DevSecOps-recommended pattern: Dockerfiles hold static provenance
 # (title, vendor, licenses), build invocation holds dynamic provenance
 # (commit SHA, timestamp, base digest). Checking the Dockerfile into
@@ -47,7 +46,7 @@ FROM ${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG} AS base
 # image already carried (maintainer strings, upstream title,
 # maintainer-authored annotations, license declarations, etc).
 #
-# Instead, all labels are added via `docker buildx build --label ...`
+# Instead, all labels are added via `docker build --label ...`
 # in scripts/build.sh, which ALSO follows override semantics but is
 # a much shorter list of explicitly-chosen keys:
 #
@@ -106,6 +105,17 @@ ARG DISTRO
 ARG APK_MIRROR
 ARG APT_MIRROR
 USER root
+# Inject CA certs BEFORE remediation so apk/apt trust internal mirrors.
+# This runs regardless of INJECT_CERTS — the flag controls whether certs
+# persist in the FINAL shipped image, but the build always needs to trust
+# the mirror during package upgrades. Matches the monorepo pattern.
+COPY certs/ /tmp/build-certs/
+RUN set -eux; \
+    for f in /tmp/build-certs/*.crt /tmp/build-certs/*.pem; do \
+      [ -f "$f" ] || continue; \
+      cat "$f" >> /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true; \
+    done; \
+    rm -rf /tmp/build-certs
 COPY scripts/remediate/ /tmp/remediate/
 RUN set -eux; \
     chmod +x /tmp/remediate/${DISTRO}.sh; \

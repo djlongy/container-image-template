@@ -3,7 +3,7 @@
 #
 # Computes the pushed tag as <UPSTREAM_TAG>-<gitShort>, pulls the
 # upstream base digest for supply-chain labels, invokes
-# `docker buildx build` with the full OCI label set, optionally pushes,
+# `docker build` with the full OCI label set, optionally pushes,
 # and emits build.env for downstream CI stages.
 #
 # Usage:
@@ -25,7 +25,6 @@
 #   VENDOR              default: example.com
 #   CA_CERT             PEM content of a CA cert to inject (writes to certs/
 #                       before build, picked up by the COPY in Dockerfile)
-#   PLATFORM            default: linux/amd64
 #   SBOM_ATTEST         default: false — scaffolded for future cosign attest-sbom;
 #                       the active SBOM workflow is driven by .gitlab-ci.yml
 #                       calling syft/grype on the pushed image directly.
@@ -35,8 +34,8 @@
 #                       to scripts/push-backends/artifactory.sh, which
 #                       handles layout-template resolution, jf rt bp
 #                       build info, and property tagging. Same pattern
-#                       as the monorepo — the image is built locally
-#                       (--load), then the backend retags and pushes.
+#                       as the monorepo — the image is built locally,
+#                       then the backend retags and pushes.
 #
 # Everything else is derived: GIT_SHA from git, CREATED from
 # `date -u`, BASE_DIGEST from `crane digest` on the upstream reference.
@@ -64,7 +63,7 @@ __SHELL_OVERRIDES=""
 for __v in IMAGE_NAME DISTRO \
            UPSTREAM_REGISTRY UPSTREAM_IMAGE UPSTREAM_TAG \
            REMEDIATE INJECT_CERTS ORIGINAL_USER \
-           VENDOR PLATFORM APK_MIRROR APT_MIRROR CA_CERT \
+           VENDOR APK_MIRROR APT_MIRROR CA_CERT \
            REGISTRY_KIND \
            ARTIFACTORY_URL ARTIFACTORY_USER ARTIFACTORY_PASSWORD ARTIFACTORY_TOKEN \
            ARTIFACTORY_TEAM ARTIFACTORY_ENVIRONMENT ARTIFACTORY_PUSH_HOST \
@@ -114,7 +113,6 @@ REMEDIATE="${REMEDIATE:-true}"
 INJECT_CERTS="${INJECT_CERTS:-false}"
 ORIGINAL_USER="${ORIGINAL_USER:-root}"
 VENDOR="${VENDOR:-example.com}"
-PLATFORM="${PLATFORM:-linux/amd64}"
 
 # Validate DISTRO against the scripts shipped in scripts/remediate/.
 # Forkers can add a new distro by dropping scripts/remediate/<name>.sh
@@ -213,7 +211,6 @@ echo "  Upstream:           ${UPSTREAM_REF}"
 echo "  Upstream digest:    ${BASE_DIGEST:-<not resolved>}"
 echo "  Git commit:         ${GIT_SHORT} (${GIT_SHA})"
 echo "  Created (UTC):      ${CREATED}"
-echo "  Platform:           ${PLATFORM}"
 echo "  Distro:             ${DISTRO}"
 echo "  Remediate:          ${REMEDIATE}$([ "${REMEDIATE}" = "true" ] && echo " (scripts/remediate/${DISTRO}.sh)" || echo "")"
 echo "  Inject certs:       ${INJECT_CERTS}"
@@ -263,42 +260,13 @@ if [ -n "${SOURCE_URL}" ]; then
   LABEL_ARGS+=(--label "org.opencontainers.image.url=${SOURCE_URL}")
 fi
 
-# Ensure buildx builder is available. `docker buildx` is present in
-# modern Docker Desktop / docker-ce. CI images (docker:27-cli) have it
-# as a plugin.
-if ! docker buildx version >/dev/null 2>&1; then
-  echo "ERROR: docker buildx is required (install Docker 20.10+)" >&2
-  exit 1
-fi
-
-# Use a dedicated builder if one isn't active. Container driver gives
-# us consistent behaviour across Docker Desktop and CI dind.
-if ! docker buildx inspect template-builder >/dev/null 2>&1; then
-  docker buildx create --name template-builder --driver docker-container --use >/dev/null
-else
-  docker buildx use template-builder >/dev/null
-fi
-
-# Output mode:
-#   - Default (no REGISTRY_KIND): --push goes straight to PUSH_REGISTRY
-#     via buildx. --load for build-only runs.
-#   - REGISTRY_KIND=artifactory: always --load first, then the backend
-#     retags and pushes. buildx doesn't know about the artifactory
-#     layout template system, so we hand the image off after loading.
 REGISTRY_KIND_LC="$(echo "${REGISTRY_KIND:-}" | tr '[:upper:]' '[:lower:]')"
 
-OUTPUT_FLAG="--load"
-if [ ${WANT_PUSH} -eq 1 ] && [ -z "${REGISTRY_KIND_LC}" ]; then
-  OUTPUT_FLAG="--push"
-fi
-
-echo "→ docker buildx build (${OUTPUT_FLAG})"
-docker buildx build \
-  --platform "${PLATFORM}" \
+echo "→ docker build"
+docker build \
   "${BUILD_ARGS[@]}" \
   "${LABEL_ARGS[@]}" \
   -t "${FULL_IMAGE}" \
-  ${OUTPUT_FLAG} \
   .
 
 echo "→ build complete: ${FULL_IMAGE}"
@@ -323,14 +291,19 @@ if [ ${WANT_PUSH} -eq 1 ]; then
     . "${BACKEND}"
     push_to_backend "${FULL_IMAGE}" || exit 1
   else
-    # Default path: plain docker push already handled by buildx
-    # --push above. Just emit build.env with the locally-known values.
+    echo ""
+    echo "→ docker push ${FULL_IMAGE}"
+    PUSH_OUTPUT=$(docker push "${FULL_IMAGE}" 2>&1) || {
+      echo "${PUSH_OUTPUT}" >&2
+      echo "ERROR: docker push failed" >&2
+      exit 1
+    }
+    echo "${PUSH_OUTPUT}"
     IMAGE_DIGEST=""
-    if command -v crane >/dev/null 2>&1; then
-      IMAGE_DIGEST=$(crane digest "${FULL_IMAGE}" 2>/dev/null || echo "")
-      if [ -n "${IMAGE_DIGEST}" ]; then
-        IMAGE_DIGEST="${PUSH_REGISTRY}/${PUSH_PROJECT}/${IMAGE_NAME}@${IMAGE_DIGEST}"
-      fi
+    PUSH_DIGEST=$(printf '%s' "${PUSH_OUTPUT}" | grep -oE 'sha256:[0-9a-f]{64}' | head -1)
+    if [ -n "${PUSH_DIGEST}" ]; then
+      IMAGE_DIGEST="${PUSH_REGISTRY}/${PUSH_PROJECT}/${IMAGE_NAME}@${PUSH_DIGEST}"
+      echo "→ pushed: ${IMAGE_DIGEST}"
     fi
 
     cat > build.env <<EOF
