@@ -139,7 +139,6 @@ variables:
   #    Docker Hub is the common blocker, not github.com. Override
   #    here if your network also blocks GitHub and you've mirrored
   #    the binaries to an Artifactory generic repo.
-  BUILDX_URL: "https://github.com/docker/buildx/releases/download/v0.17.1/buildx-v0.17.1.linux-amd64"
   CRANE_URL: "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz"
   SYFT_INSTALLER_URL: "https://raw.githubusercontent.com/anchore/syft/main/install.sh"
   SYFT_VERSION: "v1.14.0"
@@ -189,12 +188,6 @@ build:
       alias: docker
   before_script:
     - *install-tools
-    # buildx plugin for docker:27-cli (not shipped by default)
-    - |
-      mkdir -p /root/.docker/cli-plugins
-      curl -sL -o /root/.docker/cli-plugins/docker-buildx "${BUILDX_URL}"
-      chmod +x /root/.docker/cli-plugins/docker-buildx
-      docker buildx version
   script:
     # Log into the Harbor-style push registry (default path).
     - |
