@@ -357,14 +357,33 @@ _artifactory_build_publish_free_with_modules() {
   _url="${_url%/artifactory}"
   local art_base="${_url}/artifactory"
 
-  # Step 1: jf rt bp for env + git (same as before)
+  # Step 1: jf rt bp publishes build info with env + git, using jf's
+  # own sensitive-value filtering (more comprehensive than regex).
   echo ""
-  echo "── Free: collecting env + git via jf rt bp ──"
+  echo "── Free: publishing baseline build info via jf rt bp ──"
   jf rt bp "${build_name}" "${build_number}" \
     --collect-env --collect-git-info 2>/dev/null || true
 
-  # Step 2: Build module-enriched JSON and re-publish via REST API.
-  # This overwrites the jf rt bp entry with the same data PLUS modules.
+  # Step 2: GET the published record back so we can merge modules
+  # into it (preserving jf's filtered env vars + git context).
+  echo "── Free: fetching published build info for merge ──"
+  # Write directly to file instead of capturing in a shell variable —
+  # the JSON can contain special characters in env var values that
+  # break shell variable assignment.
+  local _bi_tmpfile
+  _bi_tmpfile=$(mktemp)
+  local _bi_http_code
+  _bi_http_code=$(curl -sSL -o "${_bi_tmpfile}" -w "%{http_code}" \
+    -u "${ARTIFACTORY_USER}:${secret}" \
+    "${art_base}/api/build/${build_name}/${build_number}" 2>/dev/null)
+  if [ "${_bi_http_code}" = "200" ] && [ -s "${_bi_tmpfile}" ]; then
+    echo "  ✓ fetched (HTTP ${_bi_http_code}, $(wc -c < "${_bi_tmpfile}" | tr -d ' ') bytes)"
+  else
+    echo "  WARN: fetch returned HTTP ${_bi_http_code} — env vars won't be merged" >&2
+    rm -f "${_bi_tmpfile}"
+    _bi_tmpfile=""
+  fi
+
   echo "── Free: building module linkage from storage API ──"
 
   # Get the tag directory path (strip manifest.json from the end)
@@ -425,7 +444,13 @@ _artifactory_build_publish_free_with_modules() {
     echo "  upstream base layers: ${upstream_layer_count} (from docker inspect ${UPSTREAM_REF})"
   fi
 
-  # Assemble the build info JSON with Python
+  # Copy the fetched build info into the tmpdir for Python to read
+  if [ -n "${_bi_tmpfile}" ] && [ -f "${_bi_tmpfile}" ]; then
+    mv "${_bi_tmpfile}" "${tmpdir}/published-bi.json"
+  fi
+
+  # Assemble the build info JSON with Python — merges modules into
+  # the jf-published record (preserving env vars + git + VCS from jf).
   python3 - "${tmpdir}" "${file_count}" "${tag_subpath}" \
     "${build_name}" "${build_number}" "${target}" \
     "${IMAGE_NAME}" "${IMAGE_TAG}" "${git_rev}" "${git_url}" \
@@ -439,6 +464,19 @@ build_name, build_number, target = sys.argv[4], sys.argv[5], sys.argv[6]
 image_name, image_tag = sys.argv[7], sys.argv[8]
 git_rev, git_url, started = sys.argv[9], sys.argv[10], sys.argv[11]
 upstream_layer_count = int(sys.argv[12]) if len(sys.argv) > 12 else 0
+
+# Load the published build info (from jf rt bp) if available.
+# This has the properly-filtered env vars + git context.
+published_path = os.path.join(tmpdir, "published-bi.json")
+base_bi = {}
+if os.path.exists(published_path):
+    try:
+        resp = json.load(open(published_path))
+        base_bi = resp.get("buildInfo", {})
+        env_count = len([k for k in base_bi.get("properties", {}) if k.startswith("buildInfo.env.")])
+        print(f"  merged from jf rt bp: {env_count} env vars, {len(base_bi.get('vcs',[]))} vcs entries")
+    except:
+        pass
 
 artifacts = []
 all_blobs = []  # layer blobs only (not manifest/config)
@@ -483,26 +521,21 @@ if upstream_layer_count > 0 and upstream_layer_count <= len(all_blobs):
 else:
     dependencies = all_blobs  # fallback: all blobs as deps
 
-# Capture environment variables (same as jf rt bp --collect-env).
-# Filter out sensitive vars containing PASSWORD, TOKEN, SECRET, KEY,
-# CREDENTIAL to avoid leaking secrets into build info.
-env_props = {}
-sensitive = ("PASSWORD", "TOKEN", "SECRET", "KEY", "CREDENTIAL", "PRIVATE")
-for k, v in os.environ.items():
-    if any(s in k.upper() for s in sensitive):
-        continue
-    env_props[f"buildInfo.env.{k}"] = v
-
-build_info = {
+# Build the final build info by merging modules into the published
+# record. This preserves jf's filtered env vars, git context, VCS
+# info, and agent metadata. We only override the modules array and
+# ensure type=DOCKER is set.
+build_info = base_bi.copy() if base_bi else {}
+build_info.update({
     "version": "1.0.1",
     "name": build_name,
     "number": build_number,
     "type": "DOCKER",
-    "started": started,
-    "properties": env_props,
-    "buildAgent": {"name": "container-image-template", "version": "1.0"},
-    "agent": {"name": "build.sh", "version": "free-lcd"},
-    "vcs": [{"revision": git_rev, "url": git_url}] if git_rev else [],
+    "started": base_bi.get("started", started),
+    "buildAgent": base_bi.get("buildAgent", {"name": "container-image-template", "version": "1.0"}),
+    "agent": base_bi.get("agent", {"name": "build.sh", "version": "free-lcd"}),
+    "properties": base_bi.get("properties", {}),
+    "vcs": base_bi.get("vcs", [{"revision": git_rev, "url": git_url}] if git_rev else []),
     "modules": [{
         "properties": {
             "docker.image.tag": target,
@@ -513,7 +546,7 @@ build_info = {
         "artifacts": artifacts,
         "dependencies": dependencies
     }]
-}
+})
 
 outfile = os.path.join(tmpdir, "build-info.json")
 with open(outfile, "w") as f:
