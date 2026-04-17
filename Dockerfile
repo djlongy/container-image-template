@@ -25,9 +25,13 @@
 # image.env. The Renovate hint for UPSTREAM_TAG lives in image.env
 # (matched by a customManagers regex in renovate.json), not here —
 # keeping all image-specific values in one place.
-ARG UPSTREAM_REGISTRY
-ARG UPSTREAM_IMAGE
-ARG UPSTREAM_TAG
+# Defaults here are only used if build.sh doesn't pass --build-arg
+# (e.g. running `docker build .` directly without the script).
+# build.sh always passes these from image.env, so the defaults below
+# are just to suppress BuildKit's InvalidDefaultArgInFrom warning.
+ARG UPSTREAM_REGISTRY=docker.io/library
+ARG UPSTREAM_IMAGE=nginx
+ARG UPSTREAM_TAG=latest
 ARG INJECT_CERTS=false
 ARG REMEDIATE=true
 ARG ORIGINAL_USER=root
