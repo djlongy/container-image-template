@@ -79,7 +79,7 @@ if [ -n "${SBOM_WEBHOOK_URL:-}" ]; then
   fi
   if curl -fsSL -X POST "${HEADERS[@]}" --data-binary "@${SBOM_FILE}" "${SBOM_WEBHOOK_URL}" -o /tmp/webhook-response.txt 2>&1; then
     echo "  ✓ posted ($(wc -c < /tmp/webhook-response.txt) bytes response)"
-    did_post=1
+    did_post=$((did_post + 1))
   else
     echo "  ✗ webhook POST failed" >&2
     failures=$((failures + 1))
@@ -116,7 +116,7 @@ if [ -n "${DEPENDENCY_TRACK_URL:-}" ] && [ -n "${DEPENDENCY_TRACK_API_KEY:-}" ];
          "${DEPENDENCY_TRACK_URL%/}/api/v1/bom" -o /tmp/dt-response.txt; then
       echo "  ✓ uploaded to project '${DEPENDENCY_TRACK_PROJECT}' v${DT_VERSION}"
       echo "    response: $(cat /tmp/dt-response.txt)"
-      did_post=1
+      did_post=$((did_post + 1))
     else
       echo "  ✗ Dependency-Track upload failed" >&2
       failures=$((failures + 1))
@@ -164,7 +164,7 @@ if [ -n "${ARTIFACTORY_URL:-}" ] && [ -n "${ARTIFACTORY_USER:-}" ] \
         URI=$(jq -r '.uri // empty' /tmp/art-response.txt 2>/dev/null || echo "")
         [ -n "${URI}" ] && echo "    uri: ${URI}"
       fi
-      did_post=1
+      did_post=$((did_post + 1))
     else
       echo "  ✗ Artifactory SBOM upload failed" >&2
       cat /tmp/art-response.txt >&2 2>/dev/null || true
