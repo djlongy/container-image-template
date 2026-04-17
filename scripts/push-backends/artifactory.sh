@@ -483,12 +483,23 @@ if upstream_layer_count > 0 and upstream_layer_count <= len(all_blobs):
 else:
     dependencies = all_blobs  # fallback: all blobs as deps
 
+# Capture environment variables (same as jf rt bp --collect-env).
+# Filter out sensitive vars containing PASSWORD, TOKEN, SECRET, KEY,
+# CREDENTIAL to avoid leaking secrets into build info.
+env_props = {}
+sensitive = ("PASSWORD", "TOKEN", "SECRET", "KEY", "CREDENTIAL", "PRIVATE")
+for k, v in os.environ.items():
+    if any(s in k.upper() for s in sensitive):
+        continue
+    env_props[f"buildInfo.env.{k}"] = v
+
 build_info = {
     "version": "1.0.1",
     "name": build_name,
     "number": build_number,
     "type": "DOCKER",
     "started": started,
+    "properties": env_props,
     "buildAgent": {"name": "container-image-template", "version": "1.0"},
     "agent": {"name": "build.sh", "version": "free-lcd"},
     "vcs": [{"revision": git_rev, "url": git_url}] if git_rev else [],
