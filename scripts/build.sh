@@ -192,12 +192,35 @@ else
 fi
 
 # ── Push target ──────────────────────────────────────────────────────
+# When REGISTRY_KIND=artifactory, PUSH_REGISTRY and PUSH_PROJECT are
+# only used for the intermediate local tag (the backend retags to the
+# Artifactory target via its own template). Auto-derive them from
+# Artifactory vars so users don't have to set redundant values.
+
+REGISTRY_KIND_LC="$(echo "${REGISTRY_KIND:-}" | tr '[:upper:]' '[:lower:]')"
+
+if [ "${REGISTRY_KIND_LC}" = "artifactory" ]; then
+  if [ -z "${PUSH_REGISTRY:-}" ] && [ -n "${ARTIFACTORY_PUSH_HOST:-}" ]; then
+    PUSH_REGISTRY="${ARTIFACTORY_PUSH_HOST}"
+  elif [ -z "${PUSH_REGISTRY:-}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
+    PUSH_REGISTRY="${ARTIFACTORY_URL#https://}"
+    PUSH_REGISTRY="${PUSH_REGISTRY#http://}"
+    PUSH_REGISTRY="${PUSH_REGISTRY%%/*}"
+  fi
+  if [ -z "${PUSH_PROJECT:-}" ] && [ -n "${ARTIFACTORY_TEAM:-}" ]; then
+    PUSH_PROJECT="${ARTIFACTORY_TEAM}"
+  fi
+fi
 
 WANT_PUSH=0
 if [ "${1:-}" = "--push" ]; then
   WANT_PUSH=1
   if [ -z "${PUSH_REGISTRY:-}" ] || [ -z "${PUSH_PROJECT:-}" ]; then
     echo "ERROR: PUSH_REGISTRY and PUSH_PROJECT must be set for --push" >&2
+    if [ "${REGISTRY_KIND_LC}" = "artifactory" ]; then
+      echo "       (tip: set ARTIFACTORY_PUSH_HOST + ARTIFACTORY_TEAM and they'll" >&2
+      echo "        auto-derive PUSH_REGISTRY + PUSH_PROJECT for the local tag)" >&2
+    fi
     exit 1
   fi
 fi
@@ -280,7 +303,7 @@ if [ -n "${SOURCE_URL}" ]; then
   LABEL_ARGS+=(--label "org.opencontainers.image.url=${SOURCE_URL}")
 fi
 
-REGISTRY_KIND_LC="$(echo "${REGISTRY_KIND:-}" | tr '[:upper:]' '[:lower:]')"
+# REGISTRY_KIND_LC already set above (push target section)
 
 echo "→ docker build"
 docker build \
