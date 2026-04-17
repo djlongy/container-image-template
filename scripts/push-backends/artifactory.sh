@@ -473,8 +473,51 @@ if os.path.exists(published_path):
     try:
         resp = json.load(open(published_path))
         base_bi = resp.get("buildInfo", {})
-        env_count = len([k for k in base_bi.get("properties", {}) if k.startswith("buildInfo.env.")])
-        print(f"  merged from jf rt bp: {env_count} env vars, {len(base_bi.get('vcs',[]))} vcs entries")
+
+        # Post-filter: strip env vars matching custom exclusion patterns.
+        # jf's --collect-env already filters PASSWORD/TOKEN/KEY, but orgs
+        # may have additional patterns (CLAUDE_*, internal tool vars, etc).
+        # Add patterns here as needed — matched case-insensitively against
+        # the env var name (after the buildInfo.env. prefix).
+        EXCLUDE_PREFIXES = [
+            "CLAUDE_",       # Claude Code / AI tool internals
+            "_P9K_",         # Powerlevel10k shell theme internals
+            "P9K_",
+            "ITERM_",        # iTerm2 session internals
+            "CONDA_",        # Conda environment (noisy, not build-relevant)
+            "_CONDA_",
+            "_CE_",
+            "TERM_",         # Terminal type (cosmetic)
+            "LC_TERMINAL",
+            "COLORFGBG",
+            "CLICOLOR",
+            "LS_COLORS",
+            "LSCOLORS",
+            "COLORTERM",
+            "TERM_FEATURES",
+            "__CF",           # macOS CoreFoundation internals
+            "SQLITE_EXEMPT",
+            "COMMAND_MODE",
+            "TMPDIR",
+            "OLDPWD",
+            "SHLVL",
+            "XPC_",
+        ]
+
+        props = base_bi.get("properties", {})
+        filtered = {}
+        stripped = 0
+        for k, v in props.items():
+            if k.startswith("buildInfo.env."):
+                varname = k[len("buildInfo.env."):]
+                if any(varname.upper().startswith(p.upper()) for p in EXCLUDE_PREFIXES):
+                    stripped += 1
+                    continue
+            filtered[k] = v
+        base_bi["properties"] = filtered
+
+        env_count = len([k for k in filtered if k.startswith("buildInfo.env.")])
+        print(f"  merged from jf rt bp: {env_count} env vars ({stripped} filtered), {len(base_bi.get('vcs',[]))} vcs entries")
     except:
         pass
 
