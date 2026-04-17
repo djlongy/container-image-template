@@ -90,8 +90,8 @@ push_to_backend() {
   fi
 
   local target manifest_path
-  eval "target=\"${image_ref_tpl}\""
-  eval "manifest_path=\"${manifest_path_tpl}\""
+  target=$(_artifactory_expand_template "${image_ref_tpl}")
+  manifest_path=$(_artifactory_expand_template "${manifest_path_tpl}")
 
   local build_name build_number
   build_name="${ARTIFACTORY_BUILD_NAME:-${IMAGE_NAME}}"
@@ -259,9 +259,24 @@ EOF
 
 # ── Internals ────────────────────────────────────────────────────────
 
+# Expand ${VAR} references in a template string using bash parameter
+# expansion. Only the whitelisted variables below are substituted —
+# anything else is left untouched. Safer than `eval` because it can't
+# execute arbitrary code if a variable value contains backticks, $(...),
+# or semicolons.
+_artifactory_expand_template() {
+  local tpl="$1"
+  local v
+  for v in ARTIFACTORY_PUSH_HOST ARTIFACTORY_TEAM ARTIFACTORY_ENVIRONMENT \
+           ARTIFACTORY_REPO_SUFFIX IMAGE_NAME IMAGE_TAG; do
+    tpl="${tpl//\$\{${v}\}/${!v:-}}"
+  done
+  printf '%s' "${tpl}"
+}
+
 _artifactory_require_env() {
   local missing=0 var
-  for var in ARTIFACTORY_URL ARTIFACTORY_USER; do
+  for var in ARTIFACTORY_URL ARTIFACTORY_USER ARTIFACTORY_TEAM; do
     if [ -z "${!var:-}" ]; then
       echo "ERROR: ${var} is required when REGISTRY_KIND=artifactory" >&2
       missing=1
@@ -277,17 +292,59 @@ _artifactory_require_env() {
 _artifactory_require_tools() {
   local missing=0
   if ! command -v jf >/dev/null 2>&1; then
-    echo "ERROR: 'jf' CLI not found on PATH" >&2
-    echo "  Install: https://jfrog.com/getcli/ — or" >&2
-    echo "    brew install jfrog-cli" >&2
-    echo "    curl -fL https://install-cli.jfrog.io | sh" >&2
-    missing=1
+    _artifactory_install_jf || { missing=1; }
   fi
   if ! command -v docker >/dev/null 2>&1; then
     echo "ERROR: 'docker' CLI not found on PATH" >&2
     missing=1
   fi
   return "${missing}"
+}
+
+# Auto-install the JFrog CLI if not present.
+#
+# Two environment variables control where jf is fetched from:
+#
+#   JF_BINARY_URL     Direct URL to the jf binary (Method 1 — fastest).
+#                     e.g. https://artifactory.example.com/artifactory/
+#                          jfrog-releases-remote/jfrog-cli/v2-jf/
+#                          [RELEASE]/jfrog-cli-linux-amd64/jf
+#
+#   JF_INSTALLER_URL  URL to the JFrog CLI installer script (Method 2).
+#                     Default: https://install.jfrog.io
+#                     For air-gap: proxy this through an Artifactory
+#                     generic-remote repo.
+#
+# Neither set? Falls back to JFrog's public installer.
+_artifactory_install_jf() {
+  echo "  jf CLI not found — auto-installing..."
+  local install_dir="${JF_INSTALL_DIR:-/usr/local/bin}"
+
+  # Method 1: direct binary URL (fastest, works in CI containers)
+  if [ -n "${JF_BINARY_URL:-}" ]; then
+    echo "  → downloading jf binary from JF_BINARY_URL"
+    if curl -fsSL "${JF_BINARY_URL}" -o "${install_dir}/jf" && chmod +x "${install_dir}/jf"; then
+      echo "  ✓ jf installed: $(jf --version 2>/dev/null || echo 'unknown version')"
+      return 0
+    fi
+    echo "  ✗ binary download failed" >&2
+    return 1
+  fi
+
+  # Method 2: installer script (variable-driven, air-gap safe)
+  local installer_url="${JF_INSTALLER_URL:-https://install.jfrog.io}"
+  echo "  → running installer from ${installer_url}"
+  if curl -fsSL "${installer_url}" | bash -s 2>/dev/null; then
+    if command -v jf >/dev/null 2>&1; then
+      echo "  ✓ jf installed: $(jf --version 2>/dev/null)"
+      return 0
+    fi
+  fi
+
+  echo "ERROR: 'jf' CLI not found and auto-install failed" >&2
+  echo "  Install manually: https://jfrog.com/getcli/" >&2
+  echo "  For air-gap: set JF_BINARY_URL or JF_INSTALLER_URL" >&2
+  return 1
 }
 
 _artifactory_jf_config() {
@@ -401,9 +458,19 @@ _artifactory_build_publish_free_with_modules() {
     return 0
   }
 
-  # Extract filenames from the listing
+  # Extract filenames from the listing (proper JSON parse, not sed/grep)
   local files_list
-  files_list=$(echo "${listing}" | grep -o '"uri" *: *"/[^"]*"' | sed 's/"uri" *: *"\/\([^"]*\)"/\1/' | grep -v '^$')
+  files_list=$(printf '%s' "${listing}" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    for child in d.get('children', []):
+        uri = child.get('uri', '').lstrip('/')
+        if uri:
+            print(uri)
+except json.JSONDecodeError:
+    pass
+")
 
   if [ -z "${files_list}" ]; then
     echo "  WARN: no files found in ${tag_dir} — skipping module linkage" >&2
@@ -451,164 +518,13 @@ _artifactory_build_publish_free_with_modules() {
 
   # Assemble the build info JSON with Python — merges modules into
   # the jf-published record (preserving env vars + git + VCS from jf).
-  python3 - "${tmpdir}" "${file_count}" "${tag_subpath}" \
+  local _backend_dir
+  _backend_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  python3 "${_backend_dir}/../lib/build-info-merge.py" \
+    "${tmpdir}" "${file_count}" "${tag_subpath}" \
     "${build_name}" "${build_number}" "${target}" \
     "${IMAGE_NAME}" "${IMAGE_TAG}" "${git_rev}" "${git_url}" \
-    "${started}" "${upstream_layer_count}" <<'PYEOF'
-import json, sys, os
-
-tmpdir = sys.argv[1]
-file_count = int(sys.argv[2])
-tag_subpath = sys.argv[3]
-build_name, build_number, target = sys.argv[4], sys.argv[5], sys.argv[6]
-image_name, image_tag = sys.argv[7], sys.argv[8]
-git_rev, git_url, started = sys.argv[9], sys.argv[10], sys.argv[11]
-upstream_layer_count = int(sys.argv[12]) if len(sys.argv) > 12 else 0
-
-# Load the published build info (from jf rt bp) if available.
-# This has the properly-filtered env vars + git context.
-published_path = os.path.join(tmpdir, "published-bi.json")
-base_bi = {}
-if os.path.exists(published_path):
-    try:
-        resp = json.load(open(published_path))
-        base_bi = resp.get("buildInfo", {})
-
-        # Post-filter: strip env vars matching custom exclusion patterns.
-        # jf's --collect-env already filters PASSWORD/TOKEN/KEY, but orgs
-        # may have additional patterns (CLAUDE_*, internal tool vars, etc).
-        # Add patterns here as needed — matched case-insensitively against
-        # the env var name (after the buildInfo.env. prefix).
-        # Only keep build-relevant env vars. Everything else is noise.
-        # Two filter strategies combined:
-        #   INCLUDE_PREFIXES: if set, ONLY vars matching these survive
-        #   EXCLUDE_PREFIXES: vars matching these are always stripped
-        # Include-first is safer — new random env vars don't leak in.
-        INCLUDE_PREFIXES = [
-            # Build pipeline context
-            "REGISTRY_KIND", "PUSH_REGISTRY", "PUSH_PROJECT",
-            "ARTIFACTORY_",  # all Artifactory config (jf already strips secrets)
-            "IMAGE_", "UPSTREAM_", "DISTRO", "REMEDIATE", "INJECT_CERTS",
-            "ORIGINAL_USER", "VENDOR", "PLATFORM",
-            "APK_MIRROR", "APT_MIRROR",
-            "BASE_DIGEST", "GIT_SHA", "CREATED",
-            # CI context
-            "CI_", "GITLAB_", "GITHUB_", "BAMBOO_", "BUILD_",
-            "RUNNER_", "JOB_", "PIPELINE_",
-            # Runtime identity
-            "USER", "HOME", "SHELL", "PWD", "PATH", "LANG",
-            "HOSTNAME", "LOGNAME",
-            # Docker / container
-            "DOCKER_", "BUILDKIT",
-            # Vault
-            "VAULT_ADDR",
-        ]
-        EXCLUDE_PREFIXES = [
-            # Always strip regardless of include match
-            "CLAUDE",         # Claude Code / AI tool internals
-            "CLAUDECODE",
-        ]
-
-        props = base_bi.get("properties", {})
-        filtered = {}
-        kept = 0
-        stripped = 0
-        for k, v in props.items():
-            if k.startswith("buildInfo.env."):
-                varname = k[len("buildInfo.env."):]
-                vupper = varname.upper()
-                # Exclude always wins
-                if any(vupper.startswith(p.upper()) for p in EXCLUDE_PREFIXES):
-                    stripped += 1
-                    continue
-                # Include check — must match at least one prefix
-                if not any(vupper.startswith(p.upper()) for p in INCLUDE_PREFIXES):
-                    stripped += 1
-                    continue
-                kept += 1
-            filtered[k] = v
-        base_bi["properties"] = filtered
-
-        print(f"  merged from jf rt bp: {kept} env vars kept, {stripped} stripped, {len(base_bi.get('vcs',[]))} vcs entries")
-    except:
-        pass
-
-artifacts = []
-all_blobs = []  # layer blobs only (not manifest/config)
-
-for i in range(file_count):
-    name_file = os.path.join(tmpdir, f"name_{i}.txt")
-    info_file = os.path.join(tmpdir, f"file_{i}.json")
-    if not os.path.exists(name_file) or not os.path.exists(info_file):
-        continue
-    fname = open(name_file).read().strip()
-    try:
-        info = json.load(open(info_file))
-    except:
-        continue
-    cs = info.get("checksums", {})
-    if not cs.get("sha256"):
-        continue
-
-    ftype = "json" if fname == "manifest.json" else "gz"
-    artifacts.append({
-        "type": ftype,
-        "sha1": cs.get("sha1", ""),
-        "sha256": cs["sha256"],
-        "md5": cs.get("md5", ""),
-        "name": fname,
-        "path": f"{tag_subpath}/{fname}"
-    })
-
-    if fname != "manifest.json" and fname.startswith("sha256__"):
-        all_blobs.append({
-            "id": fname,
-            "sha1": cs.get("sha1", ""),
-            "sha256": cs["sha256"],
-            "md5": cs.get("md5", "")
-        })
-
-# Dependencies = the upstream base image layers (first N blobs).
-# If we know the upstream layer count, take that many. Otherwise
-# include all blobs (better than 0, slightly over-counts).
-if upstream_layer_count > 0 and upstream_layer_count <= len(all_blobs):
-    dependencies = all_blobs[:upstream_layer_count]
-else:
-    dependencies = all_blobs  # fallback: all blobs as deps
-
-# Build the final build info by merging modules into the published
-# record. This preserves jf's filtered env vars, git context, VCS
-# info, and agent metadata. We only override the modules array and
-# ensure type=DOCKER is set.
-build_info = base_bi.copy() if base_bi else {}
-build_info.update({
-    "version": "1.0.1",
-    "name": build_name,
-    "number": build_number,
-    "type": "DOCKER",
-    "started": base_bi.get("started", started),
-    "buildAgent": base_bi.get("buildAgent", {"name": "container-image-template", "version": "1.0"}),
-    "agent": base_bi.get("agent", {"name": "build.sh", "version": "free-lcd"}),
-    "properties": base_bi.get("properties", {}),
-    "vcs": base_bi.get("vcs", [{"revision": git_rev, "url": git_url}] if git_rev else []),
-    "modules": [{
-        "properties": {
-            "docker.image.tag": target,
-            "docker.image.id": ""
-        },
-        "type": "docker",
-        "id": f"{image_name}:{image_tag}",
-        "artifacts": artifacts,
-        "dependencies": dependencies
-    }]
-})
-
-outfile = os.path.join(tmpdir, "build-info.json")
-with open(outfile, "w") as f:
-    json.dump(build_info, f)
-
-print(f"  artifacts: {len(artifacts)}, dependencies: {len(dependencies)}")
-PYEOF
+    "${started}" "${upstream_layer_count}"
 
   # PUT to /api/build
   echo "── Free: publishing enriched build info ──"
@@ -645,10 +561,22 @@ _artifactory_set_props_all_layers() {
     "${art_base}/api/storage/${tag_dir}" 2>/dev/null) || return 0
 
   local count=0
+  local files_list
+  files_list=$(printf '%s' "${listing}" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    for child in d.get('children', []):
+        uri = child.get('uri', '').lstrip('/')
+        if uri:
+            print(uri)
+except json.JSONDecodeError:
+    pass
+")
   while IFS= read -r fname; do
     [ -z "${fname}" ] && continue
     jf rt set-props "${tag_dir}/${fname}" "${props}" 2>/dev/null && count=$((count + 1))
-  done < <(echo "${listing}" | grep -o '"uri" *: *"/[^"]*"' | sed 's/"uri" *: *"\/\([^"]*\)"/\1/' | grep -v '^$')
+  done <<< "${files_list}"
 
   echo "  ✓ build.name/build.number set on ${count} files"
 }
@@ -659,11 +587,9 @@ _artifactory_set_props() {
   [ -n "${ARTIFACTORY_TEAM:-}" ] && props="${props};team=${ARTIFACTORY_TEAM}"
   [ -n "${GIT_SHA:-}" ]          && props="${props};git.commit=${GIT_SHA}"
   [ -n "${UPSTREAM_TAG:-}" ]     && props="${props};upstream.tag=${UPSTREAM_TAG}"
-  # Link to SBOM artifact if sbom-post.sh will upload to a generic repo.
-  # Consumers can find the SBOM via jf rt search --props='sbom.path=...'
-  if [ -n "${ARTIFACTORY_SBOM_REPO:-}" ] && [ -n "${IMAGE_NAME:-}" ]; then
-    props="${props};sbom.path=${ARTIFACTORY_SBOM_REPO}/${IMAGE_NAME}/${IMAGE_TAG}/sbom.cdx.json"
-  fi
+  # NOTE: sbom.path is NOT set here — it's set by sbom-post.sh AFTER
+  # the SBOM upload succeeds, so the property always points to a real
+  # artifact rather than a speculative path.
   [ -n "${ARTIFACTORY_PROPERTIES:-}" ] && props="${props};${ARTIFACTORY_PROPERTIES}"
 
   if ! jf rt set-props "${manifest_path}" "${props}" 2>/dev/null; then

@@ -31,7 +31,8 @@
 # are just to suppress BuildKit's InvalidDefaultArgInFrom warning.
 ARG UPSTREAM_REGISTRY=docker.io/library
 ARG UPSTREAM_IMAGE=nginx
-ARG UPSTREAM_TAG=latest
+# Pinned default for safety; build.sh always overrides via --build-arg from image.env
+ARG UPSTREAM_TAG=1.29.8-alpine
 ARG INJECT_CERTS=false
 ARG REMEDIATE=true
 ARG ORIGINAL_USER=root

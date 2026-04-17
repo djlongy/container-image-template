@@ -63,13 +63,16 @@ __SHELL_OVERRIDES=""
 for __v in IMAGE_NAME DISTRO \
            UPSTREAM_REGISTRY UPSTREAM_IMAGE UPSTREAM_TAG \
            REMEDIATE INJECT_CERTS ORIGINAL_USER \
-           VENDOR APK_MIRROR APT_MIRROR CA_CERT \
+           PUSH_REGISTRY PUSH_PROJECT VENDOR AUTHORS \
+           APK_MIRROR APT_MIRROR CA_CERT \
            REGISTRY_KIND \
            ARTIFACTORY_URL ARTIFACTORY_USER ARTIFACTORY_PASSWORD ARTIFACTORY_TOKEN \
            ARTIFACTORY_PRO ARTIFACTORY_PROJECT \
            ARTIFACTORY_TEAM ARTIFACTORY_ENVIRONMENT ARTIFACTORY_PUSH_HOST \
            ARTIFACTORY_IMAGE_REF ARTIFACTORY_MANIFEST_PATH \
-           ARTIFACTORY_BUILD_NAME ARTIFACTORY_BUILD_NUMBER ARTIFACTORY_PROPERTIES; do
+           ARTIFACTORY_BUILD_NAME ARTIFACTORY_BUILD_NUMBER ARTIFACTORY_PROPERTIES \
+           ARTIFACTORY_SBOM_REPO \
+           VAULT_KV_MOUNT VAULT_CA_PATH; do
   if [ "${!__v+set}" = "set" ]; then
     __SHELL_OVERRIDES="${__SHELL_OVERRIDES}${__v}=$(printf '%q' "${!__v}")"$'\n'
   fi
@@ -155,9 +158,20 @@ mkdir -p certs
 if [ -n "${CA_CERT:-}" ]; then
   echo "${CA_CERT}" > certs/ci-injected.crt
   echo "→ Wrote CA_CERT to certs/ci-injected.crt ($(wc -c < certs/ci-injected.crt) bytes)"
-  # Auto-flip INJECT_CERTS on if a cert was provided — caller clearly
-  # wants it injected.
   INJECT_CERTS=true
+elif [ -n "${VAULT_CA_PATH:-}" ] && command -v vault >/dev/null 2>&1; then
+  # Vault is opt-in — only attempt the pull when VAULT_CA_PATH is
+  # explicitly set. VAULT_ADDR must already be exported by the caller
+  # (or ~/.vault-token configured) so the CLI has a target.
+  if vault kv get -mount="${VAULT_KV_MOUNT:-secret}" \
+       -field=certificate "${VAULT_CA_PATH}" \
+       > certs/vault-ca.crt 2>/dev/null; then
+    echo "→ Pulled CA cert from Vault (${VAULT_KV_MOUNT:-secret}/${VAULT_CA_PATH})"
+    INJECT_CERTS=true
+  else
+    echo "  WARN: Vault pull failed — falling back to certs/ on disk" >&2
+    rm -f certs/vault-ca.crt
+  fi
 fi
 
 # ── Upstream base digest (optional but preferred) ───────────────────
@@ -170,14 +184,15 @@ fi
 UPSTREAM_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
 BASE_DIGEST=""
 if command -v crane >/dev/null 2>&1; then
-  _crane_err=""
-  BASE_DIGEST=$(crane digest "${UPSTREAM_REF}" 2>/tmp/crane-err.log) || _crane_err=$(cat /tmp/crane-err.log)
-  if [ -z "${BASE_DIGEST}" ] && [ -n "${_crane_err}" ]; then
+  # Capture stderr alongside stdout — exit code distinguishes success/failure
+  _crane_output=$(crane digest "${UPSTREAM_REF}" 2>&1)
+  if [ $? -eq 0 ]; then
+    BASE_DIGEST="${_crane_output}"
+  else
     echo "  WARN: crane digest failed for ${UPSTREAM_REF}" >&2
-    echo "        ${_crane_err}" | head -2 >&2
+    printf '%s\n' "${_crane_output}" | head -2 | sed 's/^/        /' >&2
     echo "        (base.digest label will be empty — image build unaffected)" >&2
   fi
-  rm -f /tmp/crane-err.log
 else
   # Fallback: try docker buildx imagetools inspect (available with
   # modern Docker, no extra binary needed).
@@ -288,12 +303,15 @@ BUILD_ARGS=(
 #   - team identity (vendor/authors) which is intentional override
 # Everything else from the upstream image flows through untouched.
 LABEL_ARGS=(
-  --label "org.opencontainers.image.version=${FULL_TAG}"
-  --label "org.opencontainers.image.revision=${GIT_SHA}"
-  --label "org.opencontainers.image.created=${CREATED}"
-  --label "org.opencontainers.image.base.name=${UPSTREAM_REF}"
   --label "org.opencontainers.image.vendor=${VENDOR}"
   --label "org.opencontainers.image.authors=${AUTHORS:-Platform Engineering}"
+  --label "org.opencontainers.image.created=${CREATED}"
+  --label "org.opencontainers.image.revision=${GIT_SHA}"
+  --label "org.opencontainers.image.version=${FULL_TAG}"
+  --label "org.opencontainers.image.ref.name=${FULL_TAG}"
+  --label "org.opencontainers.image.base.name=${UPSTREAM_REF}"
+  --label "promoted.from=${UPSTREAM_REF}"
+  --label "promoted.tag=${FULL_TAG}"
 )
 if [ -n "${BASE_DIGEST}" ]; then
   LABEL_ARGS+=(--label "org.opencontainers.image.base.digest=${BASE_DIGEST}")

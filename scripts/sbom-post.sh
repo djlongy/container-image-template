@@ -52,6 +52,11 @@ if [ ! -f "${SBOM_FILE}" ]; then
   exit 1
 fi
 
+# Per-run temp directory — avoids /tmp collisions if multiple jobs run
+# in parallel.
+_SBOM_TMPDIR=$(mktemp -d)
+trap 'rm -rf "${_SBOM_TMPDIR}"' EXIT
+
 SBOM_SIZE=$(wc -c < "${SBOM_FILE}")
 echo "→ SBOM: ${SBOM_FILE} (${SBOM_SIZE} bytes)"
 
@@ -77,8 +82,8 @@ if [ -n "${SBOM_WEBHOOK_URL:-}" ]; then
   if [ -n "${UPSTREAM_TAG:-}" ]; then
     HEADERS+=(-H "X-Image-Version: ${UPSTREAM_TAG}")
   fi
-  if curl -fsSL -X POST "${HEADERS[@]}" --data-binary "@${SBOM_FILE}" "${SBOM_WEBHOOK_URL}" -o /tmp/webhook-response.txt 2>&1; then
-    echo "  ✓ posted ($(wc -c < /tmp/webhook-response.txt) bytes response)"
+  if curl -fsSL -X POST "${HEADERS[@]}" --data-binary "@${SBOM_FILE}" "${SBOM_WEBHOOK_URL}" -o ${_SBOM_TMPDIR}/webhook-response.txt 2>&1; then
+    echo "  ✓ posted ($(wc -c < ${_SBOM_TMPDIR}/webhook-response.txt) bytes response)"
     did_post=$((did_post + 1))
   else
     echo "  ✗ webhook POST failed" >&2
@@ -113,9 +118,9 @@ if [ -n "${DEPENDENCY_TRACK_URL:-}" ] && [ -n "${DEPENDENCY_TRACK_API_KEY:-}" ];
          -H "X-Api-Key: ${DEPENDENCY_TRACK_API_KEY}" \
          -H "Content-Type: application/json" \
          --data "${PAYLOAD}" \
-         "${DEPENDENCY_TRACK_URL%/}/api/v1/bom" -o /tmp/dt-response.txt; then
+         "${DEPENDENCY_TRACK_URL%/}/api/v1/bom" -o ${_SBOM_TMPDIR}/dt-response.txt; then
       echo "  ✓ uploaded to project '${DEPENDENCY_TRACK_PROJECT}' v${DT_VERSION}"
-      echo "    response: $(cat /tmp/dt-response.txt)"
+      echo "    response: $(cat ${_SBOM_TMPDIR}/dt-response.txt)"
       did_post=$((did_post + 1))
     else
       echo "  ✗ Dependency-Track upload failed" >&2
@@ -138,8 +143,14 @@ if [ -n "${ARTIFACTORY_URL:-}" ] && [ -n "${ARTIFACTORY_USER:-}" ] \
     echo "  ✗ Artifactory SBOM sink: no ARTIFACTORY_TOKEN or ARTIFACTORY_PASSWORD" >&2
     failures=$((failures + 1))
   else
+    # IMAGE_NAME from build.env may include the full registry path
+    # (e.g. registry.example.com/project/nginx). Extract the short name.
     IMG="${IMAGE_NAME:-image}"
-    VER="${UPSTREAM_TAG:-latest}"
+    IMG="${IMG##*/}"
+    # Use IMAGE_TAG (includes git hash, e.g. 1.29.8-alpine-5d3ea65) for
+    # 1:1 mapping between SBOM and pushed image. Falls back to upstream
+    # tag if IMAGE_TAG isn't set.
+    VER="${IMAGE_TAG:-${UPSTREAM_TAG:-latest}}"
     DEPLOY_PATH="${ARTIFACTORY_SBOM_REPO}/${IMG}/${VER}/sbom.cdx.json"
     DEPLOY_URL="${ARTIFACTORY_URL%/}/artifactory/${DEPLOY_PATH}"
     echo "→ Upload SBOM to Artifactory Xray: ${DEPLOY_PATH}"
@@ -158,16 +169,43 @@ if [ -n "${ARTIFACTORY_URL:-}" ] && [ -n "${ARTIFACTORY_USER:-}" ] \
          -H "X-Checksum-Sha1: ${SHA1}" \
          -H "X-Checksum-Sha256: ${SHA256}" \
          --data-binary "@${SBOM_FILE}" \
-         "${DEPLOY_URL}" -o /tmp/art-response.txt; then
+         "${DEPLOY_URL}" -o ${_SBOM_TMPDIR}/art-response.txt; then
       echo "  ✓ deployed — Xray will auto-index"
-      if command -v jq >/dev/null 2>&1 && [ -s /tmp/art-response.txt ]; then
-        URI=$(jq -r '.uri // empty' /tmp/art-response.txt 2>/dev/null || echo "")
+      if command -v jq >/dev/null 2>&1 && [ -s ${_SBOM_TMPDIR}/art-response.txt ]; then
+        URI=$(jq -r '.uri // empty' ${_SBOM_TMPDIR}/art-response.txt 2>/dev/null || echo "")
         [ -n "${URI}" ] && echo "    uri: ${URI}"
+      fi
+      # Tag the Docker manifest with sbom.path for cross-reference.
+      # Uses Artifactory property search API to find the manifest, then
+      # sets sbom.path via REST. Does not depend on jf config state.
+      if [ -n "${IMAGE_TAG:-}" ]; then
+        _art_base="${ARTIFACTORY_URL%/}/artifactory"
+        _manifest_path=$(curl -sS -u "${ARTIFACTORY_USER}:${ART_SECRET}" \
+          "${_art_base}/api/search/prop?docker.manifest=${IMAGE_TAG}" 2>/dev/null \
+          | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for r in d.get('results',[]):
+    uri=r.get('uri','')
+    if 'manifest.json' in uri:
+        parts=uri.split('/api/storage/')
+        if len(parts)==2: print(parts[1]); break
+" 2>/dev/null || echo "")
+        if [ -n "${_manifest_path}" ]; then
+          _prop_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -u "${ARTIFACTORY_USER}:${ART_SECRET}" \
+            -X PUT "${_art_base}/api/storage/${_manifest_path}?properties=sbom.path=${DEPLOY_PATH}" 2>/dev/null)
+          if [ "${_prop_code}" = "204" ]; then
+            echo "    sbom.path property set on ${_manifest_path}"
+          else
+            echo "    WARN: could not set sbom.path (HTTP ${_prop_code})" >&2
+          fi
+        fi
       fi
       did_post=$((did_post + 1))
     else
       echo "  ✗ Artifactory SBOM upload failed" >&2
-      cat /tmp/art-response.txt >&2 2>/dev/null || true
+      cat ${_SBOM_TMPDIR}/art-response.txt >&2 2>/dev/null || true
       failures=$((failures + 1))
     fi
   fi

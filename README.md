@@ -287,6 +287,7 @@ Artifactory generic repo that mirrors the binary:
 | `GRYPE_INSTALLER_URL` | `https://raw.githubusercontent.com/anchore/grype/main/install.sh` |
 | `COSIGN_URL` | `https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64` |
 | `JF_INSTALLER_URL` | `https://install-cli.jfrog.io` |
+| `JF_BINARY_URL` | Direct URL to `jf` binary (alternative to installer script) |
 
 **5. Nothing else.** The pipeline does not call any other network
 endpoint at runtime. Git checkout comes from GitLab itself (already
@@ -406,6 +407,9 @@ set keys we explicitly want to own:
 | `org.opencontainers.image.url` | same |
 | `org.opencontainers.image.vendor` | `VENDOR` variable |
 | `org.opencontainers.image.authors` | `AUTHORS` variable (default `Platform Engineering`) |
+| `org.opencontainers.image.ref.name` | Same as version |
+| `promoted.from` | Same as base.name — the pull origin |
+| `promoted.tag` | Same as version — the promoted tag |
 
 This matches the DevSecOps convention: upstream provenance is
 preserved, our provenance is appended. The `image.version` label
@@ -424,6 +428,9 @@ container-image-template/
 ├── scripts/
 │   ├── build.sh               # Resolves tags + OCI labels, invokes buildx
 │   ├── sbom-post.sh           # Ships CycloneDX SBOM to webhook / DT / Artifactory
+│   ├── remediate/             # Distro-aware remediation (alpine/debian/ubuntu/ubi)
+│   ├── lib/
+│   │   └── build-info-merge.py  # Merges module linkage into build info (Free tier)
 │   └── push-backends/
 │       └── artifactory.sh     # REGISTRY_KIND=artifactory backend (layout templates)
 ├── .gitlab-ci.yml             # GitLab pipeline — inline, path-gated via workflow:rules
