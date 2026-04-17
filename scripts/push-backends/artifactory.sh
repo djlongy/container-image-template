@@ -479,45 +479,57 @@ if os.path.exists(published_path):
         # may have additional patterns (CLAUDE_*, internal tool vars, etc).
         # Add patterns here as needed — matched case-insensitively against
         # the env var name (after the buildInfo.env. prefix).
+        # Only keep build-relevant env vars. Everything else is noise.
+        # Two filter strategies combined:
+        #   INCLUDE_PREFIXES: if set, ONLY vars matching these survive
+        #   EXCLUDE_PREFIXES: vars matching these are always stripped
+        # Include-first is safer — new random env vars don't leak in.
+        INCLUDE_PREFIXES = [
+            # Build pipeline context
+            "REGISTRY_KIND", "PUSH_REGISTRY", "PUSH_PROJECT",
+            "ARTIFACTORY_",  # all Artifactory config (jf already strips secrets)
+            "IMAGE_", "UPSTREAM_", "DISTRO", "REMEDIATE", "INJECT_CERTS",
+            "ORIGINAL_USER", "VENDOR", "PLATFORM",
+            "APK_MIRROR", "APT_MIRROR",
+            "BASE_DIGEST", "GIT_SHA", "CREATED",
+            # CI context
+            "CI_", "GITLAB_", "GITHUB_", "BAMBOO_", "BUILD_",
+            "RUNNER_", "JOB_", "PIPELINE_",
+            # Runtime identity
+            "USER", "HOME", "SHELL", "PWD", "PATH", "LANG",
+            "HOSTNAME", "LOGNAME",
+            # Docker / container
+            "DOCKER_", "BUILDKIT",
+            # Vault
+            "VAULT_ADDR",
+        ]
         EXCLUDE_PREFIXES = [
-            "CLAUDE_",       # Claude Code / AI tool internals
-            "_P9K_",         # Powerlevel10k shell theme internals
-            "P9K_",
-            "ITERM_",        # iTerm2 session internals
-            "CONDA_",        # Conda environment (noisy, not build-relevant)
-            "_CONDA_",
-            "_CE_",
-            "TERM_",         # Terminal type (cosmetic)
-            "LC_TERMINAL",
-            "COLORFGBG",
-            "CLICOLOR",
-            "LS_COLORS",
-            "LSCOLORS",
-            "COLORTERM",
-            "TERM_FEATURES",
-            "__CF",           # macOS CoreFoundation internals
-            "SQLITE_EXEMPT",
-            "COMMAND_MODE",
-            "TMPDIR",
-            "OLDPWD",
-            "SHLVL",
-            "XPC_",
+            # Always strip regardless of include match
+            "CLAUDE",         # Claude Code / AI tool internals
+            "CLAUDECODE",
         ]
 
         props = base_bi.get("properties", {})
         filtered = {}
+        kept = 0
         stripped = 0
         for k, v in props.items():
             if k.startswith("buildInfo.env."):
                 varname = k[len("buildInfo.env."):]
-                if any(varname.upper().startswith(p.upper()) for p in EXCLUDE_PREFIXES):
+                vupper = varname.upper()
+                # Exclude always wins
+                if any(vupper.startswith(p.upper()) for p in EXCLUDE_PREFIXES):
                     stripped += 1
                     continue
+                # Include check — must match at least one prefix
+                if not any(vupper.startswith(p.upper()) for p in INCLUDE_PREFIXES):
+                    stripped += 1
+                    continue
+                kept += 1
             filtered[k] = v
         base_bi["properties"] = filtered
 
-        env_count = len([k for k in filtered if k.startswith("buildInfo.env.")])
-        print(f"  merged from jf rt bp: {env_count} env vars ({stripped} filtered), {len(base_bi.get('vcs',[]))} vcs entries")
+        print(f"  merged from jf rt bp: {kept} env vars kept, {stripped} stripped, {len(base_bi.get('vcs',[]))} vcs entries")
     except:
         pass
 
