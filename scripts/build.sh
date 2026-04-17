@@ -66,6 +66,7 @@ for __v in IMAGE_NAME DISTRO \
            VENDOR APK_MIRROR APT_MIRROR CA_CERT \
            REGISTRY_KIND \
            ARTIFACTORY_URL ARTIFACTORY_USER ARTIFACTORY_PASSWORD ARTIFACTORY_TOKEN \
+           ARTIFACTORY_PRO ARTIFACTORY_PROJECT \
            ARTIFACTORY_TEAM ARTIFACTORY_ENVIRONMENT ARTIFACTORY_PUSH_HOST \
            ARTIFACTORY_IMAGE_REF ARTIFACTORY_MANIFEST_PATH \
            ARTIFACTORY_BUILD_NAME ARTIFACTORY_BUILD_NUMBER ARTIFACTORY_PROPERTIES; do
@@ -160,15 +161,34 @@ if [ -n "${CA_CERT:-}" ]; then
 fi
 
 # ── Upstream base digest (optional but preferred) ───────────────────
-# `crane digest` queries the upstream registry without pulling the
-# image. Used only for the org.opencontainers.image.base.digest label.
-# If crane isn't installed or the registry is unreachable, build still
-# succeeds — the base.digest label just ends up empty.
+# Used for the org.opencontainers.image.base.digest OCI label — lets
+# consumers verify exactly which upstream content this image was built
+# from. Tries crane first (fast, no pull needed), then docker CLI
+# inspect (works if the image was already pulled). Empty is fine — the
+# build still succeeds, just without the provenance label.
 
 UPSTREAM_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
 BASE_DIGEST=""
 if command -v crane >/dev/null 2>&1; then
-  BASE_DIGEST=$(crane digest "${UPSTREAM_REF}" 2>/dev/null || echo "")
+  _crane_err=""
+  BASE_DIGEST=$(crane digest "${UPSTREAM_REF}" 2>/tmp/crane-err.log) || _crane_err=$(cat /tmp/crane-err.log)
+  if [ -z "${BASE_DIGEST}" ] && [ -n "${_crane_err}" ]; then
+    echo "  WARN: crane digest failed for ${UPSTREAM_REF}" >&2
+    echo "        ${_crane_err}" | head -2 >&2
+    echo "        (base.digest label will be empty — image build unaffected)" >&2
+  fi
+  rm -f /tmp/crane-err.log
+else
+  # Fallback: try docker buildx imagetools inspect (available with
+  # modern Docker, no extra binary needed).
+  if docker buildx imagetools inspect --raw "${UPSTREAM_REF}" >/dev/null 2>&1; then
+    BASE_DIGEST=$(docker buildx imagetools inspect "${UPSTREAM_REF}" --format '{{.Digest}}' 2>/dev/null || echo "")
+  fi
+  if [ -z "${BASE_DIGEST}" ]; then
+    echo "  NOTE: crane not found and docker fallback didn't resolve upstream digest" >&2
+    echo "        Install crane for supply-chain base.digest label:" >&2
+    echo "          brew install crane   OR   go install github.com/google/go-containerregistry/cmd/crane@latest" >&2
+  fi
 fi
 
 # ── Push target ──────────────────────────────────────────────────────
