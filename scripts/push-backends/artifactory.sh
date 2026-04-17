@@ -234,14 +234,22 @@ GIT_SHA=${GIT_SHA:-unknown}
 CREATED=${CREATED:-}
 EOF
 
-    # LCD build info — works on both JCR Free and Pro.
-    # Uses jf rt bp which captures env + git in one shot but does NOT
-    # capture module linkage (layers, manifests). That's a Pro-only
-    # capability via jf docker push.
-    _artifactory_build_publish_free "${build_name}" "${build_number}"
+    # Build info WITH module linkage — works on JCR Free by manually
+    # constructing the build info JSON with module/artifact data from
+    # the storage API. This replicates what jf docker push does on Pro
+    # but using only APIs available on Free (storage checksums + PUT
+    # /api/build). The module linkage makes the image appear under
+    # Packages → Builds → "Produced By" in the Artifactory UI.
+    _artifactory_build_publish_free_with_modules \
+      "${build_name}" "${build_number}" "${manifest_path}" "${target}"
 
-    # Manual property tagging (jf docker push does this automatically
-    # on Pro, but on Free we need to do it ourselves).
+    # Set build.name + build.number on ALL layers (not just manifest).
+    # This is the other half of the cross-link that Pro's jf docker push
+    # does automatically.
+    _artifactory_set_props_all_layers "${manifest_path}" \
+      "${build_name}" "${build_number}"
+
+    # Custom metadata props on the manifest.
     _artifactory_set_props "${manifest_path}" \
       "${build_name}" "${build_number}" "${ARTIFACTORY_ENVIRONMENT}"
   fi
@@ -331,26 +339,219 @@ _artifactory_docker_login() {
     }
 }
 
-# FREE-tier build info publish. LCD pattern — works on JCR Free and Pro.
-# Captures env vars and git info but NOT module linkage (layer digests).
-# On JCR Free, requires Deploy permission on the global
-# artifactory-build-info repo (admin grants once). On Pro, this writes
-# to the global repo; use ARTIFACTORY_PRO=true for project-scoped writes.
-_artifactory_build_publish_free() {
-  local build_name="$1" build_number="$2"
-  local stderr
-  stderr=$(jf rt bp "${build_name}" "${build_number}" \
-             --collect-env --collect-git-info 2>&1 >/dev/null) || {
-    echo "  WARN: 'jf rt bp' failed — build info not published" >&2
-    if echo "${stderr}" | grep -q 'not permitted to deploy.*artifactory-build-info'; then
-      echo "        Cause: ${ARTIFACTORY_USER} lacks Deploy on the system" >&2
-      echo "        'artifactory-build-info' repo. Property-based" >&2
-      echo "        traceability (below) still works regardless." >&2
-    else
-      echo "        ${stderr}" | head -5 >&2
-    fi
-    return 0  # non-fatal
+# FREE-tier build info publish WITH module linkage.
+#
+# Replaces the old LCD-only jf rt bp with a two-step approach:
+#   1. jf rt bp --collect-env --collect-git-info (captures env + git)
+#   2. Manually construct and PUT a module-enriched build info JSON
+#      with artifact checksums from the Artifactory storage API
+#
+# This replicates what jf docker push does on Pro using only APIs
+# available on JCR Free (storage checksums + PUT /api/build).
+# The module linkage makes the image appear under Packages → Builds →
+# "Produced By" in the Artifactory UI.
+_artifactory_build_publish_free_with_modules() {
+  local build_name="$1" build_number="$2" manifest_path="$3" target="$4"
+  local secret="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD}}"
+  local _url="${ARTIFACTORY_URL%/}"
+  _url="${_url%/artifactory}"
+  local art_base="${_url}/artifactory"
+
+  # Step 1: jf rt bp for env + git (same as before)
+  echo ""
+  echo "── Free: collecting env + git via jf rt bp ──"
+  jf rt bp "${build_name}" "${build_number}" \
+    --collect-env --collect-git-info 2>/dev/null || true
+
+  # Step 2: Build module-enriched JSON and re-publish via REST API.
+  # This overwrites the jf rt bp entry with the same data PLUS modules.
+  echo "── Free: building module linkage from storage API ──"
+
+  # Get the tag directory path (strip manifest.json from the end)
+  local tag_dir="${manifest_path%/manifest.json}"
+  local repo_name="${tag_dir%%/*}"
+  local tag_subpath="${tag_dir#*/}"
+
+  # List all files in the tag directory and build the module JSON
+  # using Python for reliable JSON construction (sed-based assembly
+  # was producing malformed JSON with special characters in paths).
+  local listing
+  listing=$(curl -fsSL -u "${ARTIFACTORY_USER}:${secret}" \
+    "${art_base}/api/storage/${tag_dir}" 2>/dev/null) || {
+    echo "  WARN: could not list ${tag_dir} — skipping module linkage" >&2
+    return 0
   }
+
+  # Extract filenames from the listing
+  local files_list
+  files_list=$(echo "${listing}" | grep -o '"uri" *: *"/[^"]*"' | sed 's/"uri" *: *"\/\([^"]*\)"/\1/' | grep -v '^$')
+
+  if [ -z "${files_list}" ]; then
+    echo "  WARN: no files found in ${tag_dir} — skipping module linkage" >&2
+    return 0
+  fi
+
+  # Fetch checksums for each file and build the JSON via Python.
+  # Write one JSON line per file to a temp file, then assemble.
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  local file_count=0
+
+  while IFS= read -r fname; do
+    [ -z "${fname}" ] && continue
+    curl -fsSL -u "${ARTIFACTORY_USER}:${secret}" \
+      "${art_base}/api/storage/${tag_dir}/${fname}" \
+      > "${tmpdir}/file_${file_count}.json" 2>/dev/null && \
+      echo "${fname}" > "${tmpdir}/name_${file_count}.txt"
+    file_count=$((file_count + 1))
+  done <<< "${files_list}"
+
+  # Get git info
+  local git_rev="" git_url=""
+  if git rev-parse HEAD >/dev/null 2>&1; then
+    git_rev=$(git rev-parse HEAD)
+    git_url=$(git config --get remote.origin.url 2>/dev/null || echo "")
+  fi
+
+  local started
+  started=$(date -u +"%Y-%m-%dT%H:%M:%S.000+0000")
+
+  # Count upstream base image layers so we can split dependencies
+  # (base layers we consumed) from our additions. Uses docker inspect
+  # on the upstream image which is in the local daemon after the build.
+  local upstream_layer_count=0
+  if [ -n "${UPSTREAM_REF:-}" ]; then
+    upstream_layer_count=$(docker inspect "${UPSTREAM_REF}" --format '{{len .RootFS.Layers}}' 2>/dev/null || echo 0)
+    echo "  upstream base layers: ${upstream_layer_count} (from docker inspect ${UPSTREAM_REF})"
+  fi
+
+  # Assemble the build info JSON with Python
+  python3 - "${tmpdir}" "${file_count}" "${tag_subpath}" \
+    "${build_name}" "${build_number}" "${target}" \
+    "${IMAGE_NAME}" "${IMAGE_TAG}" "${git_rev}" "${git_url}" \
+    "${started}" "${upstream_layer_count}" <<'PYEOF'
+import json, sys, os
+
+tmpdir = sys.argv[1]
+file_count = int(sys.argv[2])
+tag_subpath = sys.argv[3]
+build_name, build_number, target = sys.argv[4], sys.argv[5], sys.argv[6]
+image_name, image_tag = sys.argv[7], sys.argv[8]
+git_rev, git_url, started = sys.argv[9], sys.argv[10], sys.argv[11]
+upstream_layer_count = int(sys.argv[12]) if len(sys.argv) > 12 else 0
+
+artifacts = []
+all_blobs = []  # layer blobs only (not manifest/config)
+
+for i in range(file_count):
+    name_file = os.path.join(tmpdir, f"name_{i}.txt")
+    info_file = os.path.join(tmpdir, f"file_{i}.json")
+    if not os.path.exists(name_file) or not os.path.exists(info_file):
+        continue
+    fname = open(name_file).read().strip()
+    try:
+        info = json.load(open(info_file))
+    except:
+        continue
+    cs = info.get("checksums", {})
+    if not cs.get("sha256"):
+        continue
+
+    ftype = "json" if fname == "manifest.json" else "gz"
+    artifacts.append({
+        "type": ftype,
+        "sha1": cs.get("sha1", ""),
+        "sha256": cs["sha256"],
+        "md5": cs.get("md5", ""),
+        "name": fname,
+        "path": f"{tag_subpath}/{fname}"
+    })
+
+    if fname != "manifest.json" and fname.startswith("sha256__"):
+        all_blobs.append({
+            "id": fname,
+            "sha1": cs.get("sha1", ""),
+            "sha256": cs["sha256"],
+            "md5": cs.get("md5", "")
+        })
+
+# Dependencies = the upstream base image layers (first N blobs).
+# If we know the upstream layer count, take that many. Otherwise
+# include all blobs (better than 0, slightly over-counts).
+if upstream_layer_count > 0 and upstream_layer_count <= len(all_blobs):
+    dependencies = all_blobs[:upstream_layer_count]
+else:
+    dependencies = all_blobs  # fallback: all blobs as deps
+
+build_info = {
+    "version": "1.0.1",
+    "name": build_name,
+    "number": build_number,
+    "type": "DOCKER",
+    "started": started,
+    "buildAgent": {"name": "container-image-template", "version": "1.0"},
+    "agent": {"name": "build.sh", "version": "free-lcd"},
+    "vcs": [{"revision": git_rev, "url": git_url}] if git_rev else [],
+    "modules": [{
+        "properties": {
+            "docker.image.tag": target,
+            "docker.image.id": ""
+        },
+        "type": "docker",
+        "id": f"{image_name}:{image_tag}",
+        "artifacts": artifacts,
+        "dependencies": dependencies
+    }]
+}
+
+outfile = os.path.join(tmpdir, "build-info.json")
+with open(outfile, "w") as f:
+    json.dump(build_info, f)
+
+print(f"  artifacts: {len(artifacts)}, dependencies: {len(dependencies)}")
+PYEOF
+
+  # PUT to /api/build
+  echo "── Free: publishing enriched build info ──"
+  local http_code
+  http_code=$(curl -fsSL -o /dev/null -w "%{http_code}" \
+    -X PUT -u "${ARTIFACTORY_USER}:${secret}" \
+    -H "Content-Type: application/json" \
+    --data-binary "@${tmpdir}/build-info.json" \
+    "${art_base}/api/build" 2>/dev/null) || true
+
+  if [ "${http_code}" = "204" ]; then
+    echo "  ✓ build info published with module linkage"
+  else
+    echo "  WARN: enriched build info publish returned HTTP ${http_code}" >&2
+    echo "        (modules may not appear in the Packages UI)" >&2
+  fi
+
+  rm -rf "${tmpdir}"
+}
+
+# Set build.name + build.number props on ALL files in a tag directory.
+# On Pro, jf docker push does this automatically. On Free, we iterate.
+_artifactory_set_props_all_layers() {
+  local manifest_path="$1" build_name="$2" build_number="$3"
+  local tag_dir="${manifest_path%/manifest.json}"
+  local props="build.name=${build_name};build.number=${build_number}"
+  local secret="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD}}"
+  local _url="${ARTIFACTORY_URL%/}"
+  _url="${_url%/artifactory}"
+  local art_base="${_url}/artifactory"
+
+  local listing
+  listing=$(curl -fsSL -u "${ARTIFACTORY_USER}:${secret}" \
+    "${art_base}/api/storage/${tag_dir}" 2>/dev/null) || return 0
+
+  local count=0
+  while IFS= read -r fname; do
+    [ -z "${fname}" ] && continue
+    jf rt set-props "${tag_dir}/${fname}" "${props}" 2>/dev/null && count=$((count + 1))
+  done < <(echo "${listing}" | grep -o '"uri" *: *"/[^"]*"' | sed 's/"uri" *: *"\/\([^"]*\)"/\1/' | grep -v '^$')
+
+  echo "  ✓ build.name/build.number set on ${count} files"
 }
 
 _artifactory_set_props() {
