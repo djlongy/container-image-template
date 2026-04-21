@@ -289,7 +289,33 @@ Artifactory generic repo that mirrors the binary:
 | `JF_INSTALLER_URL` | `https://install-cli.jfrog.io` |
 | `JF_BINARY_URL` | Direct URL to `jf` binary (alternative to installer script) |
 
-**5. Nothing else.** The pipeline does not call any other network
+**5. Grype vulnerability database.** Grype fetches its CVE database
+from `grype.anchore.io` by default (~100 MB). For air-gap, mirror it
+to an Artifactory generic repo and point Grype at the mirror:
+
+| Variable | Purpose |
+|---|---|
+| `ARTIFACTORY_GRYPE_DB_REPO` | Generic repo name (e.g. `grype-db-local`). When set, the `grype-db-sync` CI job mirrors the latest DB before every scan and the `grype` job pulls from the mirror instead of Anchore's CDN |
+| `GRYPE_DB_MIRROR_SUBPATH` | Path inside the repo — default `grype-db/v6`. Preserves Anchore's relative path structure so `latest.json` resolves the tarball correctly |
+
+Run the mirror script manually any time (e.g. from a management box
+with internet access, outside the air-gap):
+
+```bash
+ARTIFACTORY_URL=https://artifactory.example.com \
+  ARTIFACTORY_USER=svc-grype-mirror \
+  ARTIFACTORY_TOKEN=<token> \
+  ARTIFACTORY_GRYPE_DB_REPO=grype-db-local \
+  ./scripts/mirror-grype-db.sh
+```
+
+The script downloads `databases/v6/latest.json` + the referenced
+tarball, verifies the SHA-256 checksum against the listing, then
+uploads both to `<repo>/<subpath>/`. Grype reads from the mirror
+via `GRYPE_DB_UPDATE_URL` which the CI job constructs automatically
+when `ARTIFACTORY_GRYPE_DB_REPO` is set.
+
+**6. Nothing else.** The pipeline does not call any other network
 endpoint at runtime. Git checkout comes from GitLab itself (already
 on your internal network), `cosign sign` talks to your registry (not
 Sigstore — `--tlog-upload=false` is set), and SBOM ingestion talks

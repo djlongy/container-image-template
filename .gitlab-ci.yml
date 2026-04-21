@@ -146,6 +146,13 @@ variables:
   GRYPE_VERSION: "v0.82.0"
   COSIGN_URL: "https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64"
   JF_INSTALLER_URL: "https://install-cli.jfrog.io"
+  # Grype vulnerability DB air-gap support:
+  # When ARTIFACTORY_GRYPE_DB_REPO is set, the grype-db-sync job mirrors
+  # the Anchore DB to that repo before the grype scan runs, and the scan
+  # pulls from there instead of grype.anchore.io. Leave unset to let
+  # grype fetch directly from Anchore's public CDN.
+  ARTIFACTORY_GRYPE_DB_REPO: ""
+  GRYPE_DB_MIRROR_SUBPATH: "grype-db/v6"
 
   # 3) Alpine package mirror. Replaces dl-cdn.alpinelinux.org in
   #    /etc/apk/repositories for every `apk add` / `apk upgrade` call
@@ -294,11 +301,35 @@ sbom:
   rules: *build-rules
 
 # ═══════════════════════════════════════════════════════════════════
+# SCAN — grype DB mirror (optional, for air-gapped environments)
+# ═══════════════════════════════════════════════════════════════════
+# Mirrors the Anchore Grype CVE database to an Artifactory generic
+# repo so the grype job can fetch it without reaching grype.anchore.io.
+# Only runs when ARTIFACTORY_GRYPE_DB_REPO is set — skipped otherwise,
+# in which case grype downloads directly from Anchore's public CDN.
+grype-db-sync:
+  stage: scan
+  image: ${ALPINE_IMAGE}
+  needs: []
+  rules:
+    - if: '$ARTIFACTORY_GRYPE_DB_REPO != "" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$ARTIFACTORY_GRYPE_DB_REPO != "" && $CI_PIPELINE_SOURCE == "schedule"'
+    - when: never
+  before_script:
+    - *install-tools
+  script:
+    - ./scripts/mirror-grype-db.sh
+
+# ═══════════════════════════════════════════════════════════════════
 # SCAN — vulnerability scanning (Grype, SBOM-first)
 # ═══════════════════════════════════════════════════════════════════
 # Grype reads the CycloneDX SBOM directly (no image re-pull) and
 # matches components against its vulnerability database. This is the
 # replacement for Trivy while Trivy is banned for business use.
+#
+# Air-gap: when ARTIFACTORY_GRYPE_DB_REPO is set, the grype-db-sync
+# job populates the mirror and this job fetches the DB from there
+# instead of from grype.anchore.io.
 grype:
   stage: scan
   image: ${ALPINE_IMAGE}
@@ -307,6 +338,8 @@ grype:
       artifacts: true
     - job: sbom
       artifacts: true
+    - job: grype-db-sync
+      optional: true
   before_script:
     - *install-tools
     - |
@@ -314,6 +347,19 @@ grype:
         curl -sSfL "${GRYPE_INSTALLER_URL}" | sh -s -- -b /usr/local/bin "${GRYPE_VERSION}"
       fi
       grype version
+    # When a mirror repo is configured, point Grype at it. Credentials
+    # are embedded in the URL so Grype's DB client (which doesn't
+    # support Basic auth headers natively) can authenticate.
+    - |
+      if [ -n "${ARTIFACTORY_GRYPE_DB_REPO:-}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
+        _art_host="${ARTIFACTORY_URL#https://}"
+        _art_host="${_art_host#http://}"
+        _art_host="${_art_host%%/*}"
+        _art_secret="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
+        export GRYPE_DB_UPDATE_URL="https://${ARTIFACTORY_USER}:${_art_secret}@${_art_host}/artifactory/${ARTIFACTORY_GRYPE_DB_REPO}/${GRYPE_DB_MIRROR_SUBPATH}/latest.json"
+        export GRYPE_DB_AUTO_UPDATE=true
+        echo "→ Grype DB source: ${ARTIFACTORY_URL}/artifactory/${ARTIFACTORY_GRYPE_DB_REPO}/${GRYPE_DB_MIRROR_SUBPATH}/latest.json"
+      fi
   script:
     - |
       echo "→ Scanning SBOM for vulnerabilities (Grype)"
