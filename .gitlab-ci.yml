@@ -50,7 +50,7 @@
 #   ARTIFACTORY_PUSH_HOST     — docker push hostname (subdomain layouts)
 #   ARTIFACTORY_IMAGE_REF     — docker push URL template
 #   ARTIFACTORY_MANIFEST_PATH — REST storage path template for set-props
-#   ARTIFACTORY_BUILD_NAME    — defaults to image name
+#   ARTIFACTORY_BUILD_NAME    — defaults to <image>-build
 #   ARTIFACTORY_BUILD_NUMBER  — defaults to CI_JOB_ID / CI_PIPELINE_ID
 #   ARTIFACTORY_PROPERTIES    — extra ;-separated props
 #

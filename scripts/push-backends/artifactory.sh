@@ -34,7 +34,9 @@
 #   ARTIFACTORY_IMAGE_REF     image URL template (see global.env.example in monorepo)
 #   ARTIFACTORY_MANIFEST_PATH REST manifest-path template (for jf rt set-props)
 #   ARTIFACTORY_ENVIRONMENT   dev | prod (default: dev)
-#   ARTIFACTORY_BUILD_NAME    defaults to ${IMAGE_NAME}
+#   ARTIFACTORY_BUILD_NAME    defaults to ${IMAGE_NAME}-build (suffix
+#                             distinguishes build-info from the image
+#                             and its packages in Artifactory UI)
 #   ARTIFACTORY_BUILD_NUMBER  defaults to CI_JOB_ID / CI_PIPELINE_ID / timestamp
 #   ARTIFACTORY_PROPERTIES    extra ;-separated props
 #
@@ -94,8 +96,8 @@ push_to_backend() {
   manifest_path=$(_artifactory_expand_template "${manifest_path_tpl}")
 
   local build_name build_number
-  build_name="${ARTIFACTORY_BUILD_NAME:-${IMAGE_NAME}}"
-  build_number="${ARTIFACTORY_BUILD_NUMBER:-${CI_JOB_ID:-${CI_PIPELINE_ID:-${BUILD_NUMBER:-${GITHUB_RUN_ID:-$(date +%s)}}}}}"
+  build_name="${ARTIFACTORY_BUILD_NAME:-${IMAGE_NAME}-build}"
+  build_number="${ARTIFACTORY_BUILD_NUMBER:-${CI_JOB_ID:-${CI_PIPELINE_ID:-${BUILD_NUMBER:-${GITHUB_RUN_ID:-$(date -u +"%Y-%m-%dT%H-%M-%SZ")}}}}}"
 
   # Pro features toggle
   local is_pro="false"
@@ -157,15 +159,19 @@ push_to_backend() {
     jf rt build-publish "${build_name}" "${build_number}" ${project_flag} 2>&1 | tail -5
 
     # Xray build scan — triggers CVE analysis on the published build.
-    # Returns a CVE table + pass/fail against the project's Xray watches.
-    # Non-fatal: if Xray isn't configured or the build isn't indexed yet,
-    # the push still succeeded and properties are still set.
+    # Non-fatal: exit 3 = watch policy violation (scan succeeded), exit 1 =
+    # Xray unreachable / unlicensed / build not yet indexed. Neither aborts
+    # the push; the image is already uploaded and properties are set.
     echo ""
     echo "── Pro: Xray build scan ──"
     # shellcheck disable=SC2086
-    jf build-scan "${build_name}" "${build_number}" ${project_flag} 2>&1 || {
-      echo "  WARN: jf build-scan returned non-zero (Xray may still be indexing)" >&2
-    }
+    jf build-scan "${build_name}" "${build_number}" ${project_flag} 2>&1
+    local xray_rc=$?
+    case "${xray_rc}" in
+      0) ;;
+      3) echo "  WARN: Xray reported policy violations (exit 3 = --fail default)" >&2 ;;
+      *) echo "  WARN: Xray scan exit ${xray_rc} (unlicensed, unreachable, or still indexing)" >&2 ;;
+    esac
 
     # Resolve digest from the pushed image
     local push_digest=""
@@ -234,18 +240,19 @@ GIT_SHA=${GIT_SHA:-unknown}
 CREATED=${CREATED:-}
 EOF
 
-    # Build info WITH module linkage — works on JCR Free by manually
-    # constructing the build info JSON with module/artifact data from
-    # the storage API. This replicates what jf docker push does on Pro
-    # but using only APIs available on Free (storage checksums + PUT
-    # /api/build). The module linkage makes the image appear under
-    # Packages → Builds → "Produced By" in the Artifactory UI.
+    # Build info WITH module linkage — constructs artifacts[] and
+    # dependencies[] from storage-API checksums + the final/upstream
+    # manifests we side-load. Same data shape jf docker push writes on
+    # Pro. Note: the Packages → Produced By UI hyperlink depends on
+    # /api/search/buildArtifacts which is Pro-licensed; the linkage
+    # data is still correctly stored here so it surfaces in the Build's
+    # own tabs (Artifacts / Dependencies / Env / Properties).
     _artifactory_build_publish_free_with_modules \
       "${build_name}" "${build_number}" "${manifest_path}" "${target}"
 
-    # Set build.name + build.number on ALL layers (not just manifest).
-    # This is the other half of the cross-link that Pro's jf docker push
-    # does automatically.
+    # Set build.name + build.number on every blob so layer details show
+    # "Used by Build" backlinks in the UI (Pro's jf docker push does
+    # this automatically on push; Free has to iterate).
     _artifactory_set_props_all_layers "${manifest_path}" \
       "${build_name}" "${build_number}"
 
@@ -398,21 +405,30 @@ _artifactory_docker_login() {
 
 # FREE-tier build info publish WITH module linkage.
 #
-# Replaces the old LCD-only jf rt bp with a two-step approach:
-#   1. jf rt bp --collect-env --collect-git-info (captures env + git)
-#   2. Manually construct and PUT a module-enriched build info JSON
-#      with artifact checksums from the Artifactory storage API
+# Two-step publish so we get jf's sensitive-value env filter AND our
+# module data on a tier without jf docker push:
+#   1. `jf rt bp --collect-env --collect-git-info` publishes a skeletal
+#      build record with env + git, using jf's own secret redaction
+#      (more comprehensive than a regex).
+#   2. We GET that record back, side-load the final + upstream manifests
+#      via the curl helpers, and hand everything to build-info-merge.py
+#      which writes a modules-enriched JSON PUT to /api/build.
 #
-# This replicates what jf docker push does on Pro using only APIs
-# available on JCR Free (storage checksums + PUT /api/build).
-# The module linkage makes the image appear under Packages → Builds →
-# "Produced By" in the Artifactory UI.
+# Caveat: Packages → Produced By in the Artifactory UI is Pro-gated
+# (calls /api/search/buildArtifacts, which returns HTTP 400 on Free).
+# The build record itself — Artifacts, Dependencies, Env, Properties
+# tabs — renders correctly.
 _artifactory_build_publish_free_with_modules() {
   local build_name="$1" build_number="$2" manifest_path="$3" target="$4"
   local secret="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD}}"
   local _url="${ARTIFACTORY_URL%/}"
   _url="${_url%/artifactory}"
   local art_base="${_url}/artifactory"
+
+  # Capture epoch-ms at the start so the Python merger can compute
+  # durationMillis for the build-info UI "Duration" field.
+  local started_ms
+  started_ms=$(python3 -c 'import time; print(int(time.time()*1000))')
 
   # Step 1: jf rt bp publishes build info with env + git, using jf's
   # own sensitive-value filtering (more comprehensive than regex).
@@ -502,14 +518,12 @@ except json.JSONDecodeError:
   local started
   started=$(date -u +"%Y-%m-%dT%H:%M:%S.000+0000")
 
-  # Count upstream base image layers so we can split dependencies
-  # (base layers we consumed) from our additions. Uses docker inspect
-  # on the upstream image which is in the local daemon after the build.
-  local upstream_layer_count=0
-  if [ -n "${UPSTREAM_REF:-}" ]; then
-    upstream_layer_count=$(docker inspect "${UPSTREAM_REF}" --format '{{len .RootFS.Layers}}' 2>/dev/null || echo 0)
-    echo "  upstream base layers: ${upstream_layer_count} (from docker inspect ${UPSTREAM_REF})"
-  fi
+  # Side-load final + upstream manifests for accurate per-blob
+  # dependency classification. Two small registry calls (~2 KB each)
+  # replace the old "first N blobs" heuristic, which was wrong whenever
+  # the storage listing order didn't match the layer order or when the
+  # upstream wasn't locally tagged under the expected ref.
+  _artifactory_fetch_manifests_for_merge "${target}" "${tmpdir}"
 
   # Copy the fetched build info into the tmpdir for Python to read
   if [ -n "${_bi_tmpfile}" ] && [ -f "${_bi_tmpfile}" ]; then
@@ -520,11 +534,18 @@ except json.JSONDecodeError:
   # the jf-published record (preserving env vars + git + VCS from jf).
   local _backend_dir
   _backend_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # docker.image.id = config blob digest of the local tagged image.
+  # Pro's jf docker push populates this automatically; on Free we read
+  # it from the Docker daemon while the image is still present.
+  local docker_image_id
+  docker_image_id=$(docker inspect --format '{{.Id}}' "${target}" 2>/dev/null || echo "")
+
   python3 "${_backend_dir}/../lib/build-info-merge.py" \
     "${tmpdir}" "${file_count}" "${tag_subpath}" \
     "${build_name}" "${build_number}" "${target}" \
     "${IMAGE_NAME}" "${IMAGE_TAG}" "${git_rev}" "${git_url}" \
-    "${started}" "${upstream_layer_count}"
+    "${started}" \
+    "${repo_name}" "${started_ms}" "${docker_image_id}"
 
   # PUT to /api/build
   echo "── Free: publishing enriched build info ──"
@@ -579,6 +600,113 @@ except json.JSONDecodeError:
   done <<< "${files_list}"
 
   echo "  ✓ build.name/build.number set on ${count} files"
+}
+
+# Fetch a v2 distribution manifest via curl. ARTIFACTORY creds are used
+# (push target and upstream proxy both live on the same Artifactory in
+# our topology; public upstreams ignore the auth header). Empty stdout
+# on failure.
+_artifactory_curl_manifest() {
+  local ref="$1"
+  local secret="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
+  local host repo_ref repo reference
+  host="${ref%%/*}"
+  repo_ref="${ref#*/}"
+  if [[ "${repo_ref}" == *"@"* ]]; then
+    repo="${repo_ref%@*}"
+    reference="${repo_ref#*@}"
+  else
+    repo="${repo_ref%:*}"
+    reference="${repo_ref##*:}"
+  fi
+  local accept="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json"
+  local auth=()
+  [ -n "${secret}" ] && auth=(-u "${ARTIFACTORY_USER:-}:${secret}")
+  curl -fsSL "${auth[@]}" -H "Accept: ${accept}" \
+    "https://${host}/v2/${repo}/manifests/${reference}" 2>/dev/null
+}
+
+# Fetch a blob by digest. Used to pull the upstream image config so we
+# can read rootfs.diff_ids (stable across docker re-compression).
+_artifactory_curl_blob() {
+  local ref="$1" digest="$2"
+  local secret="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
+  local host repo_ref repo
+  host="${ref%%/*}"
+  repo_ref="${ref#*/}"
+  repo="${repo_ref%@*}"
+  repo="${repo%:*}"
+  local auth=()
+  [ -n "${secret}" ] && auth=(-u "${ARTIFACTORY_USER:-}:${secret}")
+  curl -fsSL "${auth[@]}" \
+    "https://${host}/v2/${repo}/blobs/${digest}" 2>/dev/null
+}
+
+# Side-load the data build-info-merge.py needs to classify blobs
+# accurately on the Free path without any post-push round trip through
+# the merger. Two files end up in <tmpdir>:
+#
+#   final-manifest.json   distribution v2 manifest of what we pushed
+#                         (config.digest + layers[].digest in order)
+#   upstream-diffids.json upstream's rootfs.diff_ids, used only for its
+#                         length (= upstream layer count)
+#
+# Python then marks the first N entries of final-manifest.layers[] as
+# dependencies, where N = len(upstream-diffids). This matches what Pro's
+# `jf docker push` records on the Pro path — same semantics, same data
+# shape — just derived from REST rather than the internal Go pipeline.
+# Handles multi-arch upstream by resolving the manifest list to the
+# PLATFORM-matching child (default linux/amd64). Silent on any failure
+# — Python falls back to "all non-config blobs are dependencies".
+_artifactory_fetch_manifests_for_merge() {
+  local target="$1" tmpdir="$2"
+
+  local final_body
+  final_body=$(_artifactory_curl_manifest "${target}")
+  [ -n "${final_body}" ] && printf '%s' "${final_body}" > "${tmpdir}/final-manifest.json"
+
+  [ -z "${UPSTREAM_REF:-}" ] && return 0
+
+  local upstream_body
+  upstream_body=$(_artifactory_curl_manifest "${UPSTREAM_REF}")
+  [ -z "${upstream_body}" ] && return 0
+
+  local upstream_effective_ref="${UPSTREAM_REF}"
+  if printf '%s' "${upstream_body}" | grep -q '"manifests"'; then
+    local plat="${PLATFORM:-linux/amd64}"
+    local plat_digest
+    plat_digest=$(printf '%s' "${upstream_body}" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+os_, arch = '${plat}'.split('/', 1)
+for m in d.get('manifests', []):
+    p = m.get('platform', {})
+    if p.get('os') == os_ and p.get('architecture') == arch:
+        print(m.get('digest', '')); break
+" 2>/dev/null)
+    [ -z "${plat_digest}" ] && {
+      echo "  WARN: upstream manifest list has no ${plat} variant" >&2
+      return 0
+    }
+    local upstream_base="${UPSTREAM_REF%:*}"
+    upstream_effective_ref="${upstream_base}@${plat_digest}"
+    upstream_body=$(_artifactory_curl_manifest "${upstream_effective_ref}")
+    [ -z "${upstream_body}" ] && return 0
+  fi
+
+  local upstream_config_digest
+  upstream_config_digest=$(printf '%s' "${upstream_body}" | python3 -c "
+import json, sys
+print(json.load(sys.stdin).get('config', {}).get('digest', ''))" 2>/dev/null)
+  [ -z "${upstream_config_digest}" ] && return 0
+
+  _artifactory_curl_blob "${upstream_effective_ref}" "${upstream_config_digest}" \
+    | python3 -c "
+import json, sys
+cfg = json.load(sys.stdin)
+json.dump(cfg.get('rootfs', {}).get('diff_ids', []), sys.stdout)" \
+    > "${tmpdir}/upstream-diffids.json" 2>/dev/null || \
+    rm -f "${tmpdir}/upstream-diffids.json"
 }
 
 _artifactory_set_props() {
