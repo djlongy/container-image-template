@@ -99,7 +99,8 @@ committed state. CI overrides anything via plain env variables.
 | File | Edit when forking? | Notes |
 |---|---|---|
 | `image.env.example` | **Always** | The whole image definition lives here |
-| `Dockerfile` | Only if upstream is non-Alpine or you're changing build stages | Generic template; no image-specific values hardcoded |
+| `scripts/extend/` | When you need app-specific RUN/COPY | Drop a `customise.sh` hook and/or `files/` directory — see `scripts/extend/README.md`. One surface for all fork-owned customisation |
+| `Dockerfile` | Only for rare multi-stage `COPY --from=…` patterns | Otherwise generic; extensions go in `scripts/extend/` |
 | `scripts/build.sh` | Never | Reads `image.env`, invokes buildx, handles backend dispatch |
 | `scripts/sbom-post.sh` | Only to add new SBOM sinks | Generic; 3 sinks built in |
 | `scripts/push-backends/artifactory.sh` | Never | Ported from monorepo, same layout templates |
