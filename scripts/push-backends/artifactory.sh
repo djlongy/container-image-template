@@ -6,6 +6,30 @@
 # image to Artifactory, publishes build info, and tags the manifest
 # with structured properties.
 #
+# ── WHERE DO THE ARTIFACTORY_* ENV VARS COME FROM? ───────────────────
+#
+# Any of these three paths work — build.sh resolves them in this
+# precedence order before it sources this backend:
+#
+#   1. image.env.example  (tracked, canonical defaults)
+#   2. image.env          (gitignored, local dev override)
+#   3. Shell / CI env     (always wins — GitLab/Bamboo pipeline vars,
+#                          `export ARTIFACTORY_URL=… ./scripts/build.sh`,
+#                          etc.)
+#
+# Nothing here REQUIRES image.env specifically; CI pipelines typically
+# never touch image.env and set everything as masked group/project
+# variables. Local dev typically uses image.env to avoid re-exporting
+# on every shell. Either pattern (or mixing them) is supported.
+#
+# → See image.env.example for the authoritative list of every variable,
+#   what it does, its default, and copy-and-uncomment templates.
+#
+# The sections below re-list the variables that affect THIS backend's
+# behavior for quick on-file reference, but image.env.example is the
+# source of truth. If you're adding a new variable, document it there
+# first, then add a one-line summary here.
+#
 # ── FREE vs PRO ──────────────────────────────────────────────────────
 #
 # Set ARTIFACTORY_PRO=true to enable Pro-tier features. When unset or
@@ -22,29 +46,28 @@
 # | Project scoping       | N/A                                 | --project on all jf commands                         |
 # | Property tagging      | jf rt set-props (manifest only)     | Automatic on all layers + manual custom props        |
 #
-# Required env:
-#   ARTIFACTORY_URL           https://artifactory.example.com
-#   ARTIFACTORY_USER          team user with Deploy rights
-#   ARTIFACTORY_TOKEN | ARTIFACTORY_PASSWORD   secret
+# ── Variables this backend reads (set in image.env / image.env.example) ─
 #
-# Optional env (both tiers):
-#   ARTIFACTORY_TEAM          team acronym (referenced by layout templates)
-#   ARTIFACTORY_PUSH_HOST     docker push hostname (defaults to host
-#                             portion of ARTIFACTORY_URL)
-#   ARTIFACTORY_IMAGE_REF     image URL template (see global.env.example in monorepo)
-#   ARTIFACTORY_MANIFEST_PATH REST manifest-path template (for jf rt set-props)
-#   ARTIFACTORY_ENVIRONMENT   dev | prod (default: dev)
-#   ARTIFACTORY_BUILD_NAME    defaults to ${IMAGE_NAME}-build (suffix
-#                             distinguishes build-info from the image
-#                             and its packages in Artifactory UI)
-#   ARTIFACTORY_BUILD_NUMBER  defaults to CI_JOB_ID / CI_PIPELINE_ID / timestamp
-#   ARTIFACTORY_PROPERTIES    extra ;-separated props
+# Required (both tiers):
+#   ARTIFACTORY_URL, ARTIFACTORY_USER,
+#   ARTIFACTORY_TOKEN | ARTIFACTORY_PASSWORD,
+#   ARTIFACTORY_TEAM
 #
-# Pro-only env (ignored when ARTIFACTORY_PRO is unset):
-#   ARTIFACTORY_PRO           "true" to enable Pro features
-#   ARTIFACTORY_PROJECT       project key for --project flag (defaults to
-#                             ARTIFACTORY_TEAM). Scopes build info to
-#                             <project>-build-info instead of global.
+# Optional (both tiers):
+#   ARTIFACTORY_ENVIRONMENT, ARTIFACTORY_PUSH_HOST,
+#   ARTIFACTORY_IMAGE_REF, ARTIFACTORY_MANIFEST_PATH,
+#   ARTIFACTORY_BUILD_NAME, ARTIFACTORY_BUILD_NUMBER,
+#   ARTIFACTORY_PROPERTIES, ARTIFACTORY_SBOM_REPO
+#
+# Pro-only (ignored when ARTIFACTORY_PRO is unset/false):
+#   ARTIFACTORY_PRO, ARTIFACTORY_PROJECT,
+#   ARTIFACTORY_XRAY_PRESCAN, ARTIFACTORY_XRAY_POSTSCAN,
+#   ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS
+#
+# Auto-install (air-gap support):
+#   JF_BINARY_URL, JF_INSTALLER_URL, JF_INSTALL_DIR
+#
+# See image.env.example for what each variable does and its default.
 
 set -uo pipefail
 
