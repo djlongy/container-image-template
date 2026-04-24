@@ -75,6 +75,68 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
 # ════════════════════════════════════════════════════════════════════
+# PHASE 0 — Argument parsing
+# ════════════════════════════════════════════════════════════════════
+# Runs first, before any work. Sets WANT_PUSH and WANT_DRY_RUN for
+# later phases. Unknown flags fail loud with a usage hint instead of
+# being silently ignored (which let e.g. `--list` trigger a full build
+# when the user was just probing for options).
+
+_build_print_usage() {
+  cat <<EOF
+Usage: ./scripts/build.sh [--push | --dry-run | --help]
+
+  (no args)    Build locally, load into Docker daemon, don't push.
+  --push       Build, then push to PUSH_REGISTRY/PUSH_PROJECT (or via
+               the Artifactory backend when REGISTRY_KIND=artifactory).
+  --dry-run    Resolve config + base digest, print the report block,
+               stop before docker build. No image produced. Useful for
+               "what would this build with my current env?"
+  --help, -h   This message.
+
+All behavioural toggles are env-driven. See image.env.example for the
+full list. Commonly-used flags:
+
+  REGISTRY_KIND=artifactory   use scripts/push-backends/artifactory.sh
+  REMEDIATE=false             skip scripts/remediate/\${DISTRO}.sh
+  INJECT_CERTS=true           bake certs/*.crt into the trust store
+  SBOM_GENERATE=true          emit <image>-<tag>.cdx.json after build
+  ARTIFACTORY_PRO=true        enable Pro-tier push path
+  ARTIFACTORY_XRAY_PRESCAN=true
+                              jf docker scan BEFORE push (admin gate)
+  ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS=true
+                              fail build on Xray policy violation
+EOF
+}
+
+_build_parse_args() {
+  WANT_PUSH=0
+  WANT_DRY_RUN=0
+
+  # Zero or one arg. More than one is rejected — keeps the contract
+  # simple and discourages drift where people invent combinations.
+  if [ $# -gt 1 ]; then
+    echo "ERROR: too many arguments (got $#, expected 0 or 1)" >&2
+    echo "" >&2
+    _build_print_usage >&2
+    return 1
+  fi
+
+  case "${1:-}" in
+    "")            ;;
+    --push)        WANT_PUSH=1 ;;
+    --dry-run)     WANT_DRY_RUN=1 ;;
+    --help|-h)     _build_print_usage; exit 0 ;;
+    *)
+      echo "ERROR: unknown flag '$1'" >&2
+      echo "" >&2
+      _build_print_usage >&2
+      return 1
+      ;;
+  esac
+}
+
+# ════════════════════════════════════════════════════════════════════
 # PHASE 1 — Config loading
 # ════════════════════════════════════════════════════════════════════
 # image.env is the single source of truth. Three-layer precedence:
@@ -249,9 +311,9 @@ _build_resolve_push_target() {
     fi
   fi
 
-  WANT_PUSH=0
-  if [ "${1:-}" = "--push" ]; then
-    WANT_PUSH=1
+  # WANT_PUSH was set by _build_parse_args; validate push target only
+  # when push is actually requested.
+  if [ "${WANT_PUSH}" -eq 1 ]; then
     if [ -z "${PUSH_REGISTRY:-}" ] || [ -z "${PUSH_PROJECT:-}" ]; then
       echo "ERROR: PUSH_REGISTRY and PUSH_PROJECT must be set for --push" >&2
       if [ "${REGISTRY_KIND_LC}" = "artifactory" ]; then
@@ -584,16 +646,23 @@ _build_generate_sbom() {
 # One phase per line. Phase helpers never skip downstream work — any
 # failure returns non-zero here and the orchestrator exits.
 
+_build_parse_args "$@"
 _build_load_image_env
 _build_apply_defaults_and_normalise
 
 _build_compute_tag
 _build_resolve_source_url
 _build_materialise_certs
-_build_resolve_push_target "$@"
+_build_resolve_push_target
 
 _build_print_config_report
 _build_resolve_base_digest
+
+# --dry-run stops here: config resolved, digest fetched, no image built.
+if [ "${WANT_DRY_RUN}" -eq 1 ]; then
+  echo "→ --dry-run: stopping before docker build"
+  exit 0
+fi
 
 _build_docker_build
 _build_push_and_emit_env
