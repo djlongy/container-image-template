@@ -44,7 +44,7 @@
 # | Module linkage        | None (plain push, no layer capture)  | Automatic (jf docker push captures layers+manifests) |
 # | Xray build scan       | N/A (no Xray on Free)               | jf build-scan --project (returns CVE table)          |
 # | Project scoping       | N/A                                 | --project on all jf commands                         |
-# | Property tagging      | jf rt set-props (manifest only)     | Automatic on all layers + manual custom props        |
+# | Property tagging      | jf rt set-props per-layer loop + manifest props | Automatic on all layers via jf docker push + manifest custom props |
 #
 # ── Variables this backend reads (set in image.env / image.env.example) ─
 #
@@ -779,7 +779,11 @@ except json.JSONDecodeError:
 ")
   while IFS= read -r fname; do
     [ -z "${fname}" ] && continue
-    jf rt set-props "${tag_dir}/${fname}" "${props}" 2>/dev/null && count=$((count + 1))
+    # Swallow jf's per-call `{"status":"success",...}` stdout blob —
+    # on the Free path we iterate over every blob in the tag dir and
+    # the repetition is just noise. The trailing "set on N files" line
+    # below is the one user-facing summary.
+    jf rt set-props "${tag_dir}/${fname}" "${props}" >/dev/null 2>&1 && count=$((count + 1))
   done <<< "${files_list}"
 
   echo "  ✓ build.name/build.number set on ${count} files"
@@ -903,7 +907,7 @@ _artifactory_set_props() {
   # artifact rather than a speculative path.
   [ -n "${ARTIFACTORY_PROPERTIES:-}" ] && props="${props};${ARTIFACTORY_PROPERTIES}"
 
-  if ! jf rt set-props "${manifest_path}" "${props}" 2>/dev/null; then
+  if ! jf rt set-props "${manifest_path}" "${props}" >/dev/null 2>&1; then
     echo "  WARN: 'jf rt set-props' failed for ${manifest_path}" >&2
     echo "        (check manifest path matches the repo storage layout)" >&2
   fi
