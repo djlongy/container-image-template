@@ -58,6 +58,8 @@ push_to_backend() {
   # match consistently. Same pattern as build.sh for REMEDIATE / SBOM_*.
   ARTIFACTORY_PRO="$(printf '%s' "${ARTIFACTORY_PRO:-false}" | tr '[:upper:]' '[:lower:]')"
   ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS="$(printf '%s' "${ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS:-false}" | tr '[:upper:]' '[:lower:]')"
+  ARTIFACTORY_XRAY_PRESCAN="$(printf '%s' "${ARTIFACTORY_XRAY_PRESCAN:-false}" | tr '[:upper:]' '[:lower:]')"
+  ARTIFACTORY_XRAY_POSTSCAN="$(printf '%s' "${ARTIFACTORY_XRAY_POSTSCAN:-true}" | tr '[:upper:]' '[:lower:]')"
 
   # ── Decompose the locally-built image reference ──
   local image_repo_tag="${built_local_ref##*/}"
@@ -148,6 +150,66 @@ push_to_backend() {
     # digests) into build info automatically. Also sets build.name +
     # build.number properties on every layer, not just the manifest.
     docker tag "${built_local_ref}" "${target}"
+
+    # ── Optional: pre-push Xray gate (jf docker scan) ───────────────
+    # When ARTIFACTORY_XRAY_PRESCAN=true, run `jf docker scan` against
+    # the locally-tagged image BEFORE pushing. Two big benefits over
+    # the post-push build-scan:
+    #   1. Policy failures can keep the image OUT of Artifactory
+    #      entirely (no cleanup needed, no bad digest in prod-local).
+    #   2. Only talks to our Artifactory/Xray — no outbound to
+    #      anchore.io or other public sources. Fits air-gapped runs
+    #      where the grype stage can't reach its public DB.
+    #
+    # Caveats:
+    #   - Requires Xray Pro (already gated by is_pro above).
+    #   - Must supply one of --watches / --project / --repo-path for
+    #     the scan to return exit 3 on violations (without any of
+    #     those, the scan is informational only). We pass the project
+    #     flag we've already computed.
+    #   - Adds ~10-60s to the critical path depending on image size +
+    #     Xray indexing speed. Opt-in on purpose.
+    #
+    # Same ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS policy as the post-push
+    # build-scan — one env var governs both checkpoints.
+    if [ "${ARTIFACTORY_XRAY_PRESCAN:-false}" = "true" ]; then
+      if [ -z "${project_flag}" ]; then
+        echo "" >&2
+        echo "  WARN: ARTIFACTORY_XRAY_PRESCAN=true but project_flag is empty" >&2
+        echo "        (no ARTIFACTORY_PROJECT or ARTIFACTORY_TEAM set). Scan will" >&2
+        echo "        be informational only — set a project to enforce violations." >&2
+      fi
+      echo ""
+      echo "── Pro: Xray pre-push scan (jf docker scan ${target}) ──"
+      # shellcheck disable=SC2086
+      jf docker scan "${target}" ${project_flag} --fail=true 2>&1
+      local prescan_rc=$?
+      case "${prescan_rc}" in
+        0)
+          echo "  ✓ Xray pre-push clean"
+          ;;
+        3)
+          case "${ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS:-false}" in
+            true|strict)
+              echo "" >&2
+              echo "  ERROR: Xray pre-push scan reported policy violations" >&2
+              echo "         — refusing to push (ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS=${ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS})" >&2
+              echo "         The image is NOT in Artifactory. Review the scanner" >&2
+              echo "         output above, remediate, rebuild, and retry." >&2
+              return 1
+              ;;
+            *)
+              echo "  WARN: Xray pre-push scan found violations — pushing anyway (warn mode)" >&2
+              echo "        Set ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS=true to block push on violations." >&2
+              ;;
+          esac
+          ;;
+        *)
+          echo "  WARN: Xray pre-push scan exit ${prescan_rc} (unlicensed, unreachable, or indexing) — continuing with push" >&2
+          ;;
+      esac
+    fi
+
     # shellcheck disable=SC2086
     jf docker push "${target}" \
       --build-name="${build_name}" \
@@ -169,6 +231,13 @@ push_to_backend() {
     #   3  watch policy violation (scan succeeded, findings tripped --fail)
     #   *  Xray unreachable / unlicensed / build not yet indexed
     #
+    # Toggled by ARTIFACTORY_XRAY_POSTSCAN (default true). Symmetric
+    # with ARTIFACTORY_XRAY_PRESCAN above, so you can pick any
+    # combination: pre-only, post-only, both, neither. Skip the
+    # post-scan when relying on the pre-scan alone (saves a round-trip
+    # and build-info record), or when Xray licensing/availability is
+    # unreliable and you don't want every build flagged with warnings.
+    #
     # Violation-handling policy is driven by ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS:
     #   unset | "false" | "warn"   → warn and proceed (default — matches
     #                                the rest of the push steps where the
@@ -179,38 +248,43 @@ push_to_backend() {
     #                                this gates promotion, not publish.
     # Non-3 exits (licensing / unreachable / indexing) always stay warnings —
     # those aren't policy decisions, just scanner availability blips.
-    echo ""
-    echo "── Pro: Xray build scan ──"
-    local xray_fail_mode="${ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS:-false}"
-    # shellcheck disable=SC2086
-    jf build-scan "${build_name}" "${build_number}" ${project_flag} 2>&1
-    local xray_rc=$?
-    case "${xray_rc}" in
-      0)
-        echo "  ✓ Xray clean (no policy violations)"
-        ;;
-      3)
-        case "${xray_fail_mode}" in
-          true|strict)
-            echo "" >&2
-            echo "  ERROR: Xray policy violations detected — failing build" >&2
-            echo "         (ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS=${xray_fail_mode})" >&2
-            echo "         The image has been pushed, but this run is being" >&2
-            echo "         rejected so downstream promote/deploy stages don't" >&2
-            echo "         advance. Review findings in Artifactory →" >&2
-            echo "         Builds → ${build_name}/${build_number} → Xray Data." >&2
-            return 1
-            ;;
-          *)
-            echo "  WARN: Xray reported policy violations — continuing (warn mode)" >&2
-            echo "        Set ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS=true to hard-fail the build." >&2
-            ;;
-        esac
-        ;;
-      *)
-        echo "  WARN: Xray scan exit ${xray_rc} (unlicensed, unreachable, or still indexing)" >&2
-        ;;
-    esac
+    if [ "${ARTIFACTORY_XRAY_POSTSCAN}" = "true" ]; then
+      echo ""
+      echo "── Pro: Xray build scan ──"
+      local xray_fail_mode="${ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS:-false}"
+      # shellcheck disable=SC2086
+      jf build-scan "${build_name}" "${build_number}" ${project_flag} 2>&1
+      local xray_rc=$?
+      case "${xray_rc}" in
+        0)
+          echo "  ✓ Xray clean (no policy violations)"
+          ;;
+        3)
+          case "${xray_fail_mode}" in
+            true|strict)
+              echo "" >&2
+              echo "  ERROR: Xray policy violations detected — failing build" >&2
+              echo "         (ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS=${xray_fail_mode})" >&2
+              echo "         The image has been pushed, but this run is being" >&2
+              echo "         rejected so downstream promote/deploy stages don't" >&2
+              echo "         advance. Review findings in Artifactory →" >&2
+              echo "         Builds → ${build_name}/${build_number} → Xray Data." >&2
+              return 1
+              ;;
+            *)
+              echo "  WARN: Xray reported policy violations — continuing (warn mode)" >&2
+              echo "        Set ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS=true to hard-fail the build." >&2
+              ;;
+          esac
+          ;;
+        *)
+          echo "  WARN: Xray scan exit ${xray_rc} (unlicensed, unreachable, or still indexing)" >&2
+          ;;
+      esac
+    else
+      echo ""
+      echo "── Pro: Xray build scan skipped (ARTIFACTORY_XRAY_POSTSCAN=${ARTIFACTORY_XRAY_POSTSCAN}) ──"
+    fi
 
     # Resolve digest from the pushed image
     local push_digest=""
