@@ -94,6 +94,24 @@ Usage: ./scripts/build.sh [--push | --dry-run | --help]
                "what would this build with my current env?"
   --help, -h   This message.
 
+Customisation (fork-owned, no template edits required):
+
+  scripts/extend/customise.sh   optional shell hook. Runs as root
+                                after remediate, before the final
+                                USER flip. Use for apk/apt installs,
+                                chown, writing generated configs, etc.
+                                Failures fail the build (set -eu).
+
+  scripts/extend/files/         optional directory. Contents copy
+                                verbatim to /opt/app/ in the image
+                                (cp -a, permissions preserved). Use
+                                for static configs, entrypoint shims,
+                                prebuilt binaries.
+
+  Both are optional; missing = no-op. Hook runs AFTER files/ is copied,
+  so it can reference /opt/app/ freely. See scripts/extend/README.md
+  for the full contract.
+
 All behavioural toggles are env-driven. See image.env.example for the
 full list. Commonly-used flags:
 
