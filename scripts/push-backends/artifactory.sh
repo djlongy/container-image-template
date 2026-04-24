@@ -160,7 +160,7 @@ _artifactory_print_banner() {
   if [ "${_ART_IS_PRO}" = "true" ]; then
     echo "  Tier:            PRO (project=${_ART_PROJECT_KEY})"
   else
-    echo "  Tier:            FREE (LCD baseline)"
+    echo "  Tier:            FREE (baseline — no Pro features)"
   fi
 }
 
