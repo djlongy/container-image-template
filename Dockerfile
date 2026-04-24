@@ -131,6 +131,48 @@ RUN set -eux; \
 ARG REMEDIATE
 FROM remediate-${REMEDIATE} AS final
 
+# ═══════════════════════════════════════════════════════════════════
+# RESERVED EXTENSION POINT — fork-owned territory
+# ═══════════════════════════════════════════════════════════════════
+#
+# This is the ONE place a fork customises the image. Everything above
+# is template-owned and updates cleanly when you pull from upstream.
+# See scripts/extend/README.md for the full contract.
+#
+# Two optional surfaces inside scripts/extend/:
+#
+#   customise.sh   — shell hook. Runs as root, after remediation,
+#                    before the final USER flip. Use for apk/apt
+#                    installs, writing config, chowning paths, etc.
+#
+#   files/         — directory. Contents copy verbatim to /opt/app/
+#                    inside the image. Use for static configs,
+#                    prebuilt binaries, templates, etc.
+#
+# Both are optional. Missing = no-op, no failure.
+#
+# Ordering: files/ is copied BEFORE customise.sh runs, so the hook
+# can reference /opt/app/ if it needs to chmod/chown or rewrite
+# something. If customise.sh exits non-zero the build fails (set -eu).
+#
+# Dockerfile forks are still possible for the rare case of multi-stage
+# COPY --from=… patterns, but extending via scripts/extend/ avoids that
+# cost for ~95% of customisations (package installs, config drops, ENV
+# tweaks, healthcheck scripts, entrypoint wrappers).
+USER root
+COPY scripts/extend/ /tmp/extend/
+RUN set -eu; \
+    if [ -d /tmp/extend/files ] && [ "$(ls -A /tmp/extend/files 2>/dev/null || true)" ]; then \
+      mkdir -p /opt/app; \
+      cp -a /tmp/extend/files/. /opt/app/; \
+      echo "→ extension: copied scripts/extend/files/ → /opt/app/"; \
+    fi; \
+    if [ -x /tmp/extend/customise.sh ]; then \
+      echo "→ extension: running scripts/extend/customise.sh"; \
+      /tmp/extend/customise.sh; \
+    fi; \
+    rm -rf /tmp/extend
+
 # Restore whatever USER the upstream image ran as. Required for images
 # whose entrypoint expects a specific UID (e.g. nginx's entrypoint
 # chowns paths only if run as root, then drops privs itself).
