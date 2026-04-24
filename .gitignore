@@ -35,9 +35,16 @@ local/
 # SBOM / scan outputs — produced by the pipeline, not committed
 sbom*.json
 sbom*.xml
+*.cdx.json
+*.spdx.json
 grype-report.json
 trivy-report.json
 vulnerabilities.json
+
+# Auto-installed tool binaries (crane, syft) when not on PATH —
+# scripts/build.sh drops them here rather than /usr/local/bin so it
+# works without sudo on dev machines.
+.bin/
 
 # Editor / OS
 .DS_Store

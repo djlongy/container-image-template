@@ -25,6 +25,26 @@
 #   VENDOR              default: example.com
 #   CA_CERT             PEM content of a CA cert to inject (writes to certs/
 #                       before build, picked up by the COPY in Dockerfile)
+#   SBOM_GENERATE       default: false — opt-in. When true, syft emits a
+#                       CycloneDX JSON next to the built image. Generation
+#                       and shipping are intentionally decoupled: this
+#                       script ONLY writes the file. scripts/sbom-post.sh
+#                       is a separate, standalone stage (wired in as the
+#                       sbom-ingest job in .gitlab-ci.yml). Leave this
+#                       off when CI's dedicated sbom stage is already
+#                       running — turn it on for local dev and for
+#                       non-docker forks (Ansible / pip / npm source).
+#   SBOM_TARGET         default: image — scan the built image (needs push
+#                       to resolve IMAGE_DIGEST, falls back to FULL_IMAGE).
+#                       Set to "source" to scan the working directory
+#                       instead — useful for forks that ship Ansible,
+#                       pip, npm or go source rather than container images.
+#   SBOM_FILE           default: <image>-<tag>.cdx.json — override if
+#                       you need a specific filename. Suffix must remain
+#                       .cdx.json for Artifactory Xray SBOM-import.
+#   CRANE_URL           default: auto-detected for host OS/arch —
+#                       override to point at an internal mirror for
+#                       air-gapped runners.
 #   SBOM_ATTEST         default: false — scaffolded for future cosign attest-sbom;
 #                       the active SBOM workflow is driven by .gitlab-ci.yml
 #                       calling syft/grype on the pushed image directly.
@@ -72,6 +92,9 @@ for __v in IMAGE_NAME DISTRO \
            ARTIFACTORY_IMAGE_REF ARTIFACTORY_MANIFEST_PATH \
            ARTIFACTORY_BUILD_NAME ARTIFACTORY_BUILD_NUMBER ARTIFACTORY_PROPERTIES \
            ARTIFACTORY_SBOM_REPO ARTIFACTORY_GRYPE_DB_REPO \
+           ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS \
+           CRANE_URL SYFT_INSTALLER_URL SYFT_VERSION \
+           SBOM_GENERATE SBOM_TARGET SBOM_FILE \
            VAULT_KV_MOUNT VAULT_CA_PATH; do
   if [ "${!__v+set}" = "set" ]; then
     __SHELL_OVERRIDES="${__SHELL_OVERRIDES}${__v}=$(printf '%q' "${!__v}")"$'\n'
@@ -117,6 +140,17 @@ REMEDIATE="${REMEDIATE:-true}"
 INJECT_CERTS="${INJECT_CERTS:-false}"
 ORIGINAL_USER="${ORIGINAL_USER:-root}"
 VENDOR="${VENDOR:-example.com}"
+
+# Normalise boolean env vars to lowercase so TRUE/True/true all work
+# identically. The Dockerfile FROM selectors (certs-${INJECT_CERTS},
+# remediate-${REMEDIATE}) MUST see lowercase values — without this,
+# a user setting REMEDIATE=TRUE in image.env would silently fail to
+# match any stage and the build would break in a confusing way. Same
+# pattern as REGISTRY_KIND_LC below.
+REMEDIATE="$(printf '%s' "${REMEDIATE}"      | tr '[:upper:]' '[:lower:]')"
+INJECT_CERTS="$(printf '%s' "${INJECT_CERTS}" | tr '[:upper:]' '[:lower:]')"
+SBOM_GENERATE="$(printf '%s' "${SBOM_GENERATE:-false}" | tr '[:upper:]' '[:lower:]')"
+SBOM_TARGET="$(printf '%s'   "${SBOM_TARGET:-image}"   | tr '[:upper:]' '[:lower:]')"
 
 # Validate DISTRO against the scripts shipped in scripts/remediate/.
 # Forkers can add a new distro by dropping scripts/remediate/<name>.sh
@@ -174,38 +208,6 @@ elif [ -n "${VAULT_CA_PATH:-}" ] && command -v vault >/dev/null 2>&1; then
   fi
 fi
 
-# ── Upstream base digest (optional but preferred) ───────────────────
-# Used for the org.opencontainers.image.base.digest OCI label — lets
-# consumers verify exactly which upstream content this image was built
-# from. Tries crane first (fast, no pull needed), then docker CLI
-# inspect (works if the image was already pulled). Empty is fine — the
-# build still succeeds, just without the provenance label.
-
-UPSTREAM_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
-BASE_DIGEST=""
-if command -v crane >/dev/null 2>&1; then
-  # Capture stderr alongside stdout — exit code distinguishes success/failure
-  _crane_output=$(crane digest "${UPSTREAM_REF}" 2>&1)
-  if [ $? -eq 0 ]; then
-    BASE_DIGEST="${_crane_output}"
-  else
-    echo "  WARN: crane digest failed for ${UPSTREAM_REF}" >&2
-    printf '%s\n' "${_crane_output}" | head -2 | sed 's/^/        /' >&2
-    echo "        (base.digest label will be empty — image build unaffected)" >&2
-  fi
-else
-  # Fallback: try docker buildx imagetools inspect (available with
-  # modern Docker, no extra binary needed).
-  if docker buildx imagetools inspect --raw "${UPSTREAM_REF}" >/dev/null 2>&1; then
-    BASE_DIGEST=$(docker buildx imagetools inspect "${UPSTREAM_REF}" --format '{{.Digest}}' 2>/dev/null || echo "")
-  fi
-  if [ -z "${BASE_DIGEST}" ]; then
-    echo "  NOTE: crane not found and docker fallback didn't resolve upstream digest" >&2
-    echo "        Install crane for supply-chain base.digest label:" >&2
-    echo "          brew install crane   OR   go install github.com/google/go-containerregistry/cmd/crane@latest" >&2
-  fi
-fi
-
 # ── Push target ──────────────────────────────────────────────────────
 # When REGISTRY_KIND=artifactory, PUSH_REGISTRY and PUSH_PROJECT are
 # only used for the intermediate local tag (the backend retags to the
@@ -248,6 +250,8 @@ else
   FULL_IMAGE="${IMAGE_NAME}:${FULL_TAG}"
 fi
 
+UPSTREAM_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+
 # ── Source / URL labels ──────────────────────────────────────────────
 # Prefer CI-supplied values (GitLab sets CI_PROJECT_URL; Bamboo sets
 # bamboo_planRepository_1_repositoryUrl). Fall back to the first git
@@ -259,6 +263,10 @@ if [ -z "${SOURCE_URL}" ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1
 fi
 
 # ── Report resolved config ───────────────────────────────────────────
+# Printed BEFORE resolving the upstream digest so the user sees
+# progress immediately. Digest resolution (next section) can take a
+# few seconds against slow/air-gapped registries and was previously
+# the source of "hung with no output" reports.
 
 echo ""
 echo "=========================================="
@@ -266,7 +274,7 @@ echo "  container-image-template build"
 echo "=========================================="
 echo "  Image:              ${FULL_IMAGE}"
 echo "  Upstream:           ${UPSTREAM_REF}"
-echo "  Upstream digest:    ${BASE_DIGEST:-<not resolved>}"
+echo "  Upstream digest:    <resolving...>"
 echo "  Git commit:         ${GIT_SHORT} (${GIT_SHA})"
 echo "  Created (UTC):      ${CREATED}"
 echo "  Distro:             ${DISTRO}"
@@ -279,6 +287,83 @@ echo "  Vendor:             ${VENDOR}"
 echo "  Source URL:         ${SOURCE_URL:-<none>}"
 echo "=========================================="
 echo ""
+
+# ── Upstream base digest (optional but preferred) ───────────────────
+# Used for the org.opencontainers.image.base.digest OCI label — lets
+# consumers verify exactly which upstream content this image was built
+# from. Resolution strategy:
+#   1. crane digest        (fast — manifest-only, no image pull)
+#   2. auto-install crane  (from CRANE_URL) if not on PATH
+#   3. docker buildx imagetools inspect  (fallback if crane install fails)
+# Empty is fine — the build still succeeds, just without the
+# provenance label.
+
+BASE_DIGEST=""
+
+# Auto-install crane when missing and CRANE_URL is set (matches the
+# CI install step). Makes the CRANE_URL env var actually useful on
+# developer machines too.
+if ! command -v crane >/dev/null 2>&1; then
+  # Default URL picks the binary matching the host OS/arch. Override
+  # CRANE_URL when mirroring to an internal generic repo.
+  if [ -z "${CRANE_URL:-}" ]; then
+    case "$(uname -s)" in
+      Linux)  _crane_os="Linux" ;;
+      Darwin) _crane_os="Darwin" ;;
+      *)      _crane_os="" ;;
+    esac
+    case "$(uname -m)" in
+      x86_64|amd64)   _crane_arch="x86_64" ;;
+      aarch64|arm64)  _crane_arch="arm64" ;;
+      *)              _crane_arch="" ;;
+    esac
+    if [ -n "${_crane_os}" ] && [ -n "${_crane_arch}" ]; then
+      CRANE_URL="https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_${_crane_os}_${_crane_arch}.tar.gz"
+    fi
+    unset _crane_os _crane_arch
+  fi
+
+  if [ -n "${CRANE_URL:-}" ]; then
+    echo "→ crane not on PATH — installing from ${CRANE_URL}"
+    mkdir -p "${REPO_ROOT}/.bin"
+    if curl -fSL --progress-bar --max-time 120 "${CRANE_URL}" \
+         | tar xz -C "${REPO_ROOT}/.bin" crane 2>/dev/null \
+       && [ -x "${REPO_ROOT}/.bin/crane" ]; then
+      export PATH="${REPO_ROOT}/.bin:${PATH}"
+      echo "  ✓ crane installed to ${REPO_ROOT}/.bin/crane ($(${REPO_ROOT}/.bin/crane version 2>&1 | head -1))"
+    else
+      echo "  WARN: crane install failed — URL unreachable or tarball invalid" >&2
+      echo "        (will fall back to docker buildx imagetools inspect)" >&2
+    fi
+  else
+    echo "  NOTE: crane not on PATH and CRANE_URL not set — skipping install" >&2
+    echo "        (will fall back to docker buildx imagetools inspect)" >&2
+  fi
+fi
+
+if command -v crane >/dev/null 2>&1; then
+  echo "→ Resolving upstream digest: crane digest ${UPSTREAM_REF}"
+  _crane_output=$(crane digest "${UPSTREAM_REF}" 2>&1) && _crane_rc=0 || _crane_rc=$?
+  if [ "${_crane_rc}" -eq 0 ]; then
+    BASE_DIGEST="${_crane_output}"
+    echo "  ✓ ${BASE_DIGEST}"
+  else
+    echo "  WARN: crane digest failed (rc=${_crane_rc}) for ${UPSTREAM_REF}" >&2
+    printf '%s\n' "${_crane_output}" | head -2 | sed 's/^/        /' >&2
+  fi
+  unset _crane_output _crane_rc
+fi
+
+if [ -z "${BASE_DIGEST}" ] && command -v docker >/dev/null 2>&1; then
+  echo "→ Resolving upstream digest: docker buildx imagetools inspect ${UPSTREAM_REF}"
+  BASE_DIGEST=$(docker buildx imagetools inspect "${UPSTREAM_REF}" --format '{{.Digest}}' 2>/dev/null || echo "")
+  if [ -n "${BASE_DIGEST}" ]; then
+    echo "  ✓ ${BASE_DIGEST}"
+  else
+    echo "  WARN: docker buildx imagetools inspect also failed" >&2
+    echo "        (base.digest label will be empty — image build unaffected)" >&2
+  fi
+fi
 
 # ── Build ────────────────────────────────────────────────────────────
 # Dynamic OCI labels passed via --label (the DevSecOps-recommended
@@ -366,6 +451,9 @@ if [ ${WANT_PUSH} -eq 1 ]; then
       IMAGE_DIGEST="${PUSH_REGISTRY}/${PUSH_PROJECT}/${IMAGE_NAME}@${PUSH_DIGEST}"
       echo "→ pushed: ${IMAGE_DIGEST}"
     fi
+    # Export so downstream steps (e.g. SBOM generation) can read it
+    # without re-parsing build.env.
+    export IMAGE_DIGEST IMAGE_REF="${FULL_IMAGE}"
 
     cat > build.env <<EOF
 IMAGE_REF=${FULL_IMAGE}
@@ -382,4 +470,83 @@ EOF
 
   echo "→ wrote build.env"
   cat build.env | sed 's/^/    /'
+fi
+
+# ── SBOM generation (opt-in, decoupled from SBOM shipping) ──────────
+# Emits a CycloneDX JSON next to the built image. Filename follows
+# Artifactory Xray's expected <name>.cdx.json convention so it's
+# auto-indexed when whichever stage does the upload picks it up.
+#
+# Off by default on purpose — the CI pipeline already has a dedicated
+# `sbom` stage (see .gitlab-ci.yml) that does this against the pushed
+# digest, and a separate `sbom-ingest` stage that ships via
+# scripts/sbom-post.sh. Running both would duplicate work.
+#
+# Turn this on (SBOM_GENERATE=true) for:
+#   - Local dev runs where you want a scanable BOM without a full pipeline
+#   - Forks that build non-docker artifacts (Ansible, pip, npm, go
+#     source) and don't have a separate sbom CI stage
+#
+# Two scan targets:
+#   SBOM_TARGET=image   (default)  — built/pushed image content. Uses
+#                                    IMAGE_DIGEST when available (with
+#                                    --push), else FULL_IMAGE.
+#   SBOM_TARGET=source             — the repo working directory. Fits
+#                                    Ansible roles, requirements.txt,
+#                                    package.json, go.mod, etc.
+#
+# Shipping stays the domain of scripts/sbom-post.sh as a standalone
+# stage — do not chain it here. Downstream callers decide when and how
+# to ingest the produced file.
+
+if [ "${SBOM_GENERATE}" = "true" ]; then
+  if ! command -v syft >/dev/null 2>&1; then
+    _syft_url="${SYFT_INSTALLER_URL:-https://raw.githubusercontent.com/anchore/syft/main/install.sh}"
+    _syft_ver="${SYFT_VERSION:-v1.14.0}"
+    echo ""
+    echo "→ syft not on PATH — installing ${_syft_ver} from ${_syft_url}"
+    mkdir -p "${REPO_ROOT}/.bin"
+    if curl -fsSL --max-time 120 "${_syft_url}" \
+         | sh -s -- -b "${REPO_ROOT}/.bin" "${_syft_ver}" >/dev/null 2>&1 \
+       && [ -x "${REPO_ROOT}/.bin/syft" ]; then
+      export PATH="${REPO_ROOT}/.bin:${PATH}"
+      echo "  ✓ syft installed ($(${REPO_ROOT}/.bin/syft version 2>&1 | head -1))"
+    else
+      echo "  WARN: syft install failed — skipping SBOM generation" >&2
+    fi
+    unset _syft_url _syft_ver
+  fi
+
+  if command -v syft >/dev/null 2>&1; then
+    _sbom_basename="${IMAGE_NAME##*/}-${FULL_TAG}"
+    SBOM_FILE="${SBOM_FILE:-${_sbom_basename}.cdx.json}"
+
+    case "${SBOM_TARGET}" in
+      source)
+        _scan_target="dir:${REPO_ROOT}"
+        ;;
+      image|*)
+        _scan_target="${IMAGE_DIGEST:-${FULL_IMAGE}}"
+        ;;
+    esac
+
+    echo ""
+    echo "→ syft: generating CycloneDX SBOM for ${_scan_target}"
+    if syft "${_scan_target}" -o cyclonedx-json="${SBOM_FILE}"; then
+      echo "→ SBOM: ${SBOM_FILE} ($(wc -c < "${SBOM_FILE}") bytes)"
+      if command -v jq >/dev/null 2>&1; then
+        echo "        components: $(jq '.components | length' "${SBOM_FILE}")"
+      fi
+      # Expose SBOM_FILE to downstream stages (sbom-ingest, etc.) via
+      # build.env when it exists. No shipping here — sbom-post.sh runs
+      # as its own stage.
+      if [ -f build.env ] && ! grep -q "^SBOM_FILE=" build.env; then
+        echo "SBOM_FILE=${SBOM_FILE}" >> build.env
+      fi
+      echo "  (ship via scripts/sbom-post.sh ${SBOM_FILE} in a separate stage)"
+    else
+      echo "  WARN: syft failed — no SBOM produced" >&2
+    fi
+    unset _sbom_basename _scan_target
+  fi
 fi
