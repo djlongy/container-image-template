@@ -54,6 +54,11 @@ push_to_backend() {
   _artifactory_require_env   || return 1
   _artifactory_require_tools || return 1
 
+  # Normalise boolean env vars to lowercase so TRUE/True/true all
+  # match consistently. Same pattern as build.sh for REMEDIATE / SBOM_*.
+  ARTIFACTORY_PRO="$(printf '%s' "${ARTIFACTORY_PRO:-false}" | tr '[:upper:]' '[:lower:]')"
+  ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS="$(printf '%s' "${ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS:-false}" | tr '[:upper:]' '[:lower:]')"
+
   # ── Decompose the locally-built image reference ──
   local image_repo_tag="${built_local_ref##*/}"
   local _img_name="${image_repo_tag%:*}"
@@ -159,18 +164,52 @@ push_to_backend() {
     jf rt build-publish "${build_name}" "${build_number}" ${project_flag} 2>&1 | tail -5
 
     # Xray build scan — triggers CVE analysis on the published build.
-    # Non-fatal: exit 3 = watch policy violation (scan succeeded), exit 1 =
-    # Xray unreachable / unlicensed / build not yet indexed. Neither aborts
-    # the push; the image is already uploaded and properties are set.
+    # Exit codes from jf build-scan:
+    #   0  clean
+    #   3  watch policy violation (scan succeeded, findings tripped --fail)
+    #   *  Xray unreachable / unlicensed / build not yet indexed
+    #
+    # Violation-handling policy is driven by ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS:
+    #   unset | "false" | "warn"   → warn and proceed (default — matches
+    #                                the rest of the push steps where the
+    #                                image is already uploaded)
+    #   "true"  | "strict"         → return non-zero so CI marks the job
+    #                                failed and downstream promote jobs
+    #                                don't advance. Image is still pushed;
+    #                                this gates promotion, not publish.
+    # Non-3 exits (licensing / unreachable / indexing) always stay warnings —
+    # those aren't policy decisions, just scanner availability blips.
     echo ""
     echo "── Pro: Xray build scan ──"
+    local xray_fail_mode="${ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS:-false}"
     # shellcheck disable=SC2086
     jf build-scan "${build_name}" "${build_number}" ${project_flag} 2>&1
     local xray_rc=$?
     case "${xray_rc}" in
-      0) ;;
-      3) echo "  WARN: Xray reported policy violations (exit 3 = --fail default)" >&2 ;;
-      *) echo "  WARN: Xray scan exit ${xray_rc} (unlicensed, unreachable, or still indexing)" >&2 ;;
+      0)
+        echo "  ✓ Xray clean (no policy violations)"
+        ;;
+      3)
+        case "${xray_fail_mode}" in
+          true|strict)
+            echo "" >&2
+            echo "  ERROR: Xray policy violations detected — failing build" >&2
+            echo "         (ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS=${xray_fail_mode})" >&2
+            echo "         The image has been pushed, but this run is being" >&2
+            echo "         rejected so downstream promote/deploy stages don't" >&2
+            echo "         advance. Review findings in Artifactory →" >&2
+            echo "         Builds → ${build_name}/${build_number} → Xray Data." >&2
+            return 1
+            ;;
+          *)
+            echo "  WARN: Xray reported policy violations — continuing (warn mode)" >&2
+            echo "        Set ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS=true to hard-fail the build." >&2
+            ;;
+        esac
+        ;;
+      *)
+        echo "  WARN: Xray scan exit ${xray_rc} (unlicensed, unreachable, or still indexing)" >&2
+        ;;
     esac
 
     # Resolve digest from the pushed image
@@ -183,6 +222,11 @@ push_to_backend() {
     local image_ref_bare="${target%:*}"
     local digest_ref=""
     [ -n "${push_digest}" ] && digest_ref="${image_ref_bare}@${push_digest}"
+
+    # Export IMAGE_DIGEST/IMAGE_REF so the parent build.sh can consume
+    # them (SBOM generation scans by digest when available).
+    export IMAGE_REF="${target}"
+    export IMAGE_DIGEST="${digest_ref}"
 
     cat > build.env <<EOF
 IMAGE_REF=${target}
@@ -227,6 +271,11 @@ EOF
     local image_ref_bare="${target%:*}"
     local digest_ref=""
     [ -n "${push_digest}" ] && digest_ref="${image_ref_bare}@${push_digest}"
+
+    # Export IMAGE_DIGEST/IMAGE_REF so the parent build.sh can consume
+    # them (SBOM generation scans by digest when available).
+    export IMAGE_REF="${target}"
+    export IMAGE_DIGEST="${digest_ref}"
 
     cat > build.env <<EOF
 IMAGE_REF=${target}
