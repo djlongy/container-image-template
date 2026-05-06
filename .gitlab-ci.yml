@@ -145,7 +145,27 @@ variables:
   GRYPE_INSTALLER_URL: "https://raw.githubusercontent.com/anchore/grype/main/install.sh"
   GRYPE_VERSION: "v0.82.0"
   COSIGN_URL: "https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64"
-  JF_INSTALLER_URL: "https://install-cli.jfrog.io"
+  # JFrog CLI install — sudoless. Set ONE of the three URLs below to
+  # point at a file in your local Artifactory. The public installer
+  # path was removed because it required sudo to land in /usr/local/bin.
+  # All three install into ${JF_INSTALL_DIR:-$HOME/.local/bin}.
+  JF_BINARY_URL: ""   # direct binary, preferred
+  JF_DEB_URL: ""      # .deb extracted with dpkg-deb -x (or ar/tar fallback)
+  JF_RPM_URL: ""      # .rpm extracted with rpm2cpio | cpio
+  JF_INSTALL_DIR: ""  # default: ${HOME}/.local/bin
+
+  # ── Splunk HEC for Xray scan audit (xray-scan-post.sh) ──────────
+  # Both URL + TOKEN must be set for the xray-audit job to ship JSON.
+  # Keep SPLUNK_HEC_TOKEN as a masked group variable, never inline it.
+  SPLUNK_HEC_URL: ""
+  SPLUNK_HEC_INDEX: "main"
+  SPLUNK_HEC_SOURCETYPE: "jfrog:xray:scan"
+  SPLUNK_HEC_INSECURE: "false"
+
+  # Verbose "why did this happen?" logging from build.sh. Set to
+  # "true" via CI variable to debug image.env propagation, default
+  # decisions, or tool install paths. Keep "false" in normal runs.
+  BUILD_DEBUG: "false"
   # Grype vulnerability DB air-gap support:
   # When ARTIFACTORY_GRYPE_DB_REPO is set, the grype-db-sync job mirrors
   # the Anchore DB to that repo before the grype scan runs, and the scan
@@ -179,9 +199,13 @@ variables:
     fi
   - apk add --no-cache bash git curl openssl jq
   - |
-    # crane — used by build.sh for base digest + by promote for crane copy
+    # crane — used by build.sh for base digest + by promote for crane copy.
+    # Install into $HOME/.local/bin (sudoless). PATH is exported here so
+    # subsequent script: lines see it.
+    mkdir -p "${HOME}/.local/bin"
+    export PATH="${HOME}/.local/bin:${PATH}"
     if ! command -v crane >/dev/null 2>&1; then
-      curl -sL "${CRANE_URL}" | tar xz -C /usr/local/bin/ crane
+      curl -sL "${CRANE_URL}" | tar xz -C "${HOME}/.local/bin/" crane
     fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -202,14 +226,14 @@ build:
         echo "${PUSH_REGISTRY_PASSWORD}" | docker login "${PUSH_REGISTRY}" \
           -u "${PUSH_REGISTRY_USER}" --password-stdin
       fi
-    # Artifactory backend: install jf CLI and log into the Artifactory
+    # Artifactory backend: install jf via the shared helper (no sudo,
+    # honours JF_BINARY_URL for air-gap) and log into the Artifactory
     # push host. build.sh's backend dispatch takes care of the rest.
     - |
       if [ "${REGISTRY_KIND:-}" = "artifactory" ]; then
-        if ! command -v jf >/dev/null 2>&1; then
-          curl -fL "${JF_INSTALLER_URL}" | sh
-          mv jf /usr/local/bin/ 2>/dev/null || true
-        fi
+        # shellcheck source=scripts/lib/install-jf.sh
+        . ./scripts/lib/install-jf.sh
+        install_jf
         jf --version
         ART_HOST="${ARTIFACTORY_PUSH_HOST:-}"
         if [ -z "${ART_HOST}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
@@ -244,8 +268,10 @@ sbom:
   before_script:
     - *install-tools
     - |
+      mkdir -p "${HOME}/.local/bin"
+      export PATH="${HOME}/.local/bin:${PATH}"
       if ! command -v syft >/dev/null 2>&1; then
-        curl -sSfL "${SYFT_INSTALLER_URL}" | sh -s -- -b /usr/local/bin "${SYFT_VERSION}"
+        curl -sSfL "${SYFT_INSTALLER_URL}" | sh -s -- -b "${HOME}/.local/bin" "${SYFT_VERSION}"
       fi
       syft version
   script:
@@ -343,8 +369,10 @@ grype:
   before_script:
     - *install-tools
     - |
+      mkdir -p "${HOME}/.local/bin"
+      export PATH="${HOME}/.local/bin:${PATH}"
       if ! command -v grype >/dev/null 2>&1; then
-        curl -sSfL "${GRYPE_INSTALLER_URL}" | sh -s -- -b /usr/local/bin "${GRYPE_VERSION}"
+        curl -sSfL "${GRYPE_INSTALLER_URL}" | sh -s -- -b "${HOME}/.local/bin" "${GRYPE_VERSION}"
       fi
       grype version
     # When a mirror repo is configured, point Grype at it. Credentials
@@ -395,6 +423,35 @@ grype:
       - grype-report.json
     expire_in: 1 month
   rules: *build-rules
+
+# ═══════════════════════════════════════════════════════════════════
+# SCAN — Xray audit → Splunk
+# ═══════════════════════════════════════════════════════════════════
+# Runs `jf docker scan --format=simple-json` against the upstream
+# image and ships the JSON to Splunk HEC for SecOps audit trail. The
+# script is a no-op when SPLUNK_HEC_URL or SPLUNK_HEC_TOKEN is unset,
+# so this stage stays green before Splunk is wired up — set both as
+# group-level CI variables to enable.
+xray-audit:
+  stage: scan
+  image: ${DOCKER_CLI_IMAGE}
+  needs:
+    - job: build
+      artifacts: true
+  before_script:
+    - *install-tools
+  script:
+    - bash ./scripts/xray-scan-post.sh
+  artifacts:
+    paths:
+      - xray-scan.json
+    expire_in: 1 month
+    when: always
+  rules: *build-rules
+  # Audit shipping is non-blocking: a Splunk outage shouldn't fail
+  # the pipeline. The script itself warns + exits 0 on POST failure;
+  # this is belt-and-suspenders for any other unexpected error.
+  allow_failure: true
 
 # ═══════════════════════════════════════════════════════════════════
 # SCAN — Trivy (DISABLED: banned for business use)
@@ -452,9 +509,11 @@ cosign-sign:
   before_script:
     - *install-tools
     - |
+      mkdir -p "${HOME}/.local/bin"
+      export PATH="${HOME}/.local/bin:${PATH}"
       if ! command -v cosign >/dev/null 2>&1; then
-        curl -sL "${COSIGN_URL}" -o /usr/local/bin/cosign
-        chmod +x /usr/local/bin/cosign
+        curl -sL "${COSIGN_URL}" -o "${HOME}/.local/bin/cosign"
+        chmod +x "${HOME}/.local/bin/cosign"
       fi
       cosign version
   script:
