@@ -2,77 +2,54 @@
 #
 # Single-image build and DevSecOps pipeline. Everything inline —
 # no includes, no template indirection. Designed so a newcomer can
-# read this one file and see the entire promotion flow.
+# read this one file and see the entire flow.
 #
-# Pipeline shape:
-#   build → sbom → grype → cosign-sign → sbom-ingest → promote (manual)
+# Pipeline shape (5 stages, sign commented out, promote dropped):
 #
-#   (trivy stages are present but commented out — uncomment when
-#    Trivy is unbanned for business use. Grype covers the SBOM-first
-#    vulnerability scanning in the meantime.)
+#   prescan      → xray-vuln-prescan, xray-sbom-prescan
+#                  (scan UPSTREAM_REF, fail-fast on policy violation
+#                   if XRAY_FAIL_ON_SEVERITY is set + allow_failure
+#                   flipped to false on xray-vuln-prescan)
+#   build        → docker build + push to PUSH_REGISTRY
+#   postscan     → xray-vuln-postscan, xray-sbom-postscan
+#                  (scan the BUILT image — IMAGE_DIGEST from build.env)
+#                  + sbom (Syft when approved), grype, grype-db-sync
+#   sign         → cosign-sign (DORMANT — commented out)
+#   ingest       → sbom-ingest (sbom-post.sh ships Syft SBOM)
 #
-# Variable precedence (CI sources of truth):
-#   - Group-level CI/CD variables: hostnames, registry creds, vault roles
-#   - Project-level CI/CD variables: team acronyms, project-specific overrides
-#   - Pipeline runtime variables: manual overrides
-#   - image.env.example at the repo root: upstream pin, image name,
-#     behavior flags. Renovate's `# renovate:` hint next to
-#     UPSTREAM_TAG is what bumps the upstream version pin via PRs.
-#     The upstream tag IS the image version — no separate semver.
+#   (trivy block is present but commented out — uncomment when Trivy
+#    is unbanned for business use. Xray covers vuln scan + SBOM in
+#    the meantime; Grype reads the Syft SBOM when Syft is approved.)
 #
-# Required CI variables (typically set at group level):
-#   PUSH_REGISTRY             — destination registry host
-#   PUSH_PROJECT              — destination project / path
-#   PUSH_REGISTRY_USER        — push user
-#   PUSH_REGISTRY_PASSWORD    — push password (masked)
+# Variable precedence (canonical sources):
+#   1. image.env (committed)  — non-secret per-fork canonical config
+#   2. shell / CI env         — overrides image.env values for this run
+#   3. CI variables           — for SECRETS only (passwords, tokens)
 #
-# Optional CI variables:
-#   CA_CERT                   — PEM content of corp CA, injects into image
-#                               (auto-flips INJECT_CERTS=true in build.sh)
-#   VENDOR                    — company name for OCI vendor label
-#   PLATFORM                  — default linux/amd64
-#   COSIGN_KEY                — cosign private key (file: reference, e.g. vault:...)
-#                               DORMANT — sign job is commented out until cosign
-#                               infra (Vault transit / KMS) is in place.
+# Only these need to live as masked GitLab CI variables (everything
+# else is in image.env, see README "Required CI variables — only
+# secrets" for the rationale):
 #
-#   # ── Push backend switch ─────────────────────────────────────
-#   REGISTRY_KIND             — unset (default) = plain docker push
-#                               to PUSH_REGISTRY (Harbor baseline).
-#                               "artifactory" = delegate to the
-#                               scripts/push-backends/artifactory.sh
-#                               backend for layout-template resolution
-#                               and jf rt metadata.
-#   ARTIFACTORY_URL           — https://artifactory.example.com (REST)
-#   ARTIFACTORY_USER          — team/service user with Deploy
-#   ARTIFACTORY_TOKEN         — access token (preferred), OR
-#   ARTIFACTORY_PASSWORD      — basic-auth password
-#   ARTIFACTORY_TEAM          — team acronym (referenced by layout templates)
-#   ARTIFACTORY_ENVIRONMENT   — dev|prod; drives ARTIFACTORY_REPO_SUFFIX
-#   ARTIFACTORY_PUSH_HOST     — docker push hostname (subdomain layouts)
-#   ARTIFACTORY_IMAGE_REF     — docker push URL template
-#   ARTIFACTORY_MANIFEST_PATH — REST storage path template for set-props
-#   ARTIFACTORY_BUILD_NAME    — defaults to <image>-build
-#   ARTIFACTORY_BUILD_NUMBER  — defaults to CI_JOB_ID / CI_PIPELINE_ID
-#   ARTIFACTORY_PROPERTIES    — extra ;-separated props
+#   PUSH_REGISTRY_PASSWORD       — push secret for default backend
+#   ARTIFACTORY_PASSWORD/TOKEN   — when REGISTRY_KIND=artifactory
+#   XRAY_ARTIFACTORY_TOKEN       — when scan-side Artifactory differs
+#   SPLUNK_HEC_TOKEN             — when shipping to Splunk
+#   DEPENDENCY_TRACK_API_KEY     — when shipping to Dependency-Track
+#   SBOM_WEBHOOK_AUTH_HEADER     — when generic webhook needs auth
+#   COSIGN_KEY                   — when restoring the cosign-sign job
 #
-#   # ── SBOM ingestion (scripts/sbom-post.sh picks whichever are set) ─
-#   SBOM_WEBHOOK_URL          — generic SBOM ingestion endpoint
-#   SBOM_WEBHOOK_AUTH_HEADER  — optional auth header for the webhook
-#   DEPENDENCY_TRACK_URL      — OWASP Dependency-Track base URL
-#   DEPENDENCY_TRACK_API_KEY  — DT BOM-upload API key
-#   DEPENDENCY_TRACK_PROJECT  — DT project name
-#   ARTIFACTORY_SBOM_REPO     — JFrog Xray generic repo for SBOM
-#                               import (reuses ARTIFACTORY_URL /
-#                               ARTIFACTORY_USER / ARTIFACTORY_TOKEN
-#                               from the artifactory push backend).
+# Plus 3 CI-runtime images that YAML reads at pipeline-load time
+# (these can't come from image.env): ALPINE_IMAGE, DOCKER_CLI_IMAGE,
+# DOCKER_DIND_IMAGE. Their defaults work in a public-internet runner.
 #
-#   Production promotion is INTENTIONALLY not in this pipeline —
-#   manual ritual via Artifactory's native copy UI. See README
-#   "Promoting to production" for the crane CLI invocation.
+# Production promotion is INTENTIONALLY not in this pipeline — manual
+# ritual via Artifactory's native copy UI. See README "Promoting to
+# production" for the crane CLI invocation.
 
 stages:
+  - prescan      # Xray scan + SBOM of UPSTREAM_REF. Fails build on policy violation
   - build
-  - scan
+  - postscan     # Xray scan + SBOM of the BUILT image (IMAGE_DIGEST), Syft SBOM, Grype
   - sign         # COMMENTED OUT — no cosign infra yet, restore when KMS/Vault transit lands
   - ingest
   # promote     # REMOVED — production promotion is a human ritual via Artifactory's
@@ -252,7 +229,7 @@ build:
 # This is the single source of truth for the rest of the pipeline:
 # Grype consumes it, cosign attests it, sbom-post.sh ships it.
 sbom:
-  stage: scan
+  stage: postscan
   image: ${ALPINE_IMAGE}
   needs:
     - job: build
@@ -326,7 +303,7 @@ sbom:
 # Only runs when ARTIFACTORY_GRYPE_DB_REPO is set — skipped otherwise,
 # in which case grype downloads directly from Anchore's public CDN.
 grype-db-sync:
-  stage: scan
+  stage: postscan
   image: ${ALPINE_IMAGE}
   needs: []
   rules:
@@ -349,7 +326,7 @@ grype-db-sync:
 # job populates the mirror and this job fetches the DB from there
 # instead of from grype.anchore.io.
 grype:
-  stage: scan
+  stage: postscan
   image: ${ALPINE_IMAGE}
   needs:
     - job: build
@@ -417,23 +394,82 @@ grype:
   rules: *build-rules
 
 # ═══════════════════════════════════════════════════════════════════
-# SCAN — Xray vuln scan → Splunk (one of two paired Xray jobs)
+# PRESCAN — Xray on UPSTREAM_REF, gated, BEFORE build runs
 # ═══════════════════════════════════════════════════════════════════
-# Runs `jf docker scan --format=simple-json` against the upstream
-# image, produces xray-scan.json, ships JSON to Splunk HEC. The
-# script is a no-op when scan-side Artifactory creds are unset.
-# Pairs with xray-sbom (CycloneDX SBOM) — they run in parallel.
-xray-vuln:
-  stage: scan
+# Two paired jobs that scan the upstream image we're about to rebuild.
+# They run in the prescan stage so a critical CVE in the upstream
+# fails the pipeline BEFORE the build job wastes runner time. Set
+# XRAY_FAIL_ON_SEVERITY in image.env (or as a pipeline-trigger var)
+# to enforce a real gate; leave unset for audit-only mode.
+#
+# Both jobs pass UPSTREAM_REF explicitly via XRAY_SCAN_REF (positional
+# arg would also work) so the script's resolution chain doesn't fall
+# back to IMAGE_DIGEST (which doesn't exist yet — build hasn't run).
+.xray-anchor: &xray-anchor
   image: ${DOCKER_CLI_IMAGE}
   services:
     - name: ${DOCKER_DIND_IMAGE}
       alias: docker
+  before_script:
+    - *install-tools
+  rules: *build-rules
+  # JFrog Cloud trial / shared-instance Xray hates concurrent scans
+  # (we hung at 10+ minutes when two ran in parallel against the
+  # trial). resource_group serialises ALL xray jobs across ALL
+  # pipelines on this project. Drop it when you've moved to a Pro /
+  # self-hosted Xray with real concurrency.
+  resource_group: xray-scan
+  # POLICY-GATE NOTE: when XRAY_FAIL_ON_SEVERITY is set in image.env
+  # the script exits 2 on violation. To make THAT a real gate (not a
+  # warning), set allow_failure: false on xray-vuln-prescan only —
+  # then a critical CVE in the upstream blocks build. Postscan jobs
+  # stay allow_failure: true (audit shipping is non-blocking).
+  allow_failure: true
+
+xray-vuln-prescan:
+  <<: *xray-anchor
+  stage: prescan
+  needs: []      # no need for build artifacts — scans UPSTREAM_REF
+  script:
+    - |
+      # Use the assembled UPSTREAM_REF derived from image.env's
+      # UPSTREAM_REGISTRY/IMAGE/TAG. Bypasses the script's IMAGE_DIGEST
+      # default (which would be empty here anyway since build hasn't run).
+      export XRAY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+      bash ./scripts/scan/xray-vuln.sh
+  artifacts:
+    paths:
+      - xray-scan.json
+    expire_in: 1 month
+    when: always
+
+xray-sbom-prescan:
+  <<: *xray-anchor
+  stage: prescan
+  needs: []
+  script:
+    - |
+      export XRAY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+      bash ./scripts/scan/xray-sbom.sh
+  artifacts:
+    paths:
+      - xray-sbom.cdx.json
+    expire_in: 1 month
+    when: always
+
+# ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Xray on the BUILT image (IMAGE_DIGEST), audit ingestion
+# ═══════════════════════════════════════════════════════════════════
+# Runs AFTER build. Scans what consumers will actually pull, including
+# remediation / cert injection / scripts/extend/ customisations. The
+# scripts default to scanning IMAGE_DIGEST (from build.env via dotenv
+# artifact import), so no XRAY_SCAN_REF override needed.
+xray-vuln-postscan:
+  <<: *xray-anchor
+  stage: postscan
   needs:
     - job: build
       artifacts: true
-  before_script:
-    - *install-tools
   script:
     - bash ./scripts/scan/xray-vuln.sh
   artifacts:
@@ -441,39 +477,13 @@ xray-vuln:
       - xray-scan.json
     expire_in: 1 month
     when: always
-  rules: *build-rules
-  # JFrog Cloud trial / shared-instance Xray hates concurrent scans
-  # (we hung at 10+ minutes when both jobs ran in parallel against
-  # <yourorg>.jfrog.io). resource_group serialises Xray jobs across
-  # ALL pipelines on this project, so xray-vuln and xray-sbom can't
-  # both be running at once. Drop the resource_group when you've
-  # moved to a Pro/Self-hosted Xray with proper concurrency.
-  resource_group: xray-scan
-  # Audit shipping is non-blocking — Splunk outage / Xray-side outage
-  # shouldn't fail the pipeline. Script warns + exits 0; this flag is
-  # belt-and-suspenders for any other unexpected error.
-  allow_failure: true
 
-# ═══════════════════════════════════════════════════════════════════
-# SCAN — Xray CycloneDX SBOM → sbom-post sinks (Splunk, DT, etc.)
-# ═══════════════════════════════════════════════════════════════════
-# Runs `jf docker scan --format=cyclonedx --sbom` against the upstream
-# image, produces xray-sbom.cdx.json, hands off to sbom-post.sh which
-# ships to every configured sink (Splunk, Dependency-Track, Artifactory,
-# webhook). Default ON because Xray is the only approved SBOM source
-# while Trivy is banned and Syft awaits security review. Disable via
-# XRAY_GENERATE_SBOM=false in image.env when Syft is producing the BOM.
-xray-sbom:
-  stage: scan
-  image: ${DOCKER_CLI_IMAGE}
-  services:
-    - name: ${DOCKER_DIND_IMAGE}
-      alias: docker
+xray-sbom-postscan:
+  <<: *xray-anchor
+  stage: postscan
   needs:
     - job: build
       artifacts: true
-  before_script:
-    - *install-tools
   script:
     - bash ./scripts/scan/xray-sbom.sh
   artifacts:
@@ -481,8 +491,6 @@ xray-sbom:
       - xray-sbom.cdx.json
     expire_in: 1 month
     when: always
-  rules: *build-rules
-  allow_failure: true
 
 # ═══════════════════════════════════════════════════════════════════
 # SCAN — Trivy (DISABLED: banned for business use)

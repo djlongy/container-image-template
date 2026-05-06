@@ -343,6 +343,40 @@ _run env -i HOME="$HOME" PATH="$PATH" XRAY_GENERATE_SBOM=false ./scripts/scan/xr
 _must_contain "XRAY_GENERATE_SBOM=false — skipping"
 end_scenario
 
+scenario "xray-vuln-target-resolution-image-digest-wins"
+# When IMAGE_DIGEST is set (post-build), it should be the scan target
+# (NOT UPSTREAM_REF, even though image.env defines that too).
+_run env -i HOME="$HOME" PATH="$PATH" \
+  IMAGE_DIGEST="harbor.example.com/team/img@sha256:abc" \
+  ./scripts/scan/xray-vuln.sh 2>/dev/null || true
+_must_contain "→ Scan target: harbor.example.com/team/img@sha256:abc"
+_must_not_contain "→ Scan target: docker.io/library/nginx:1.25.3-alpine"
+end_scenario
+
+scenario "xray-vuln-target-resolution-positional-arg-wins"
+# Positional arg beats every env / image.env value.
+_run env -i HOME="$HOME" PATH="$PATH" \
+  IMAGE_DIGEST="should-be-ignored@sha256:def" \
+  ./scripts/scan/xray-vuln.sh "explicit:override" 2>/dev/null || true
+_must_contain "→ Scan target: explicit:override"
+end_scenario
+
+scenario "xray-vuln-target-resolution-xray-scan-ref-wins-over-upstream"
+# XRAY_SCAN_REF beats UPSTREAM_REF (prescan use case).
+_run env -i HOME="$HOME" PATH="$PATH" \
+  XRAY_SCAN_REF="prescan:target" \
+  ./scripts/scan/xray-vuln.sh 2>/dev/null || true
+_must_contain "→ Scan target: prescan:target"
+end_scenario
+
+scenario "xray-vuln-target-resolution-fallback-to-upstream"
+# When neither IMAGE_DIGEST nor XRAY_SCAN_REF nor positional arg are
+# set, fall back to UPSTREAM_REF (or assembled UPSTREAM_*). Confirms
+# the prescan-without-build case still works.
+_run env -i HOME="$HOME" PATH="$PATH" ./scripts/scan/xray-vuln.sh 2>/dev/null || true
+_must_contain "→ Scan target: docker.io/library/nginx:1.25.3-alpine"
+end_scenario
+
 scenario "sbom-post-no-sinks-and-no-file"
 out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/sbom-post.sh /nonexistent.cdx.json 2>&1) ; rc=$?
 echo "${out}" > "${TMP_DIR}/out"

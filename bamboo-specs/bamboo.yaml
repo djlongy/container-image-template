@@ -101,15 +101,19 @@ triggers:
   - polling: 60
 
 stages:
+  - Prescan:
+      jobs:
+        - Xray Vuln Prescan
+        - Xray SBOM Prescan
   - Build:
       jobs:
         - Build
-  - Scan:
+  - Postscan:
       jobs:
         - SBOM
         - Grype
-        - Xray Vuln
-        - Xray SBOM
+        - Xray Vuln Postscan
+        - Xray SBOM Postscan
         # - Trivy   # Disabled: banned for business use.
   # - Sign:           # COMMENTED OUT — no cosign infra at work yet.
   #     jobs:        # Restore by uncommenting both this stage and the
@@ -298,7 +302,73 @@ Grype:
 # every bamboo_* env var → bare name. The shim block in each task
 # only re-exports vars whose Bamboo global-var name DIFFERS from what
 # the script expects (svc_* prefixed service-account creds).
-Xray Vuln:
+# ── PRESCAN: scan UPSTREAM_REF before build runs ─────────────────
+# Scan target = UPSTREAM_REGISTRY/UPSTREAM_IMAGE:UPSTREAM_TAG (passed
+# explicitly via XRAY_SCAN_REF so the script's resolution chain
+# doesn't fall back to IMAGE_DIGEST — build hasn't run yet).
+#
+# Set XRAY_FAIL_ON_SEVERITY in your bamboo.yaml plan vars (or in
+# image.env) to enforce a real gate. Otherwise this is audit-only.
+Xray Vuln Prescan:
+  tasks:
+    - script:
+        interpreter: BASH
+        scripts:
+          - |-
+            set -euo pipefail
+
+            # Renamed shared globals → script-expected names.
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
+
+            # Scan the upstream we're about to inherit from. The
+            # script picks up UPSTREAM_REGISTRY/IMAGE/TAG from image.env
+            # via load_image_env, so we just point XRAY_SCAN_REF at
+            # the assembled ref.
+            . ./image.env
+            export XRAY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+
+            bash ./scripts/scan/xray-vuln.sh
+  artifacts:
+    - name: xray-scan-prescan
+      location: .
+      pattern: xray-scan.json
+      shared: true
+      required: false
+  requirements:
+    - system.docker.executable
+
+Xray SBOM Prescan:
+  tasks:
+    - script:
+        interpreter: BASH
+        scripts:
+          - |-
+            set -euo pipefail
+
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
+
+            . ./image.env
+            export XRAY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+
+            bash ./scripts/scan/xray-sbom.sh
+  artifacts:
+    - name: xray-sbom-prescan
+      location: .
+      pattern: xray-sbom.cdx.json
+      shared: true
+      required: false
+  requirements:
+    - system.docker.executable
+
+# ── POSTSCAN: scan the BUILT image (IMAGE_DIGEST from build.env) ──
+# Default scan target is the rebuilt image — that's what consumers
+# pull and what should be audited. Includes any remediation, cert
+# injection, or scripts/extend/ customisations applied during build.
+Xray Vuln Postscan:
   tasks:
     - artifact-download:
         artifacts:
@@ -312,16 +382,15 @@ Xray Vuln:
             . ./build.env
             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
 
-            # Renamed shared globals → script-expected names. Everything
-            # else (URLs, install paths) flows through the auto-importer
-            # inside the script itself.
             export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
             export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
             export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
 
+            # IMAGE_DIGEST is in env from `. ./build.env` above —
+            # script auto-resolves to it.
             bash ./scripts/scan/xray-vuln.sh
   artifacts:
-    - name: xray-scan
+    - name: xray-scan-postscan
       location: .
       pattern: xray-scan.json
       shared: true
@@ -329,7 +398,7 @@ Xray Vuln:
   requirements:
     - system.docker.executable
 
-Xray SBOM:
+Xray SBOM Postscan:
   tasks:
     - artifact-download:
         artifacts:
@@ -349,7 +418,7 @@ Xray SBOM:
 
             bash ./scripts/scan/xray-sbom.sh
   artifacts:
-    - name: xray-sbom
+    - name: xray-sbom-postscan
       location: .
       pattern: xray-sbom.cdx.json
       shared: true

@@ -10,8 +10,28 @@
 # the shared loader and self-install jf via scripts/lib/install-jf.sh.
 #
 # Usage:
-#   bash scripts/scan/xray-vuln.sh                 # scan UPSTREAM_REF
+#   bash scripts/scan/xray-vuln.sh                 # scan the BUILT image
+#                                                  # (IMAGE_DIGEST from
+#                                                  #  build.env, fallback
+#                                                  #  chain below)
 #   bash scripts/scan/xray-vuln.sh <image-ref>     # scan arbitrary ref
+#                                                  # (e.g. for prescan:
+#                                                  #  pass UPSTREAM_REF)
+#
+# Scan target resolution (highest precedence first):
+#   1. positional arg $1
+#   2. XRAY_SCAN_REF env var (explicit override)
+#   3. IMAGE_DIGEST   (from build.env — the rebuilt image's digest)
+#   4. IMAGE_REF      (from build.env — the rebuilt image's tag)
+#   5. UPSTREAM_REF   (from image.env — the upstream we rebuilt from)
+#   6. UPSTREAM_REGISTRY/UPSTREAM_IMAGE:UPSTREAM_TAG (assembled if all set)
+#
+# Default targets the BUILT image because that's what consumers actually
+# pull — scanning only the upstream would leave a gap (remediation,
+# cert injection, scripts/extend/ customisations all change the image
+# contents). Use the positional arg or XRAY_SCAN_REF=upstream pattern
+# in a separate prescan job if you want to fail-fast on a bad upstream
+# BEFORE the build runs.
 #
 # Required env (Phase 1 preconditions — no-op when unset):
 #   ARTIFACTORY_URL + ARTIFACTORY_USER + ARTIFACTORY_TOKEN/PASSWORD
@@ -23,11 +43,22 @@
 #   SPLUNK_HEC_SOURCETYPE              default: jfrog:xray:scan
 #
 # Optional env (scan side):
-#   UPSTREAM_REF                       full <reg>/<image>:<tag> when no
-#                                      positional arg given
+#   XRAY_SCAN_REF                      override the resolved target
 #   XRAY_SCAN_FILE                     output path (default xray-scan.json)
 #   XRAY_SCAN_FORMAT                   simple-json (default) | json
 #   ARTIFACTORY_PROJECT                pass-through to --project=
+#
+# Optional env (policy gate — exits non-zero on threshold breach):
+#   XRAY_FAIL_ON_SEVERITY              comma-separated list of severities
+#                                      that should fail the script.
+#                                      Examples:
+#                                        critical              (only criticals)
+#                                        critical,high         (either)
+#                                        critical,high,medium  (anything serious)
+#                                      Empty/unset = report-only mode (current
+#                                      default). Severities are matched
+#                                      case-insensitive against the simple-json
+#                                      vulnerabilities[].severity field.
 #
 # Exit codes:
 #   0  success (including graceful no-op when creds missing)
@@ -46,19 +77,29 @@ import_bamboo_vars
 load_image_env
 
 # ── Resolve scan target ─────────────────────────────────────────────
-SCAN_REF="${1:-}"
+# Default to the BUILT image (IMAGE_DIGEST from build.env, populated
+# by the build job's dotenv artifact). Falls back through tag → upstream
+# → constructed-upstream so the script also works for prescan use cases
+# where build hasn't run yet.
+SCAN_REF="${1:-${XRAY_SCAN_REF:-}}"
 if [ -z "${SCAN_REF}" ]; then
-  if [ -n "${UPSTREAM_REF:-}" ]; then
-    SCAN_REF="${UPSTREAM_REF}"
+  if   [ -n "${IMAGE_DIGEST:-}" ];                                          then SCAN_REF="${IMAGE_DIGEST}"
+  elif [ -n "${IMAGE_REF:-}" ];                                             then SCAN_REF="${IMAGE_REF}"
+  elif [ -n "${UPSTREAM_REF:-}" ];                                          then SCAN_REF="${UPSTREAM_REF}"
   elif [ -n "${UPSTREAM_REGISTRY:-}" ] && [ -n "${UPSTREAM_IMAGE:-}" ] && [ -n "${UPSTREAM_TAG:-}" ]; then
     SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
   fi
 fi
 if [ -z "${SCAN_REF}" ]; then
-  echo "ERROR: no scan target — pass an image ref as \$1, or set UPSTREAM_REF" >&2
-  echo "       (or UPSTREAM_REGISTRY + UPSTREAM_IMAGE + UPSTREAM_TAG in image.env)" >&2
+  echo "ERROR: no scan target available." >&2
+  echo "  Resolution chain: \$1 > XRAY_SCAN_REF > IMAGE_DIGEST > IMAGE_REF > UPSTREAM_REF > UPSTREAM_REGISTRY/IMAGE:TAG" >&2
+  echo "  All empty. To scan after build, ensure build.env (with IMAGE_DIGEST) is" >&2
+  echo "  available. To scan upstream as a prescan, set UPSTREAM_REF in image.env" >&2
+  echo "  or pass a ref explicitly: bash scripts/scan/xray-vuln.sh <image-ref>" >&2
   exit 1
 fi
+echo "→ Scan target: ${SCAN_REF}"
+_dbg "(resolution: \$1=${1:-} XRAY_SCAN_REF=${XRAY_SCAN_REF:-} IMAGE_DIGEST=${IMAGE_DIGEST:-} IMAGE_REF=${IMAGE_REF:-} UPSTREAM_REF=${UPSTREAM_REF:-})"
 
 # ── Phase 1 preconditions: resolve scan-side Artifactory creds ─────
 SCAN_ART_URL="${XRAY_ARTIFACTORY_URL:-${ARTIFACTORY_URL:-}}"
@@ -158,3 +199,34 @@ jq -nc \
 # shellcheck source=../lib/splunk-hec.sh
 . "${REPO_ROOT}/scripts/lib/splunk-hec.sh"
 splunk_hec_post "${EVENT_FILE}" "${SPLUNK_HEC_SOURCETYPE:-jfrog:xray:scan}" || true
+
+# ── Policy gate (opt-in): fail on configured severity threshold ───
+# XRAY_FAIL_ON_SEVERITY="critical"            → any critical fails the script
+# XRAY_FAIL_ON_SEVERITY="critical,high"       → either one fails
+# XRAY_FAIL_ON_SEVERITY=""                    → report-only (default)
+#
+# Useful for promoting the xray-vuln job from "audit-only" to a real
+# pre-build/post-build gate. Pair with the pipeline's `prescan` stage
+# (or `postscan` for built-image gating). Reads severity strings from
+# the simple-json `vulnerabilities[].severity` field, case-insensitive.
+if [ -n "${XRAY_FAIL_ON_SEVERITY:-}" ]; then
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "WARN: XRAY_FAIL_ON_SEVERITY set but jq not on PATH — gate skipped" >&2
+  else
+    # Lowercase the configured list for case-insensitive matching.
+    _gate=$(printf '%s' "${XRAY_FAIL_ON_SEVERITY}" | tr '[:upper:]' '[:lower:]')
+    _violations=0
+    echo "→ Policy gate: fail-on=${_gate}"
+    for sev in $(printf '%s\n' "${_gate}" | tr ',' '\n' | sed '/^$/d'); do
+      _count=$(jq --arg s "${sev}" '[.vulnerabilities[]? | select((.severity // "" | ascii_downcase) == $s)] | length' "${SCAN_FILE}")
+      printf '    %-10s %s\n' "${sev}" "${_count}"
+      _violations=$((_violations + _count))
+    done
+    if [ "${_violations}" -gt 0 ]; then
+      echo "  ✗ FAIL: ${_violations} vulnerabilit(ies) match policy gate (XRAY_FAIL_ON_SEVERITY=${XRAY_FAIL_ON_SEVERITY})" >&2
+      echo "    To override (audit-only this run): unset XRAY_FAIL_ON_SEVERITY" >&2
+      exit 2   # distinct from script-error (1) and clean-no-op (0)
+    fi
+    echo "  ✓ PASS: no matching vulnerabilities at the configured severity threshold"
+  fi
+fi

@@ -22,8 +22,22 @@
 # producing the SBOM and an Xray duplicate isn't needed.
 #
 # Usage:
-#   bash scripts/scan/xray-sbom.sh                 # scan UPSTREAM_REF
-#   bash scripts/scan/xray-sbom.sh <image-ref>     # scan arbitrary ref
+#   bash scripts/scan/xray-sbom.sh                 # SBOM of the BUILT image
+#                                                  # (IMAGE_DIGEST from
+#                                                  #  build.env, fallback
+#                                                  #  chain below)
+#   bash scripts/scan/xray-sbom.sh <image-ref>     # SBOM of arbitrary ref
+#
+# Scan target resolution (highest precedence first):
+#   1. positional arg $1
+#   2. XRAY_SCAN_REF env var (explicit override)
+#   3. IMAGE_DIGEST   (from build.env — the rebuilt image's digest)
+#   4. IMAGE_REF      (from build.env — the rebuilt image's tag)
+#   5. UPSTREAM_REF   (from image.env — the upstream we rebuilt from)
+#   6. UPSTREAM_REGISTRY/UPSTREAM_IMAGE:UPSTREAM_TAG (assembled if all set)
+#
+# Default targets the BUILT image — same reasoning as xray-vuln.sh.
+# Pair with that script as the postscan stage of your pipeline.
 #
 # Required env (Phase 1 preconditions — no-op when unset):
 #   ARTIFACTORY_URL + ARTIFACTORY_USER + ARTIFACTORY_TOKEN/PASSWORD
@@ -31,6 +45,7 @@
 #
 # Optional env:
 #   XRAY_GENERATE_SBOM    "true" (default) | "false" → no-op
+#   XRAY_SCAN_REF         override the resolved target
 #   XRAY_SBOM_FILE        output path (default xray-sbom.cdx.json)
 #   ARTIFACTORY_PROJECT   pass-through to --project=
 #
@@ -52,19 +67,23 @@ if [ "${XRAY_GENERATE_SBOM:-true}" = "false" ]; then
   exit 0
 fi
 
-# ── Resolve scan target ─────────────────────────────────────────────
-SCAN_REF="${1:-}"
+# ── Resolve scan target (mirrors xray-vuln.sh's chain) ────────────
+SCAN_REF="${1:-${XRAY_SCAN_REF:-}}"
 if [ -z "${SCAN_REF}" ]; then
-  if [ -n "${UPSTREAM_REF:-}" ]; then
-    SCAN_REF="${UPSTREAM_REF}"
+  if   [ -n "${IMAGE_DIGEST:-}" ];                                          then SCAN_REF="${IMAGE_DIGEST}"
+  elif [ -n "${IMAGE_REF:-}" ];                                             then SCAN_REF="${IMAGE_REF}"
+  elif [ -n "${UPSTREAM_REF:-}" ];                                          then SCAN_REF="${UPSTREAM_REF}"
   elif [ -n "${UPSTREAM_REGISTRY:-}" ] && [ -n "${UPSTREAM_IMAGE:-}" ] && [ -n "${UPSTREAM_TAG:-}" ]; then
     SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
   fi
 fi
 if [ -z "${SCAN_REF}" ]; then
-  echo "ERROR: no scan target — pass an image ref as \$1, or set UPSTREAM_REF" >&2
+  echo "ERROR: no scan target available." >&2
+  echo "  Resolution chain: \$1 > XRAY_SCAN_REF > IMAGE_DIGEST > IMAGE_REF > UPSTREAM_REF > UPSTREAM_REGISTRY/IMAGE:TAG" >&2
   exit 1
 fi
+echo "→ Scan target: ${SCAN_REF}"
+_dbg "(resolution: \$1=${1:-} XRAY_SCAN_REF=${XRAY_SCAN_REF:-} IMAGE_DIGEST=${IMAGE_DIGEST:-} IMAGE_REF=${IMAGE_REF:-} UPSTREAM_REF=${UPSTREAM_REF:-})"
 
 # ── Phase 1 preconditions: scan-side Artifactory creds ────────────
 SCAN_ART_URL="${XRAY_ARTIFACTORY_URL:-${ARTIFACTORY_URL:-}}"
