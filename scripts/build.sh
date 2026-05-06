@@ -596,6 +596,54 @@ CREATED=${CREATED}
 EOF
 }
 
+# ════════════════════════════════════════════════════════════════════
+# PHASE 7.5 — Docker login (image.env values, not just CI shell env)
+# ════════════════════════════════════════════════════════════════════
+# Login is done HERE in build.sh (not in the CI yaml's before_script)
+# so credentials can flow from image.env → load_image_env → push.
+# Previously the CI yaml's before_script hardcoded the login using its
+# own shell env, which meant PUSH_REGISTRY/USER/PASSWORD HAD to be CI
+# variables — image.env values for those would never reach the login
+# step. Moving the login here makes image.env the canonical source for
+# everything except the password (which still belongs in CI as a
+# masked secret).
+#
+# Two paths matched to the push backend selector:
+#   REGISTRY_KIND=artifactory → login to ARTIFACTORY_PUSH_HOST
+#   anything else            → login to PUSH_REGISTRY (Harbor baseline)
+#
+# Both no-op cleanly when the corresponding USER/PASSWORD pair is
+# empty (e.g. unauthenticated pulls / scratchpad runs).
+_build_docker_login() {
+  if [ "${WANT_PUSH}" -ne 1 ]; then
+    _dbg "WANT_PUSH=0 — skipping docker login"
+    return 0
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    _dbg "docker CLI not on PATH — skipping login (push will fail)"
+    return 0
+  fi
+
+  if [ "${REGISTRY_KIND_LC}" = "artifactory" ]; then
+    local _host="${ARTIFACTORY_PUSH_HOST:-${PUSH_REGISTRY:-}}"
+    local _user="${ARTIFACTORY_USER:-}"
+    local _secret="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
+    if [ -n "${_host}" ] && [ -n "${_user}" ] && [ -n "${_secret}" ]; then
+      echo "→ docker login ${_host} (Artifactory backend)"
+      printf '%s' "${_secret}" | docker login "${_host}" -u "${_user}" --password-stdin
+    else
+      _dbg "Artifactory creds incomplete (host=${_host} user=${_user:+set}) — skipping login"
+    fi
+  else
+    if [ -n "${PUSH_REGISTRY:-}" ] && [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ]; then
+      echo "→ docker login ${PUSH_REGISTRY} (default backend)"
+      printf '%s' "${PUSH_REGISTRY_PASSWORD}" | docker login "${PUSH_REGISTRY}" -u "${PUSH_REGISTRY_USER}" --password-stdin
+    else
+      _dbg "Default-backend creds incomplete (registry=${PUSH_REGISTRY:-} user=${PUSH_REGISTRY_USER:+set}) — skipping login"
+    fi
+  fi
+}
+
 _build_push_and_emit_env() {
   if [ "${WANT_PUSH}" -ne 1 ]; then
     _dbg "WANT_PUSH=0 (no --push flag) — skipping push + build.env emission"
@@ -713,6 +761,7 @@ if [ "${WANT_DRY_RUN}" -eq 1 ]; then
 fi
 
 _build_docker_build
+_build_docker_login
 _build_push_and_emit_env
 
 _build_generate_sbom

@@ -222,32 +222,10 @@ build:
   before_script:
     - *install-tools
   script:
-    # Log into the Harbor-style push registry (default path).
-    - |
-      if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ]; then
-        echo "${PUSH_REGISTRY_PASSWORD}" | docker login "${PUSH_REGISTRY}" \
-          -u "${PUSH_REGISTRY_USER}" --password-stdin
-      fi
-    # Artifactory backend: install jf via the shared helper (no sudo,
-    # honours JF_BINARY_URL for air-gap) and log into the Artifactory
-    # push host. build.sh's backend dispatch takes care of the rest.
-    - |
-      if [ "${REGISTRY_KIND:-}" = "artifactory" ]; then
-        # shellcheck source=scripts/lib/install-jf.sh
-        . ./scripts/lib/install-jf.sh
-        install_jf
-        jf --version
-        ART_HOST="${ARTIFACTORY_PUSH_HOST:-}"
-        if [ -z "${ART_HOST}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
-          ART_HOST="${ARTIFACTORY_URL#https://}"
-          ART_HOST="${ART_HOST#http://}"
-          ART_HOST="${ART_HOST%%/*}"
-        fi
-        if [ -n "${ART_HOST}" ] && [ -n "${ARTIFACTORY_USER:-}" ]; then
-          echo "${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}" \
-            | docker login "${ART_HOST}" -u "${ARTIFACTORY_USER}" --password-stdin
-        fi
-      fi
+    # build.sh now handles its own docker login (after sourcing
+    # image.env so creds can come from there). For the Artifactory
+    # backend, jf is installed via scripts/lib/install-jf.sh which
+    # build.sh's artifactory backend sources on demand.
     - bash ./scripts/build.sh --push
   artifacts:
     reports:

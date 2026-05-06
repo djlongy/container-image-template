@@ -166,34 +166,6 @@ Build:
             export PUSH_REGISTRY_USER="${bamboo_svc_push_registry_user:-${bamboo_PUSH_REGISTRY_USER:-}}"
             export PUSH_REGISTRY_PASSWORD="${bamboo_svc_push_registry_password:-${bamboo_PUSH_REGISTRY_PASSWORD:-}}"
 
-            # Log into the Harbor-style push target (no-op when the
-            # backend is artifactory and PUSH_REGISTRY_USER unset).
-            if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ] && [ -n "${bamboo_PUSH_REGISTRY:-}" ]; then
-              echo "${PUSH_REGISTRY_PASSWORD}" | docker login "${bamboo_PUSH_REGISTRY}" \
-                -u "${PUSH_REGISTRY_USER}" --password-stdin
-            fi
-
-            # Artifactory backend: install jf via shared helper, log
-            # docker into the Artifactory push host. build.sh handles
-            # the rest via the artifactory.sh backend.
-            if [ "${bamboo_REGISTRY_KIND:-}" = "artifactory" ]; then
-              # shellcheck source=../scripts/lib/install-jf.sh
-              . ./scripts/lib/install-jf.sh
-              install_jf
-              jf --version
-
-              ART_HOST="${bamboo_ARTIFACTORY_PUSH_HOST:-}"
-              if [ -z "${ART_HOST}" ] && [ -n "${bamboo_ARTIFACTORY_URL:-}" ]; then
-                ART_HOST="${bamboo_ARTIFACTORY_URL#https://}"
-                ART_HOST="${ART_HOST#http://}"
-                ART_HOST="${ART_HOST%%/*}"
-              fi
-              if [ -n "${ART_HOST}" ] && [ -n "${ARTIFACTORY_USER:-}" ]; then
-                echo "${ARTIFACTORY_TOKEN:-${bamboo_ARTIFACTORY_PASSWORD:-}}" \
-                  | docker login "${ART_HOST}" -u "${ARTIFACTORY_USER}" --password-stdin
-              fi
-            fi
-
             # crane is needed for base.digest resolution in build.sh.
             # Falls back to docker buildx inspect if not present, but
             # we install proactively so the digest label always lands.
@@ -204,6 +176,10 @@ Build:
               export PATH="${HOME}/.local/bin:${PATH}"
             fi
 
+            # build.sh handles its own docker login (after sourcing
+            # image.env) and its own jf install (via the artifactory
+            # push backend). Don't do those here — image.env values
+            # would not flow through to a pre-script login otherwise.
             bash ./scripts/build.sh --push
   artifacts:
     - name: build-env
