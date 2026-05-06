@@ -187,15 +187,31 @@ variables:
       curl -sL "${CRANE_URL}" | tar xz -C "${HOME}/.local/bin/" crane
     fi
   - |
-    # Source image.env so subsequent script: lines see PUSH_REGISTRY,
-    # ARTIFACTORY_*, VENDOR, etc. without each script having to source
-    # it themselves. image.env is the canonical config — CI vars are
-    # for SECRETS only. Jobs that invoke build.sh / scan/* don't need
-    # this themselves (the scripts source via the shared lib), but
-    # inline registry-auth setups in sbom / grype / sbom-ingest do.
-    if [ -f image.env ]; then
-      set -a            # auto-export every var image.env defines
-      . ./image.env
+    # Source image.env via the SHARED LOADER (lib/load-image-env.sh)
+    # so subsequent script: lines see PUSH_REGISTRY, ARTIFACTORY_*,
+    # VENDOR, etc. with the SAME precedence semantics build.sh uses:
+    #   shell / pipeline-trigger / CI vars   WIN
+    #   image.env values                     LOSE if shell already set
+    #
+    # The earlier `set -a; . ./image.env; set +a` approach was wrong —
+    # image.env unconditionally overrode shell vars, which broke
+    # CI-variable overrides + pipeline-trigger variable overrides.
+    # Pipeline 1931 caught this when an ARTIFACTORY_PUSH_HOST trigger
+    # var was clobbered by image.env's value of the same key.
+    #
+    # load_image_env snapshots non-empty shell vars first, sources
+    # image.env, then re-applies the snapshot so shell wins. Idempotent:
+    # safe to call from install-tools AND from build.sh / scan scripts.
+    if [ -f scripts/lib/load-image-env.sh ] && [ -f image.env ]; then
+      # shellcheck source=scripts/lib/load-image-env.sh
+      . ./scripts/lib/load-image-env.sh
+      # `set -a` makes every variable assigned during the load auto-
+      # exported. load_image_env snapshots non-empty shell vars first,
+      # sources image.env (auto-exported via set -a), then re-applies
+      # the snapshot — so shell vars still WIN over image.env values
+      # but everything ends up in the env for subsequent script: lines.
+      set -a
+      load_image_env
       set +a
     fi
 
