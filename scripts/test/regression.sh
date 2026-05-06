@@ -216,7 +216,9 @@ end_scenario
 
 scenario "append-git-short-false"
 _run env -i HOME="$HOME" PATH="$PATH" APPEND_GIT_SHORT=false ./scripts/build.sh --dry-run >/dev/null
-_must_contain "Image:              nginx:1.25.3-alpine"
+# Tag should end at the upstream tag with no SHA suffix, regardless
+# of whether PUSH_REGISTRY / PUSH_PROJECT are set in image.env.
+_must_contain "1.25.3-alpine"
 _must_not_contain "1.25.3-alpine-"  # no SHA suffix
 end_scenario
 
@@ -258,6 +260,10 @@ _must_contain "UPSTREAM_IMAGE must be set"
 end_scenario
 
 scenario "push-without-push-registry-fails"
+# Strip PUSH_REGISTRY/PROJECT (and ARTIFACTORY_PUSH_HOST in case
+# auto-derive would kick in) from image.env so the test starts from
+# the unconfigured state regardless of what's currently committed.
+sed -i.bak -E '/^(PUSH_REGISTRY|PUSH_PROJECT|ARTIFACTORY_URL|ARTIFACTORY_PUSH_HOST)=/d' image.env && rm image.env.bak
 out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --push 2>&1) ; rc=$?
 echo "${out}" > "${TMP_DIR}/out"
 echo "${out}" | head -10
@@ -293,9 +299,11 @@ end_scenario
 # ════════════════════════════════════════════════════════════════════
 
 scenario "registry-kind-artifactory-needs-creds-on-push"
-# REGISTRY_KIND=artifactory requires either ARTIFACTORY_PUSH_HOST OR
-# ARTIFACTORY_URL to derive PUSH_REGISTRY. Without them, --push fails.
-sed -i.bak -E 's|^# REGISTRY_KIND=.*|REGISTRY_KIND="artifactory"|' image.env && rm image.env.bak
+# Strip BOTH push-side and Artifactory derivation sources from
+# image.env so the test starts from an unconfigured state. With
+# REGISTRY_KIND=artifactory but no derivation source, --push must fail.
+sed -i.bak -E '/^(PUSH_REGISTRY|PUSH_PROJECT|ARTIFACTORY_URL|ARTIFACTORY_PUSH_HOST|ARTIFACTORY_TEAM|REGISTRY_KIND)=/d' image.env && rm image.env.bak
+echo 'REGISTRY_KIND="artifactory"' >> image.env
 out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --push 2>&1) ; rc=$?
 echo "${out}" > "${TMP_DIR}/out"
 echo "${out}" | head -10
@@ -305,7 +313,10 @@ _must_contain "ARTIFACTORY_PUSH_HOST"  # tip pointing at the right vars
 end_scenario
 
 scenario "registry-kind-artifactory-derives-from-push-host"
-sed -i.bak -E 's|^# REGISTRY_KIND=.*|REGISTRY_KIND="artifactory"|' image.env && rm image.env.bak
+# Strip image.env push config first, then provide ARTIFACTORY_PUSH_HOST
+# via shell to test the auto-derive path.
+sed -i.bak -E '/^(PUSH_REGISTRY|PUSH_PROJECT|ARTIFACTORY_URL|ARTIFACTORY_PUSH_HOST|ARTIFACTORY_TEAM|REGISTRY_KIND)=/d' image.env && rm image.env.bak
+echo 'REGISTRY_KIND="artifactory"' >> image.env
 _run env -i HOME="$HOME" PATH="$PATH" \
   ARTIFACTORY_PUSH_HOST="example.jfrog.io" \
   ARTIFACTORY_TEAM="test" \
