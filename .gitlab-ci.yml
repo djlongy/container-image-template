@@ -435,6 +435,12 @@ grype:
 xray-audit:
   stage: scan
   image: ${DOCKER_CLI_IMAGE}
+  # `jf docker scan` calls `docker save` on the local daemon, so the
+  # job needs a docker:dind sidecar (same shape as the build job).
+  # The script handles `docker pull` itself before scanning.
+  services:
+    - name: ${DOCKER_DIND_IMAGE}
+      alias: docker
   needs:
     - job: build
       artifacts: true

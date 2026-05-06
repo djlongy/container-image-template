@@ -155,6 +155,21 @@ jf config add xray-scan-post-server \
   --overwrite=true >/dev/null
 jf config use xray-scan-post-server >/dev/null
 
+# ── Pull image into the local docker daemon ─────────────────────────
+# `jf docker scan` calls `docker save <ref>` to package the image as a
+# tarball before uploading to Xray. If the image isn't in the local
+# daemon, save fails. Always pull first so the script works on a fresh
+# CI runner that hasn't seen the upstream before. No-op if cached.
+if command -v docker >/dev/null 2>&1; then
+  echo "→ docker pull ${SCAN_REF} (pre-fetch for jf docker scan → docker save)"
+  if ! docker pull "${SCAN_REF}" >/dev/null 2>/tmp/xray-pull.err; then
+    echo "WARN: docker pull failed — jf docker scan will likely fail too" >&2
+    sed 's/^/  /' /tmp/xray-pull.err >&2 || true
+  fi
+else
+  echo "WARN: docker CLI not on PATH — jf docker scan needs local docker" >&2
+fi
+
 # ── Run the scan ────────────────────────────────────────────────────
 SCAN_FORMAT="${XRAY_SCAN_FORMAT:-simple-json}"
 SCAN_FILE="${XRAY_SCAN_FILE:-${REPO_ROOT}/xray-scan.json}"
