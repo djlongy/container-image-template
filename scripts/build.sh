@@ -293,7 +293,7 @@ _build_load_image_env() {
   . ./image.env
 
   if [ -n "${__SHELL_OVERRIDES}" ]; then
-    _dbg "re-applying shell-set overrides on top of ${_image_env_file}"
+    _dbg "re-applying shell-set overrides on top of image.env"
     while IFS= read -r __line; do
       [ -z "${__line}" ] && continue
       eval "export ${__line}"
