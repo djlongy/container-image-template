@@ -259,7 +259,11 @@ if [ -n "${SPLUNK_HEC_URL:-}" ] && [ -n "${SPLUNK_HEC_TOKEN:-}" ]; then
     echo "  ✗ jq required for Splunk HEC envelope construction" >&2
     failures=$((failures + 1))
   else
-    HEC_PAYLOAD=$(jq -nc \
+    # Write payload to a tmp FILE (not via "$VAR") because SBOM
+    # envelopes routinely exceed the OS argv limit (E2BIG / "Argument
+    # list too long" — Linux ARG_MAX minus env is often <500 KB).
+    # `--data-binary @file` avoids the limit entirely.
+    jq -nc \
       --arg sourcetype "${HEC_SOURCETYPE}" \
       --arg index      "${HEC_INDEX}" \
       --arg source     "container-image-template/sbom-post.sh" \
@@ -279,14 +283,14 @@ if [ -n "${SPLUNK_HEC_URL:-}" ] && [ -n "${SPLUNK_HEC_TOKEN:-}" ]; then
            git_commit:    $gitsha,
            cyclonedx:     $bom[0]
          }
-       }')
+       }' > ${_SBOM_TMPDIR}/hec-payload.json
 
     HEC_HTTP_CODE=$(curl -sS -o ${_SBOM_TMPDIR}/hec-response.txt -w '%{http_code}' \
       ${HEC_INSECURE_FLAG} \
       -X POST "${HEC_URL}" \
       -H "Authorization: Splunk ${SPLUNK_HEC_TOKEN}" \
       -H 'Content-Type: application/json' \
-      --data-binary "${HEC_PAYLOAD}" \
+      --data-binary "@${_SBOM_TMPDIR}/hec-payload.json" \
       || echo '000')
     case "${HEC_HTTP_CODE}" in
       2*)

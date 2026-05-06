@@ -216,29 +216,29 @@ if [ -n "${SPLUNK_HEC_URL:-}" ] && [ -n "${SPLUNK_HEC_TOKEN:-}" ]; then
 
   GIT_SHA="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo 'unknown')"
 
-  # Build the HEC envelope. The Xray JSON goes inside `event` so
-  # Splunk auto-extracts fields. host/time/source are HEC metadata.
-  HEC_PAYLOAD="$(
-    jq -nc \
-      --arg sourcetype "${SOURCETYPE}" \
-      --arg index      "${INDEX}" \
-      --arg source     "container-image-template/xray-scan-post.sh" \
-      --arg host       "${HOSTNAME:-$(uname -n)}" \
-      --arg image      "${SCAN_REF}" \
-      --arg gitsha     "${GIT_SHA}" \
-      --slurpfile event "${SCAN_FILE}" \
-      '{
-         sourcetype: $sourcetype,
-         index:      $index,
-         source:     $source,
-         host:       $host,
-         event: {
-           scanned_image: $image,
-           git_commit:    $gitsha,
-           xray:          $event[0]
-         }
-       }'
-  )"
+  # Build the HEC envelope into a tmp FILE — passing it inline as
+  # "${HEC_PAYLOAD}" hits the OS argv limit (Linux ARG_MAX minus env
+  # is often <500 KB; nginx Xray output is ~957 KB pre-envelope).
+  # `--data-binary @file` sidesteps the issue entirely.
+  jq -nc \
+    --arg sourcetype "${SOURCETYPE}" \
+    --arg index      "${INDEX}" \
+    --arg source     "container-image-template/xray-scan-post.sh" \
+    --arg host       "${HOSTNAME:-$(uname -n)}" \
+    --arg image      "${SCAN_REF}" \
+    --arg gitsha     "${GIT_SHA}" \
+    --slurpfile event "${SCAN_FILE}" \
+    '{
+       sourcetype: $sourcetype,
+       index:      $index,
+       source:     $source,
+       host:       $host,
+       event: {
+         scanned_image: $image,
+         git_commit:    $gitsha,
+         xray:          $event[0]
+       }
+     }' > /tmp/xray-hec-payload.json
 
   echo "→ POST vuln scan to ${HEC_URL} (index=${INDEX} sourcetype=${SOURCETYPE})"
   HTTP_CODE="$(
@@ -247,7 +247,7 @@ if [ -n "${SPLUNK_HEC_URL:-}" ] && [ -n "${SPLUNK_HEC_TOKEN:-}" ]; then
       -X POST "${HEC_URL}" \
       -H "Authorization: Splunk ${SPLUNK_HEC_TOKEN}" \
       -H 'Content-Type: application/json' \
-      --data-binary "${HEC_PAYLOAD}" \
+      --data-binary "@/tmp/xray-hec-payload.json" \
     || echo '000'
   )"
   case "${HTTP_CODE}" in
