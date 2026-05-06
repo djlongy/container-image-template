@@ -202,17 +202,37 @@ variables:
     # load_image_env snapshots non-empty shell vars first, sources
     # image.env, then re-applies the snapshot so shell wins. Idempotent:
     # safe to call from install-tools AND from build.sh / scan scripts.
-    if [ -f scripts/lib/load-image-env.sh ] && [ -f image.env ]; then
-      # shellcheck source=scripts/lib/load-image-env.sh
-      . ./scripts/lib/load-image-env.sh
-      # `set -a` makes every variable assigned during the load auto-
-      # exported. load_image_env snapshots non-empty shell vars first,
-      # sources image.env (auto-exported via set -a), then re-applies
-      # the snapshot — so shell vars still WIN over image.env values
-      # but everything ends up in the env for subsequent script: lines.
-      set -a
-      load_image_env
-      set +a
+    if [ -f image.env ]; then
+      # POSIX-sh snapshot/restore: GitLab's default shell is /bin/sh
+      # (busybox in alpine images) which can't run our bash-only
+      # load-image-env.sh (it uses ${!var}, <<<, <(...) — all bash 4+).
+      # Implement the same shell-wins-over-file precedence in pure
+      # POSIX so pipeline-trigger / CI vars override image.env values.
+      #
+      # Algorithm:
+      #   1. Collect names of vars defined in image.env
+      #   2. base64-encode currently-set non-empty values into a tmp file
+      #   3. set -a; source image.env; set +a (auto-export all)
+      #   4. Restore snapshot from tmp file (overrides image.env values)
+      #
+      # base64 is used to safely round-trip values containing single
+      # quotes, newlines, $-substitutions, etc. without shell-injection.
+      _IMG_KEYS=$(grep -oE '^[A-Z_][A-Z0-9_]*=' image.env | sed 's/=$//' | sort -u)
+      _IMG_SNAP=$(mktemp)
+      for k in $_IMG_KEYS; do
+        eval "_v=\"\${${k}:-}\""
+        if [ -n "${_v}" ]; then
+          printf '%s=%s\n' "${k}" "$(printf '%s' "${_v}" | base64 | tr -d '\n')" >> "${_IMG_SNAP}"
+        fi
+      done
+      set -a; . ./image.env; set +a
+      while IFS='=' read -r _rk _rv; do
+        _rdec=$(printf '%s' "${_rv}" | base64 -d)
+        eval "${_rk}=\"\${_rdec}\""
+        export "${_rk}"
+      done < "${_IMG_SNAP}"
+      rm -f "${_IMG_SNAP}"
+      unset _IMG_KEYS _IMG_SNAP _v _rk _rv _rdec
     fi
 
 # ═══════════════════════════════════════════════════════════════════
