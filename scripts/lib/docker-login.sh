@@ -72,25 +72,14 @@ docker_login_for_xray_scan() {
     fi
   fi
 
-  # ── Scan-side Artifactory (host derived from XRAY_ARTIFACTORY_URL) ─
-  if [ -n "${XRAY_ARTIFACTORY_URL:-}" ] && [ -n "${XRAY_ARTIFACTORY_USER:-}" ]; then
-    local _xhost="${XRAY_ARTIFACTORY_URL#https://}"
-    _xhost="${_xhost#http://}"
-    _xhost="${_xhost%%/*}"
-    local _xsecret="${XRAY_ARTIFACTORY_TOKEN:-${XRAY_ARTIFACTORY_PASSWORD:-}}"
-    if [ -n "${_xsecret}" ] && [ "${_xhost}" != "${PUSH_REGISTRY:-}" ] && [ "${_xhost}" != "${ARTIFACTORY_PUSH_HOST:-}" ]; then
-      _attempts=$((_attempts + 1))
-      echo "→ docker login ${_xhost} (XRAY_ARTIFACTORY)"
-      if printf '%s' "${_xsecret}" \
-           | docker login "${_xhost}" -u "${XRAY_ARTIFACTORY_USER}" --password-stdin >/dev/null 2>/tmp/docker-login.err; then
-        echo "  ✓ logged in"
-      else
-        echo "  WARN: login failed — ${_xhost} pulls will be unauthenticated" >&2
-        sed 's/^/    /' /tmp/docker-login.err >&2 || true
-        _failures=$((_failures + 1))
-      fi
-    fi
-  fi
+  # NOTE: we deliberately DO NOT attempt docker login against
+  # XRAY_ARTIFACTORY_URL. That URL is the JFrog Platform API endpoint
+  # for `jf config add` (scan API), not a registry host we pull from.
+  # On JFrog Cloud especially, docker login uses a different identity
+  # (the access-token's encoded subject, not the API user/email) and
+  # an attempted login with the API creds fails with "Wrong username
+  # was used" — noisy and confusing. The actual built image lives at
+  # PUSH_REGISTRY or ARTIFACTORY_PUSH_HOST, both handled above.
 
   if [ "${_attempts}" -eq 0 ]; then
     echo "  NOTE: no registry credentials in env — relying on existing daemon auth + public pulls" >&2
