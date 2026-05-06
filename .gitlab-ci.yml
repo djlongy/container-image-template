@@ -209,6 +209,18 @@ variables:
     if ! command -v crane >/dev/null 2>&1; then
       curl -sL "${CRANE_URL}" | tar xz -C "${HOME}/.local/bin/" crane
     fi
+  - |
+    # Source image.env so subsequent script: lines see PUSH_REGISTRY,
+    # ARTIFACTORY_*, VENDOR, etc. without each script having to source
+    # it themselves. image.env is the canonical config — CI vars are
+    # for SECRETS only. Jobs that invoke build.sh / scan/* don't need
+    # this themselves (the scripts source via the shared lib), but
+    # inline registry-auth setups in sbom / grype / sbom-ingest do.
+    if [ -f image.env ]; then
+      set -a            # auto-export every var image.env defines
+      . ./image.env
+      set +a
+    fi
 
 # ═══════════════════════════════════════════════════════════════════
 # BUILD
@@ -617,11 +629,7 @@ sbom-ingest:
     - job: sbom
       artifacts: true
   before_script:
-    - |
-      if [ -n "${APK_MIRROR:-}" ]; then
-        sed -i "s|https\?://dl-cdn.alpinelinux.org/alpine|${APK_MIRROR}|g" /etc/apk/repositories
-      fi
-    - apk add --no-cache bash curl jq
+    - *install-tools     # also sources image.env so sbom-post sees ARTIFACTORY_*, etc.
   script:
     - bash ./scripts/sbom-post.sh sbom.cdx.json
   rules:
