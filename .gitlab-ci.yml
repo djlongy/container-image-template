@@ -32,7 +32,8 @@
 #   VENDOR                    — company name for OCI vendor label
 #   PLATFORM                  — default linux/amd64
 #   COSIGN_KEY                — cosign private key (file: reference, e.g. vault:...)
-#                               leave unset to skip signing
+#                               DORMANT — sign job is commented out until cosign
+#                               infra (Vault transit / KMS) is in place.
 #
 #   # ── Push backend switch ─────────────────────────────────────
 #   REGISTRY_KIND             — unset (default) = plain docker push
@@ -65,17 +66,18 @@
 #                               ARTIFACTORY_USER / ARTIFACTORY_TOKEN
 #                               from the artifactory push backend).
 #
-#   PROD_PUSH_REGISTRY        — production registry for the promote stage
-#   PROD_PUSH_REGISTRY_USER   — prod push user
-#   PROD_PUSH_REGISTRY_PASSWORD — prod push password
-#   ENABLE_PROD_PROMOTE       — set to "true" to show the manual promote job
+#   Production promotion is INTENTIONALLY not in this pipeline —
+#   manual ritual via Artifactory's native copy UI. See README
+#   "Promoting to production" for the crane CLI invocation.
 
 stages:
   - build
   - scan
-  - sign
+  - sign         # COMMENTED OUT — no cosign infra yet, restore when KMS/Vault transit lands
   - ingest
-  - promote
+  # promote     # REMOVED — production promotion is a human ritual via Artifactory's
+  #             # native copy UI (manual review + tag bump). See README "Promoting
+  #             # to production" for the exact crane-copy command if you want CLI.
 
 # ── Path gate ──────────────────────────────────────────────────────
 # A pipeline only runs when something that actually affects the image
@@ -497,91 +499,97 @@ xray-audit:
 #     - if: '$CI_COMMIT_TAG'
 
 # ═══════════════════════════════════════════════════════════════════
-# SIGN — cosign sign + SBOM attestation
+# SIGN — cosign sign + SBOM attestation  (DORMANT — no cosign infra at work yet)
 # ═══════════════════════════════════════════════════════════════════
+# Restore by uncommenting the block below AND configuring COSIGN_KEY
+# as a file-type CI variable (Vault transit / KMS reference preferred
+# over a raw private key). Until then the `sign` stage in `stages:`
+# above has no jobs and is silently skipped.
+#
 # Signs the image by digest (tag reassignment can't invalidate the
 # signature) and attests the CycloneDX SBOM + Grype report as
 # predicates, so downstream consumers can verify both provenance
-# AND scanned state at any time via `cosign verify-attestation`.
-cosign-sign:
-  stage: sign
-  image: ${ALPINE_IMAGE}
-  needs:
-    - job: build
-      artifacts: true
-    - job: sbom
-      artifacts: true
-    - job: grype
-      artifacts: true
-  before_script:
-    - *install-tools
-    - |
-      mkdir -p "${HOME}/.local/bin"
-      export PATH="${HOME}/.local/bin:${PATH}"
-      if ! command -v cosign >/dev/null 2>&1; then
-        curl -sL "${COSIGN_URL}" -o "${HOME}/.local/bin/cosign"
-        chmod +x "${HOME}/.local/bin/cosign"
-      fi
-      cosign version
-  script:
-    - |
-      if [ -z "${COSIGN_KEY:-}" ]; then
-        echo "SKIPPED: COSIGN_KEY not set — image will be unsigned"
-        echo "  Set COSIGN_KEY as a CI variable (file: type preferred) to enable signing"
-        exit 0
-      fi
-    - |
-      # Write a config.json that covers BOTH Harbor and (optionally)
-      # Artifactory. Downstream tools (syft, cosign) use this to
-      # authenticate image pulls regardless of which backend the build
-      # stage pushed to. Order doesn't matter — each host key points
-      # to a separate auth entry.
-      mkdir -p ~/.docker
-      AUTHS=""
-      if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ]; then
-        A=$(printf '%s' "${PUSH_REGISTRY_USER}:${PUSH_REGISTRY_PASSWORD}" | base64 -w0)
-        AUTHS="${AUTHS}\"${PUSH_REGISTRY}\":{\"auth\":\"${A}\"},"
-      fi
-      if [ "${REGISTRY_KIND:-}" = "artifactory" ] && [ -n "${ARTIFACTORY_USER:-}" ]; then
-        ART_SECRET="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
-        ART_HOST="${ARTIFACTORY_PUSH_HOST:-}"
-        if [ -z "${ART_HOST}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
-          ART_HOST="${ARTIFACTORY_URL#https://}"
-          ART_HOST="${ART_HOST#http://}"
-          ART_HOST="${ART_HOST%%/*}"
-        fi
-        if [ -n "${ART_HOST}" ] && [ -n "${ART_SECRET}" ]; then
-          A=$(printf '%s' "${ARTIFACTORY_USER}:${ART_SECRET}" | base64 -w0)
-          AUTHS="${AUTHS}\"${ART_HOST}\":{\"auth\":\"${A}\"},"
-        fi
-      fi
-      AUTHS="${AUTHS%,}"
-      printf '{"auths":{%s}}\n' "${AUTHS}" > ~/.docker/config.json
-    - |
-      TARGET="${IMAGE_DIGEST:-${IMAGE_REF}}"
-      echo "→ cosign sign ${TARGET}"
-      cosign sign --key "${COSIGN_KEY}" --yes --tlog-upload=false \
-        -a "ci.build=${CI_JOB_ID}" \
-        -a "ci.pipeline=${CI_PIPELINE_ID}" \
-        -a "git.commit=${CI_COMMIT_SHA}" \
-        "${TARGET}"
-
-      if [ -f sbom.cdx.json ]; then
-        echo "→ cosign attest (CycloneDX SBOM)"
-        cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
-          --type cyclonedx --predicate sbom.cdx.json "${TARGET}"
-      fi
-
-      if [ -f grype-report.json ]; then
-        echo "→ cosign attest (Grype vulnerability report)"
-        cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
-          --type vuln --predicate grype-report.json "${TARGET}"
-      fi
-  rules:
-    - if: '$FORCE_ALL == "true"'
-    - if: '$CI_COMMIT_TAG'
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      changes: *build-changes
+# AND scanned state via `cosign verify-attestation`.
+#
+# cosign-sign:
+#   stage: sign
+#   image: ${ALPINE_IMAGE}
+#   needs:
+#     - job: build
+#       artifacts: true
+#     - job: sbom
+#       artifacts: true
+#     - job: grype
+#       artifacts: true
+#   before_script:
+#     - *install-tools
+#     - |
+#       mkdir -p "${HOME}/.local/bin"
+#       export PATH="${HOME}/.local/bin:${PATH}"
+#       if ! command -v cosign >/dev/null 2>&1; then
+#         curl -sL "${COSIGN_URL}" -o "${HOME}/.local/bin/cosign"
+#         chmod +x "${HOME}/.local/bin/cosign"
+#       fi
+#       cosign version
+#   script:
+#     - |
+#       if [ -z "${COSIGN_KEY:-}" ]; then
+#         echo "SKIPPED: COSIGN_KEY not set — image will be unsigned"
+#         echo "  Set COSIGN_KEY as a CI variable (file: type preferred) to enable signing"
+#         exit 0
+#       fi
+#     - |
+#       # Write a config.json that covers BOTH Harbor and (optionally)
+#       # Artifactory. Downstream tools (syft, cosign) use this to
+#       # authenticate image pulls regardless of which backend the build
+#       # stage pushed to. Order doesn't matter — each host key points
+#       # to a separate auth entry.
+#       mkdir -p ~/.docker
+#       AUTHS=""
+#       if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ]; then
+#         A=$(printf '%s' "${PUSH_REGISTRY_USER}:${PUSH_REGISTRY_PASSWORD}" | base64 -w0)
+#         AUTHS="${AUTHS}\"${PUSH_REGISTRY}\":{\"auth\":\"${A}\"},"
+#       fi
+#       if [ "${REGISTRY_KIND:-}" = "artifactory" ] && [ -n "${ARTIFACTORY_USER:-}" ]; then
+#         ART_SECRET="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
+#         ART_HOST="${ARTIFACTORY_PUSH_HOST:-}"
+#         if [ -z "${ART_HOST}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
+#           ART_HOST="${ARTIFACTORY_URL#https://}"
+#           ART_HOST="${ART_HOST#http://}"
+#           ART_HOST="${ART_HOST%%/*}"
+#         fi
+#         if [ -n "${ART_HOST}" ] && [ -n "${ART_SECRET}" ]; then
+#           A=$(printf '%s' "${ARTIFACTORY_USER}:${ART_SECRET}" | base64 -w0)
+#           AUTHS="${AUTHS}\"${ART_HOST}\":{\"auth\":\"${A}\"},"
+#         fi
+#       fi
+#       AUTHS="${AUTHS%,}"
+#       printf '{"auths":{%s}}\n' "${AUTHS}" > ~/.docker/config.json
+#     - |
+#       TARGET="${IMAGE_DIGEST:-${IMAGE_REF}}"
+#       echo "→ cosign sign ${TARGET}"
+#       cosign sign --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+#         -a "ci.build=${CI_JOB_ID}" \
+#         -a "ci.pipeline=${CI_PIPELINE_ID}" \
+#         -a "git.commit=${CI_COMMIT_SHA}" \
+#         "${TARGET}"
+#
+#       if [ -f sbom.cdx.json ]; then
+#         echo "→ cosign attest (CycloneDX SBOM)"
+#         cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+#           --type cyclonedx --predicate sbom.cdx.json "${TARGET}"
+#       fi
+#
+#       if [ -f grype-report.json ]; then
+#         echo "→ cosign attest (Grype vulnerability report)"
+#         cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+#           --type vuln --predicate grype-report.json "${TARGET}"
+#       fi
+#   rules:
+#     - if: '$FORCE_ALL == "true"'
+#     - if: '$CI_COMMIT_TAG'
+#     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+#       changes: *build-changes
 
 # ═══════════════════════════════════════════════════════════════════
 # INGEST — post SBOM to configured sinks
@@ -612,54 +620,10 @@ sbom-ingest:
   allow_failure: true
 
 # ═══════════════════════════════════════════════════════════════════
-# PROMOTE — crane copy to production registry (manual)
+# PROMOTE — REMOVED. Manual via Artifactory's native copy UI.
 # ═══════════════════════════════════════════════════════════════════
-# Byte-for-byte identical promotion using `crane copy`. No rebuild,
-# same digest. Gated behind ENABLE_PROD_PROMOTE=true so fresh clones
-# without a prod registry don't show a red manual gate.
-promote-prod:
-  stage: promote
-  image: ${ALPINE_IMAGE}
-  needs:
-    - job: build
-      artifacts: true
-  before_script:
-    - *install-tools
-  script:
-    - |
-      if [ -z "${PROD_PUSH_REGISTRY:-}" ]; then
-        echo "ERROR: PROD_PUSH_REGISTRY not set" >&2
-        exit 1
-      fi
-      if [ -z "${IMAGE_DIGEST:-}" ]; then
-        echo "ERROR: IMAGE_DIGEST not available from build stage" >&2
-        exit 1
-      fi
-    - |
-      if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ]; then
-        crane auth login "${PUSH_REGISTRY}" -u "${PUSH_REGISTRY_USER}" -p "${PUSH_REGISTRY_PASSWORD}"
-      fi
-      if [ -n "${PROD_PUSH_REGISTRY_USER:-}" ] && [ -n "${PROD_PUSH_REGISTRY_PASSWORD:-}" ]; then
-        crane auth login "${PROD_PUSH_REGISTRY}" -u "${PROD_PUSH_REGISTRY_USER}" -p "${PROD_PUSH_REGISTRY_PASSWORD}"
-      fi
-    - |
-      DEST_PROJECT="${PROD_PUSH_PROJECT:-${PUSH_PROJECT}}"
-      DST="${PROD_PUSH_REGISTRY}/${DEST_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}"
-      echo "→ crane copy ${IMAGE_DIGEST} → ${DST}"
-      crane copy "${IMAGE_DIGEST}" "${DST}"
-      echo "→ promoted"
-      echo "  source digest: $(crane digest ${IMAGE_DIGEST})"
-      echo "  dest digest:   $(crane digest ${DST})"
-  rules:
-    - if: '$ENABLE_PROD_PROMOTE != "true"'
-      when: never
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      changes: *build-changes
-      when: manual
-      allow_failure: true
-    - if: '$CI_COMMIT_TAG'
-      when: manual
-      allow_failure: true
-    - if: '$FORCE_ALL == "true"'
-      when: manual
-      allow_failure: true
+# After validating the dev image, a human promotes to prod by either:
+#   - Artifactory UI: Browse → <repo>/<image>/<tag> → "Copy" or "Move"
+#   - CLI:  crane copy <dev-digest> <prod-registry>/<project>/<image>:<tag>
+# Same digest preserved either way. See README "Promoting to production"
+# for the exact crane invocation and required auth setup.

@@ -38,7 +38,7 @@
 #   svc_artifactory_user     → exported as ARTIFACTORY_USER
 #   svc_splunk_hec_token     → exported as SPLUNK_HEC_TOKEN
 #
-#   # Optional: cosign signing
+#   # Optional: cosign signing (DORMANT — restore Cosign Sign job to use)
 #   COSIGN_KEY               private key path or env: reference
 #
 #   # Optional: corp CA (auto-flips INJECT_CERTS=true inside build.sh)
@@ -67,11 +67,9 @@
 #   SPLUNK_HEC_URL           Splunk HEC endpoint
 #   SPLUNK_HEC_TOKEN         HEC token (preferably via shim from svc_*)
 #
-#   # Optional: production promotion
-#   PROD_PUSH_REGISTRY       production registry host
-#   PROD_PUSH_PROJECT        prod project / path
-#   PROD_PUSH_REGISTRY_USER  prod push username
-#   PROD_PUSH_REGISTRY_PASSWORD  prod push password (masked)
+#   # Production promotion is INTENTIONALLY not in this pipeline —
+#   # human ritual via Artifactory's native copy UI. See README
+#   # "Promoting to production".
 #
 # image.env (committed) is the single source of truth for build
 # behaviour (REMEDIATE, INJECT_CERTS, REGISTRY_KIND, UPSTREAM_*,
@@ -112,16 +110,16 @@ stages:
         - Grype
         - Xray Audit
         # - Trivy   # Disabled: banned for business use.
-  - Sign:
-      jobs:
-        - Cosign Sign
+  # - Sign:           # COMMENTED OUT — no cosign infra at work yet.
+  #     jobs:        # Restore by uncommenting both this stage and the
+  #       - Cosign Sign  # `Cosign Sign:` job block further down.
   - Ingest:
       jobs:
         - SBOM Ingest
-  - Promote:
-      manual: true
-      jobs:
-        - Promote Prod
+  # - Promote:        # REMOVED — production promotion is a human ritual
+  #     manual: true  # via Artifactory's native copy UI. See README
+  #     jobs:         # "Promoting to production" for the manual command.
+  #       - Promote Prod
 
 # ═══════════════════════════════════════════════════════════════════
 # BUILD
@@ -362,65 +360,70 @@ Xray Audit:
     - system.docker.executable
 
 # ═══════════════════════════════════════════════════════════════════
-# SIGN — cosign sign + SBOM/Grype attestations
+# SIGN — cosign sign + SBOM/Grype attestations  (DORMANT)
 # ═══════════════════════════════════════════════════════════════════
-Cosign Sign:
-  tasks:
-    - artifact-download:
-        artifacts:
-          - name: build-env
-            destination: .
-          - name: sbom
-            destination: .
-          - name: grype-report
-            destination: .
-    - script:
-        interpreter: BASH
-        scripts:
-          - |-
-            set -euo pipefail
-            . ./build.env
-            [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
-
-            export PUSH_REGISTRY_USER="${bamboo_svc_push_registry_user:-${bamboo_PUSH_REGISTRY_USER:-}}"
-            export PUSH_REGISTRY_PASSWORD="${bamboo_svc_push_registry_password:-${bamboo_PUSH_REGISTRY_PASSWORD:-}}"
-
-            if [ -z "${bamboo_COSIGN_KEY:-}" ]; then
-              echo "SKIPPED: COSIGN_KEY plan var not set"
-              exit 0
-            fi
-            export COSIGN_KEY="${bamboo_COSIGN_KEY}"
-
-            if ! command -v cosign >/dev/null 2>&1; then
-              COSIGN_URL_EFFECTIVE="${bamboo_COSIGN_URL:-https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64}"
-              mkdir -p "${HOME}/.local/bin"
-              curl -sL "${COSIGN_URL_EFFECTIVE}" -o "${HOME}/.local/bin/cosign"
-              chmod +x "${HOME}/.local/bin/cosign"
-              export PATH="${HOME}/.local/bin:${PATH}"
-            fi
-
-            if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${bamboo_PUSH_REGISTRY:-}" ]; then
-              echo "${PUSH_REGISTRY_PASSWORD}" | docker login "${bamboo_PUSH_REGISTRY}" \
-                -u "${PUSH_REGISTRY_USER}" --password-stdin
-            fi
-
-            TARGET="${IMAGE_DIGEST:-${IMAGE_REF}}"
-            cosign sign --key "${COSIGN_KEY}" --yes --tlog-upload=false \
-              -a "ci.build=${bamboo_buildResultKey}" \
-              -a "ci.plan=${bamboo_planKey}" \
-              -a "git.commit=${GIT_SHA}" \
-              "${TARGET}"
-
-            if [ -f sbom.cdx.json ]; then
-              cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
-                --type cyclonedx --predicate sbom.cdx.json "${TARGET}"
-            fi
-            if [ -f grype-report.json ]; then
-              cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
-                --type vuln --predicate grype-report.json "${TARGET}"
-            fi
-  requirements:
-    - system.docker.executable
+# Restore by uncommenting the `Cosign Sign:` block below AND the
+# matching `- Sign:` entry in the stages list at the top. Configure
+# COSIGN_KEY as a Bamboo plan variable (file: type) that points at
+# Vault transit / KMS rather than holding raw key material.
+#
+# Cosign Sign:
+#   tasks:
+#     - artifact-download:
+#         artifacts:
+#           - name: build-env
+#             destination: .
+#           - name: sbom
+#             destination: .
+#           - name: grype-report
+#             destination: .
+#     - script:
+#         interpreter: BASH
+#         scripts:
+#           - |-
+#             set -euo pipefail
+#             . ./build.env
+#             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+#
+#             export PUSH_REGISTRY_USER="${bamboo_svc_push_registry_user:-${bamboo_PUSH_REGISTRY_USER:-}}"
+#             export PUSH_REGISTRY_PASSWORD="${bamboo_svc_push_registry_password:-${bamboo_PUSH_REGISTRY_PASSWORD:-}}"
+#
+#             if [ -z "${bamboo_COSIGN_KEY:-}" ]; then
+#               echo "SKIPPED: COSIGN_KEY plan var not set"
+#               exit 0
+#             fi
+#             export COSIGN_KEY="${bamboo_COSIGN_KEY}"
+#
+#             if ! command -v cosign >/dev/null 2>&1; then
+#               COSIGN_URL_EFFECTIVE="${bamboo_COSIGN_URL:-https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64}"
+#               mkdir -p "${HOME}/.local/bin"
+#               curl -sL "${COSIGN_URL_EFFECTIVE}" -o "${HOME}/.local/bin/cosign"
+#               chmod +x "${HOME}/.local/bin/cosign"
+#               export PATH="${HOME}/.local/bin:${PATH}"
+#             fi
+#
+#             if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${bamboo_PUSH_REGISTRY:-}" ]; then
+#               echo "${PUSH_REGISTRY_PASSWORD}" | docker login "${bamboo_PUSH_REGISTRY}" \
+#                 -u "${PUSH_REGISTRY_USER}" --password-stdin
+#             fi
+#
+#             TARGET="${IMAGE_DIGEST:-${IMAGE_REF}}"
+#             cosign sign --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+#               -a "ci.build=${bamboo_buildResultKey}" \
+#               -a "ci.plan=${bamboo_planKey}" \
+#               -a "git.commit=${GIT_SHA}" \
+#               "${TARGET}"
+#
+#             if [ -f sbom.cdx.json ]; then
+#               cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+#                 --type cyclonedx --predicate sbom.cdx.json "${TARGET}"
+#             fi
+#             if [ -f grype-report.json ]; then
+#               cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
+#                 --type vuln --predicate grype-report.json "${TARGET}"
+#             fi
+#   requirements:
+#     - system.docker.executable
 
 # ═══════════════════════════════════════════════════════════════════
 # INGEST — SBOM post to configured sinks
@@ -453,47 +456,10 @@ SBOM Ingest:
     - system.docker.executable
 
 # ═══════════════════════════════════════════════════════════════════
-# PROMOTE — crane copy to production (manual)
+# PROMOTE — REMOVED. Manual via Artifactory's native copy UI.
 # ═══════════════════════════════════════════════════════════════════
-Promote Prod:
-  tasks:
-    - artifact-download:
-        artifacts:
-          - name: build-env
-            destination: .
-    - script:
-        interpreter: BASH
-        scripts:
-          - |-
-            set -euo pipefail
-            . ./build.env
-            [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
-
-            export PUSH_REGISTRY_USER="${bamboo_svc_push_registry_user:-${bamboo_PUSH_REGISTRY_USER:-}}"
-            export PUSH_REGISTRY_PASSWORD="${bamboo_svc_push_registry_password:-${bamboo_PUSH_REGISTRY_PASSWORD:-}}"
-            export PROD_PUSH_REGISTRY_USER="${bamboo_svc_prod_push_registry_user:-${bamboo_PROD_PUSH_REGISTRY_USER:-}}"
-            export PROD_PUSH_REGISTRY_PASSWORD="${bamboo_svc_prod_push_registry_password:-${bamboo_PROD_PUSH_REGISTRY_PASSWORD:-}}"
-
-            if [ -z "${bamboo_PROD_PUSH_REGISTRY:-}" ] || [ -z "${IMAGE_DIGEST:-}" ]; then
-              echo "ERROR: need PROD_PUSH_REGISTRY plan var and IMAGE_DIGEST" >&2
-              exit 1
-            fi
-
-            if ! command -v crane >/dev/null 2>&1; then
-              CRANE_URL_EFFECTIVE="${bamboo_CRANE_URL:-https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz}"
-              mkdir -p "${HOME}/.local/bin"
-              curl -sL "${CRANE_URL_EFFECTIVE}" | tar xz -C "${HOME}/.local/bin/" crane
-              export PATH="${HOME}/.local/bin:${PATH}"
-            fi
-
-            [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${bamboo_PUSH_REGISTRY:-}" ] && \
-              crane auth login "${bamboo_PUSH_REGISTRY}" -u "${PUSH_REGISTRY_USER}" -p "${PUSH_REGISTRY_PASSWORD}"
-            [ -n "${PROD_PUSH_REGISTRY_USER:-}" ] && \
-              crane auth login "${bamboo_PROD_PUSH_REGISTRY}" -u "${PROD_PUSH_REGISTRY_USER}" -p "${PROD_PUSH_REGISTRY_PASSWORD}"
-
-            DEST_PROJECT="${bamboo_PROD_PUSH_PROJECT:-${bamboo_PUSH_PROJECT}}"
-            DST="${bamboo_PROD_PUSH_REGISTRY}/${DEST_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}"
-            crane copy "${IMAGE_DIGEST}" "${DST}"
-            echo "Promoted: ${DST}"
-  requirements:
-    - system.docker.executable
+# After validating the dev image, a human promotes to prod by either:
+#   - Artifactory UI: Browse → <repo>/<image>/<tag> → "Copy" or "Move"
+#   - CLI:  crane copy <dev-digest> <prod-registry>/<project>/<image>:<tag>
+# Same digest preserved either way. See README "Promoting to production"
+# for the exact crane invocation and required auth setup.

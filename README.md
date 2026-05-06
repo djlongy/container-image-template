@@ -350,12 +350,12 @@ APK_MIRROR            = https://artifactory.example.com/artifactory/alpine-proxy
 ## Pipeline flow
 
 ```
-┌─────────┐   ┌────────┐   ┌────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-│  build  │ → │  sbom  │ → │ grype  │ → │ cosign-sign  │ → │ sbom-ingest  │ → │ promote-prod │
-└─────────┘   └────────┘   └────────┘   └──────────────┘   └──────────────┘   └──────────────┘
-   buildx       Syft       SBOM scan       sign +            webhook/DT           manual,
-   + push       CycloneDX   → JSON         attest SBOM +     POST                 crane copy
-   → build.env  + SPDX      + table        attest vuln       (optional)           by digest
+┌─────────┐   ┌────────┐   ┌────────┐   ┌────────────┐   ┌──────────────┐
+│  build  │ → │  sbom  │ → │ grype  │ → │ xray-audit │ → │ sbom-ingest  │
+└─────────┘   └────────┘   └────────┘   └────────────┘   └──────────────┘
+   buildx       Syft       SBOM scan      Xray scan         webhook/DT
+   + push       CycloneDX   → JSON        + Xray SBOM        POST
+   → build.env  + SPDX      + table       → Splunk          (optional)
 ```
 
 **Trivy** is present as a commented-out block in both CI files. When
@@ -364,6 +364,35 @@ Trivy is unbanned for business use, uncomment the `trivy:` job in
 `bamboo-specs/bamboo.yaml`, and re-enable the `- trivy` stage
 reference. Grype covers the same ground via the SBOM scan in the
 meantime — no gap.
+
+**`cosign-sign`** is present as commented-out blocks in both CI files
+(dormant). Restore by uncommenting the job AND the `- sign` / `- Sign:`
+stage entry, then setting `COSIGN_KEY` (file-type CI variable, ideally
+backed by Vault transit / KMS).
+
+### Promoting to production
+
+Promotion is **not in the CI pipeline by design**. After the dev image
+is validated, a human promotes it via Artifactory's native copy. Two
+equivalent paths:
+
+```bash
+# Option A — Artifactory UI (most common):
+#   Browse → <repo>/<image>/<dev-tag> → "Copy" or "Move"
+#   Pick destination repo/path, confirm.
+
+# Option B — CLI (scriptable, same digest):
+crane auth login <prod-registry> -u <user> -p <password>
+crane copy \
+  <dev-registry>/<project>/<image>@sha256:<digest-from-build.env> \
+  <prod-registry>/<project>/<image>:<tag>
+```
+
+Both paths preserve the digest, so any cosign attestation made in the
+dev pipeline transfers to the prod tag. The dev pipeline keeps
+`build.env` as a 1-month artifact — `IMAGE_DIGEST` is the value to
+copy from. No automated CI promotion job exists, deliberately: the
+human-in-the-loop check is the gate.
 
 ## Distro-aware remediation
 
