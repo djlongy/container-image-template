@@ -410,6 +410,24 @@ grype:
   services:
     - name: ${DOCKER_DIND_IMAGE}
       alias: docker
+  variables:
+    # Move jf's home dir INTO the project dir so GitLab CI cache can
+    # persist it across job runs. Default ~/.jfrog is outside the
+    # project tree and not cacheable. Without this, every xray job
+    # re-downloads the Xray Analyzer Manager (~300MB) — across 4 xray
+    # jobs per pipeline that's 1.2 GB of redundant downloads and was
+    # the root cause of pipeline 1926's "no space left on device".
+    JFROG_CLI_HOME_DIR: "${CI_PROJECT_DIR}/.jfrog-cli-home"
+  cache:
+    # Static key shared across all branches + pipelines so the analyzer
+    # downloaded by the first xray job of the day is reused by every
+    # subsequent xray job. Bump the suffix when you upgrade JF_BINARY_URL
+    # (jf CLI version) so the cache invalidates and grabs a matching
+    # analyzer for the new CLI.
+    key: jfrog-deps-cache-v1
+    paths:
+      - .jfrog-cli-home/dependencies/
+    policy: pull-push    # download cache first, upload changes after
   before_script:
     - *install-tools
   rules: *build-rules
