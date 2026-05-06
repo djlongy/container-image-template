@@ -131,15 +131,23 @@ jf config add xray-sbom-server \
   --overwrite=true >/dev/null
 jf config use xray-sbom-server >/dev/null
 
+# ── Multi-registry docker login (mirrors xray-vuln.sh's flow) ─────
+# shellcheck source=../lib/docker-login.sh
+. "${REPO_ROOT}/scripts/lib/docker-login.sh"
+docker_login_for_xray_scan
+
 # ── Pre-pull image ────────────────────────────────────────────────
-if command -v docker >/dev/null 2>&1; then
-  echo "→ docker pull ${SCAN_REF}"
-  if ! docker pull "${SCAN_REF}" >/dev/null 2>/tmp/xray-sbom-pull.err; then
-    echo "WARN: docker pull failed — jf docker scan will likely fail too" >&2
-    sed 's/^/  /' /tmp/xray-sbom-pull.err >&2 || true
-  fi
-else
-  echo "WARN: docker CLI not on PATH — jf docker scan needs local docker" >&2
+if ! command -v docker >/dev/null 2>&1; then
+  echo "ERROR: docker CLI not on PATH — jf docker scan needs local docker" >&2
+  exit 1
+fi
+echo "→ docker pull ${SCAN_REF}"
+if ! docker pull "${SCAN_REF}" >/dev/null 2>/tmp/xray-sbom-pull.err; then
+  echo "ERROR: docker pull failed — cannot scan a missing local image" >&2
+  echo "── pull error ──" >&2
+  sed 's/^/  /' /tmp/xray-sbom-pull.err >&2 || true
+  echo "  Check: registry credentials in env, network reachability, image ref correctness." >&2
+  exit 1
 fi
 
 # ── Generate SBOM ─────────────────────────────────────────────────
@@ -160,16 +168,21 @@ SBOM_RC=$?
 set -e
 
 if [ ! -s "${SBOM_FILE_OUT}" ]; then
-  echo "WARN: jf docker scan (cyclonedx) produced no output (rc=${SBOM_RC}) — continuing" >&2
+  echo "ERROR: jf docker scan (cyclonedx) produced no output (rc=${SBOM_RC})" >&2
+  echo "── stderr ──" >&2
   sed 's/^/  /' /tmp/xray-sbom.err >&2 || true
-  exit 0
+  echo "  Common causes: image not pulled into local daemon, Xray service" >&2
+  echo "  unreachable, or credentials wrong. The job will fail visibly so" >&2
+  echo "  the gap is noticed (allow_failure: true at the CI level still" >&2
+  echo "  prevents this from blocking downstream jobs)." >&2
+  exit 1
 fi
 
 # Validate JSON shape (jf occasionally emits a warning above the JSON).
 if command -v jq >/dev/null 2>&1; then
   if ! jq empty "${SBOM_FILE_OUT}" >/dev/null 2>&1; then
-    echo "WARN: ${SBOM_FILE_OUT} is not valid JSON — keeping as artifact for debug" >&2
-    exit 0
+    echo "ERROR: ${SBOM_FILE_OUT} is not valid JSON — keeping as artifact for debug" >&2
+    exit 1
   fi
   COMPONENT_COUNT="$(jq '.components | length' "${SBOM_FILE_OUT}" 2>/dev/null || echo '?')"
   VULN_COUNT="$(jq '.vulnerabilities | length' "${SBOM_FILE_OUT}" 2>/dev/null || echo '?')"

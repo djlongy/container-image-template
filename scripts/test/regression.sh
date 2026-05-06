@@ -377,6 +377,25 @@ _run env -i HOME="$HOME" PATH="$PATH" ./scripts/scan/xray-vuln.sh 2>/dev/null ||
 _must_contain "→ Scan target: docker.io/library/nginx:1.25.3-alpine"
 end_scenario
 
+scenario "xray-vuln-fails-loudly-when-pull-fails"
+# Regression for the silent-fail bug: previously, if docker pull
+# failed (e.g. unauthorized to a private registry), the script would
+# WARN and exit 0 — CI showed the job as success even though no
+# scan ran. Now it must exit non-zero so CI marks the job failed.
+# We trigger this by passing a definitely-unreachable digest with
+# Xray creds present (so Phase 1 passes through) and no docker login.
+out=$(env -i HOME="$HOME" PATH="$PATH" \
+  ARTIFACTORY_URL="https://example.invalid" \
+  ARTIFACTORY_USER="x" \
+  ARTIFACTORY_TOKEN="x" \
+  ./scripts/scan/xray-vuln.sh "harbor.invalid/nope/nope@sha256:0000000000000000000000000000000000000000000000000000000000000000" 2>&1) ; rc=$?
+echo "${out}" > "${TMP_DIR}/out"
+[ "${rc}" -ne 0 ] || FAILURES+=("${CURRENT_NAME}: expected non-zero exit on docker pull / scan failure")
+# We may exit at jf install (no JF_BINARY_URL), at docker pull, or at
+# scan — any of those is a valid loud-failure point. Just confirm it's
+# not pretending to succeed.
+end_scenario
+
 scenario "sbom-post-no-sinks-and-no-file"
 out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/sbom-post.sh /nonexistent.cdx.json 2>&1) ; rc=$?
 echo "${out}" > "${TMP_DIR}/out"

@@ -148,15 +148,27 @@ jf config add xray-vuln-server \
   --overwrite=true >/dev/null
 jf config use xray-vuln-server >/dev/null
 
+# ── Multi-registry docker login (built image pulls need auth) ──────
+# Postscan SCAN_REF is typically a private-registry digest. Without
+# this login, docker pull returns 401 unauthorized and jf docker scan
+# fails with "reference does not exist". For prescan (public upstream)
+# the login is harmless — public pulls work either way.
+# shellcheck source=../lib/docker-login.sh
+. "${REPO_ROOT}/scripts/lib/docker-login.sh"
+docker_login_for_xray_scan
+
 # ── Pre-pull image so `jf docker scan → docker save` finds it ──────
-if command -v docker >/dev/null 2>&1; then
-  echo "→ docker pull ${SCAN_REF}"
-  if ! docker pull "${SCAN_REF}" >/dev/null 2>/tmp/xray-vuln-pull.err; then
-    echo "WARN: docker pull failed — jf docker scan will likely fail too" >&2
-    sed 's/^/  /' /tmp/xray-vuln-pull.err >&2 || true
-  fi
-else
-  echo "WARN: docker CLI not on PATH — jf docker scan needs local docker" >&2
+if ! command -v docker >/dev/null 2>&1; then
+  echo "ERROR: docker CLI not on PATH — jf docker scan needs local docker" >&2
+  exit 1
+fi
+echo "→ docker pull ${SCAN_REF}"
+if ! docker pull "${SCAN_REF}" >/dev/null 2>/tmp/xray-vuln-pull.err; then
+  echo "ERROR: docker pull failed — cannot scan a missing local image" >&2
+  echo "── pull error ──" >&2
+  sed 's/^/  /' /tmp/xray-vuln-pull.err >&2 || true
+  echo "  Check: registry credentials in env, network reachability, image ref correctness." >&2
+  exit 1
 fi
 
 # ── Run the scan ────────────────────────────────────────────────────
@@ -177,9 +189,14 @@ SCAN_RC=$?
 set -e
 
 if [ ! -s "${SCAN_FILE}" ]; then
-  echo "WARN: jf docker scan produced no output (rc=${SCAN_RC}) — continuing" >&2
+  echo "ERROR: jf docker scan produced no output (rc=${SCAN_RC})" >&2
+  echo "── stderr ──" >&2
   sed 's/^/  /' /tmp/xray-vuln.err >&2 || true
-  exit 0
+  echo "  Common causes: image not pulled into local daemon, Xray service" >&2
+  echo "  unreachable, or credentials wrong. The job will fail visibly so" >&2
+  echo "  the gap is noticed (allow_failure: true at the CI level still" >&2
+  echo "  prevents this from blocking downstream jobs)." >&2
+  exit 1
 fi
 echo "  ✓ vuln scan: ${SCAN_FILE} ($(wc -c < "${SCAN_FILE}") bytes, rc=${SCAN_RC})"
 
