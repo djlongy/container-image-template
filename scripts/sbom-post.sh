@@ -42,6 +42,19 @@
 #     ARTIFACTORY_SBOM_REPO     generic repo name (must be Xray-
 #                               indexed), e.g. "sboms-local"
 #
+#   Splunk HEC (audit-trail ingestion; the SBOM goes inside the HEC
+#   `event` field, sourcetype defaults to "cyclonedx:json" — vendor-
+#   neutral so the same sourcetype handles Syft-, Xray-, and Trivy-
+#   generated SBOMs):
+#     SPLUNK_HEC_URL            HEC base URL (we append /services/collector
+#                               if missing). e.g. https://splunk.example.com:8088
+#     SPLUNK_HEC_TOKEN          HEC token. Sent as `Authorization: Splunk <token>`.
+#     SPLUNK_HEC_INDEX          target index. Default: main
+#     SPLUNK_SBOM_SOURCETYPE    sourcetype tag. Default: cyclonedx:json
+#                               (separate from SPLUNK_HEC_SOURCETYPE which
+#                               xray-scan-post.sh uses for vuln events)
+#     SPLUNK_HEC_INSECURE       "true" → curl -k. Default: false
+#
 # Extending:
 #   To add another sink (Snyk, GitLab Security Dashboard, Kafka, etc.)
 #   drop a new block below following the same pattern — guard on the
@@ -220,6 +233,76 @@ for r in d.get('results',[]):
   fi
 fi
 
+# ── Splunk HEC ──────────────────────────────────────────────────────
+# Vendor-agnostic — this sink doesn't care if the SBOM came from Syft,
+# Xray, Trivy, or anything else, as long as it's CycloneDX. Each event
+# carries the source filename + image ref + git commit so consumers
+# can correlate across multiple generators.
+if [ -n "${SPLUNK_HEC_URL:-}" ] && [ -n "${SPLUNK_HEC_TOKEN:-}" ]; then
+  HEC_URL="${SPLUNK_HEC_URL%/}"
+  case "${HEC_URL}" in
+    */services/collector|*/services/collector/event) ;;
+    *) HEC_URL="${HEC_URL}/services/collector" ;;
+  esac
+
+  HEC_INDEX="${SPLUNK_HEC_INDEX:-main}"
+  HEC_SOURCETYPE="${SPLUNK_SBOM_SOURCETYPE:-cyclonedx:json}"
+  HEC_INSECURE_FLAG=""
+  [ "${SPLUNK_HEC_INSECURE:-false}" = "true" ] && HEC_INSECURE_FLAG="-k"
+
+  GIT_SHA_HEC="${GIT_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
+  IMAGE_REF_HEC="${IMAGE_REF:-${UPSTREAM_REGISTRY:-}/${UPSTREAM_IMAGE:-}:${UPSTREAM_TAG:-}}"
+
+  echo "→ POST SBOM to Splunk HEC: ${HEC_URL} (sourcetype=${HEC_SOURCETYPE})"
+
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "  ✗ jq required for Splunk HEC envelope construction" >&2
+    failures=$((failures + 1))
+  else
+    HEC_PAYLOAD=$(jq -nc \
+      --arg sourcetype "${HEC_SOURCETYPE}" \
+      --arg index      "${HEC_INDEX}" \
+      --arg source     "container-image-template/sbom-post.sh" \
+      --arg host       "${HOSTNAME:-$(uname -n)}" \
+      --arg sbom_file  "${SBOM_FILE##*/}" \
+      --arg image      "${IMAGE_REF_HEC}" \
+      --arg gitsha     "${GIT_SHA_HEC}" \
+      --slurpfile bom  "${SBOM_FILE}" \
+      '{
+         sourcetype: $sourcetype,
+         index:      $index,
+         source:     $source,
+         host:       $host,
+         event: {
+           sbom_file:     $sbom_file,
+           scanned_image: $image,
+           git_commit:    $gitsha,
+           cyclonedx:     $bom[0]
+         }
+       }')
+
+    HEC_HTTP_CODE=$(curl -sS -o ${_SBOM_TMPDIR}/hec-response.txt -w '%{http_code}' \
+      ${HEC_INSECURE_FLAG} \
+      -X POST "${HEC_URL}" \
+      -H "Authorization: Splunk ${SPLUNK_HEC_TOKEN}" \
+      -H 'Content-Type: application/json' \
+      --data-binary "${HEC_PAYLOAD}" \
+      || echo '000')
+    case "${HEC_HTTP_CODE}" in
+      2*)
+        echo "  ✓ posted to Splunk HEC (HTTP ${HEC_HTTP_CODE})"
+        did_post=$((did_post + 1))
+        ;;
+      *)
+        # Audit shipping is non-blocking — warn but don't fail the
+        # whole sbom-post run. Other sinks may still want to succeed.
+        echo "  WARN: Splunk HEC POST failed (HTTP ${HEC_HTTP_CODE}) — continuing" >&2
+        sed 's/^/    /' ${_SBOM_TMPDIR}/hec-response.txt >&2 2>/dev/null || true
+        ;;
+    esac
+  fi
+fi
+
 # ── Summary ─────────────────────────────────────────────────────────
 if [ ${did_post} -eq 0 ] && [ ${failures} -eq 0 ]; then
   echo ""
@@ -228,6 +311,7 @@ if [ ${did_post} -eq 0 ] && [ ${failures} -eq 0 ]; then
   echo "    - SBOM_WEBHOOK_URL (+ optional SBOM_WEBHOOK_AUTH_HEADER)"
   echo "    - DEPENDENCY_TRACK_URL + DEPENDENCY_TRACK_API_KEY + DEPENDENCY_TRACK_PROJECT"
   echo "    - ARTIFACTORY_URL + ARTIFACTORY_USER + ARTIFACTORY_TOKEN/PASSWORD + ARTIFACTORY_SBOM_REPO"
+  echo "    - SPLUNK_HEC_URL + SPLUNK_HEC_TOKEN"
   echo "  SBOM was still generated and is available as a pipeline artifact."
   exit 0
 fi

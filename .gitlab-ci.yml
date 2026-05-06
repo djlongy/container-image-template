@@ -445,6 +445,7 @@ xray-audit:
   artifacts:
     paths:
       - xray-scan.json
+      - xray-sbom.cdx.json
     expire_in: 1 month
     when: always
   rules: *build-rules

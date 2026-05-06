@@ -353,6 +353,11 @@ Xray Audit:
       pattern: xray-scan.json
       shared: true
       required: false
+    - name: xray-sbom
+      location: .
+      pattern: xray-sbom.cdx.json
+      shared: true
+      required: false
   requirements:
     - system.docker.executable
 
