@@ -123,9 +123,12 @@ if ! command -v jf >/dev/null 2>&1; then
   fi
 fi
 
-# ── Configure jf to talk to Artifactory ────────────────────────────
-# Sanitise URL: strip trailing slash, ensure single /artifactory suffix.
-_url="${ARTIFACTORY_URL%/}"
+# ── Configure jf to talk to the SCAN-side Artifactory ─────────────
+# Uses SCAN_ART_* (which already resolved XRAY_ARTIFACTORY_* with
+# fallback to ARTIFACTORY_*) — NOT the bare ARTIFACTORY_* names. That
+# distinction matters when push-side Artifactory has no Xray license
+# (e.g. JCR Free) and a separate scan-side instance has it (Pro/Cloud).
+_url="${SCAN_ART_URL%/}"
 if [[ "${_url}" == */artifactory ]]; then
   _art_url="${_url}"
   _platform_url="${_url%/artifactory}"
@@ -134,17 +137,19 @@ else
   _platform_url="${_url}"
 fi
 
-if [ -n "${ARTIFACTORY_TOKEN:-}" ]; then
-  _auth_flag="--access-token=${ARTIFACTORY_TOKEN}"
+if [ -n "${SCAN_ART_TOKEN}" ]; then
+  _auth_flag="--access-token=${SCAN_ART_TOKEN}"
 else
-  _auth_flag="--password=${ARTIFACTORY_PASSWORD}"
+  _auth_flag="--password=${SCAN_ART_PASSWORD}"
 fi
+
+echo "→ jf config add xray-scan-post-server (url=${_platform_url}, user=${SCAN_ART_USER})"
 
 # shellcheck disable=SC2086
 jf config add xray-scan-post-server \
   --url="${_platform_url}" \
   --artifactory-url="${_art_url}" \
-  --user="${ARTIFACTORY_USER}" \
+  --user="${SCAN_ART_USER}" \
   ${_auth_flag} \
   --interactive=false \
   --overwrite=true >/dev/null
