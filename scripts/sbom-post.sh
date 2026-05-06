@@ -67,6 +67,8 @@
 
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 SBOM_FILE="${1:-sbom.cdx.json}"
 
 if [ ! -f "${SBOM_FILE}" ]; then
@@ -233,77 +235,37 @@ for r in d.get('results',[]):
   fi
 fi
 
-# ── Splunk HEC ──────────────────────────────────────────────────────
-# Vendor-agnostic — this sink doesn't care if the SBOM came from Syft,
-# Xray, Trivy, or anything else, as long as it's CycloneDX. Each event
-# carries the source filename + image ref + git commit so consumers
-# can correlate across multiple generators.
+# ── Splunk HEC (via shared lib) ─────────────────────────────────────
+# Vendor-agnostic: same sourcetype handles Syft-, Xray-, or Trivy-made
+# SBOMs. Build the event content (sbom_file + image + git_commit +
+# the BOM nested under .cyclonedx) and hand to the shared poster.
 if [ -n "${SPLUNK_HEC_URL:-}" ] && [ -n "${SPLUNK_HEC_TOKEN:-}" ]; then
-  HEC_URL="${SPLUNK_HEC_URL%/}"
-  case "${HEC_URL}" in
-    */services/collector|*/services/collector/event) ;;
-    *) HEC_URL="${HEC_URL}/services/collector" ;;
-  esac
+  if command -v jq >/dev/null 2>&1; then
+    IMAGE_REF_HEC="${IMAGE_REF:-${UPSTREAM_REGISTRY:-}/${UPSTREAM_IMAGE:-}:${UPSTREAM_TAG:-}}"
+    GIT_SHA_HEC="${GIT_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
+    jq -nc \
+      --arg sbom_file "${SBOM_FILE##*/}" \
+      --arg image     "${IMAGE_REF_HEC}" \
+      --arg gitsha    "${GIT_SHA_HEC}" \
+      --slurpfile bom "${SBOM_FILE}" \
+      '{
+         sbom_file:     $sbom_file,
+         scanned_image: $image,
+         git_commit:    $gitsha,
+         cyclonedx:     $bom[0]
+       }' > "${_SBOM_TMPDIR}/hec-event.json"
 
-  HEC_INDEX="${SPLUNK_HEC_INDEX:-main}"
-  HEC_SOURCETYPE="${SPLUNK_SBOM_SOURCETYPE:-cyclonedx:json}"
-  HEC_INSECURE_FLAG=""
-  [ "${SPLUNK_HEC_INSECURE:-false}" = "true" ] && HEC_INSECURE_FLAG="-k"
-
-  GIT_SHA_HEC="${GIT_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
-  IMAGE_REF_HEC="${IMAGE_REF:-${UPSTREAM_REGISTRY:-}/${UPSTREAM_IMAGE:-}:${UPSTREAM_TAG:-}}"
-
-  echo "→ POST SBOM to Splunk HEC: ${HEC_URL} (sourcetype=${HEC_SOURCETYPE})"
-
-  if ! command -v jq >/dev/null 2>&1; then
+    # shellcheck source=lib/splunk-hec.sh
+    . "${REPO_ROOT}/scripts/lib/splunk-hec.sh"
+    if splunk_hec_post "${_SBOM_TMPDIR}/hec-event.json" \
+         "${SPLUNK_SBOM_SOURCETYPE:-cyclonedx:json}"; then
+      did_post=$((did_post + 1))
+    fi
+    # POST failure stays a warning (already logged by splunk_hec_post);
+    # we don't bump `failures` so other sinks can still succeed.
+  else
     echo "  ✗ jq required for Splunk HEC envelope construction" >&2
     failures=$((failures + 1))
-  else
-    # Write payload to a tmp FILE (not via "$VAR") because SBOM
-    # envelopes routinely exceed the OS argv limit (E2BIG / "Argument
-    # list too long" — Linux ARG_MAX minus env is often <500 KB).
-    # `--data-binary @file` avoids the limit entirely.
-    jq -nc \
-      --arg sourcetype "${HEC_SOURCETYPE}" \
-      --arg index      "${HEC_INDEX}" \
-      --arg source     "container-image-template/sbom-post.sh" \
-      --arg host       "${HOSTNAME:-$(uname -n)}" \
-      --arg sbom_file  "${SBOM_FILE##*/}" \
-      --arg image      "${IMAGE_REF_HEC}" \
-      --arg gitsha     "${GIT_SHA_HEC}" \
-      --slurpfile bom  "${SBOM_FILE}" \
-      '{
-         sourcetype: $sourcetype,
-         index:      $index,
-         source:     $source,
-         host:       $host,
-         event: {
-           sbom_file:     $sbom_file,
-           scanned_image: $image,
-           git_commit:    $gitsha,
-           cyclonedx:     $bom[0]
-         }
-       }' > ${_SBOM_TMPDIR}/hec-payload.json
-
-    HEC_HTTP_CODE=$(curl -sS -o ${_SBOM_TMPDIR}/hec-response.txt -w '%{http_code}' \
-      ${HEC_INSECURE_FLAG} \
-      -X POST "${HEC_URL}" \
-      -H "Authorization: Splunk ${SPLUNK_HEC_TOKEN}" \
-      -H 'Content-Type: application/json' \
-      --data-binary "@${_SBOM_TMPDIR}/hec-payload.json" \
-      || echo '000')
-    case "${HEC_HTTP_CODE}" in
-      2*)
-        echo "  ✓ posted to Splunk HEC (HTTP ${HEC_HTTP_CODE})"
-        did_post=$((did_post + 1))
-        ;;
-      *)
-        # Audit shipping is non-blocking — warn but don't fail the
-        # whole sbom-post run. Other sinks may still want to succeed.
-        echo "  WARN: Splunk HEC POST failed (HTTP ${HEC_HTTP_CODE}) — continuing" >&2
-        sed 's/^/    /' ${_SBOM_TMPDIR}/hec-response.txt >&2 2>/dev/null || true
-        ;;
-    esac
   fi
 fi
 

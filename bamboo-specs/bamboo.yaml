@@ -108,7 +108,8 @@ stages:
       jobs:
         - SBOM
         - Grype
-        - Xray Audit
+        - Xray Vuln
+        - Xray SBOM
         # - Trivy   # Disabled: banned for business use.
   # - Sign:           # COMMENTED OUT — no cosign infra at work yet.
   #     jobs:        # Restore by uncommenting both this stage and the
@@ -308,13 +309,20 @@ Grype:
     - system.docker.executable
 
 # ═══════════════════════════════════════════════════════════════════
-# SCAN — Xray audit → Splunk
+# SCAN — Xray vuln + Xray SBOM (paired, run in parallel)
 # ═══════════════════════════════════════════════════════════════════
-# Runs `jf docker scan` against the upstream image and ships the
-# JSON to Splunk HEC for SecOps audit. No-op when SPLUNK_HEC_URL
-# or SPLUNK_HEC_TOKEN is unset (so the stage stays green before
-# Splunk is wired up).
-Xray Audit:
+# Two paired Xray jobs — both run in parallel under the Scan stage.
+# Each is single-responsibility:
+#   Xray Vuln  → jf docker scan --format=simple-json → xray-scan.json
+#                + Splunk HEC POST (sourcetype=jfrog:xray:scan)
+#   Xray SBOM  → jf docker scan --format=cyclonedx --sbom → xray-sbom.cdx.json
+#                + sbom-post.sh (Splunk + DT + Artifactory + webhook)
+#
+# Both scripts source scripts/lib/load-image-env.sh which auto-imports
+# every bamboo_* env var → bare name. The shim block in each task
+# only re-exports vars whose Bamboo global-var name DIFFERS from what
+# the script expects (svc_* prefixed service-account creds).
+Xray Vuln:
   tasks:
     - artifact-download:
         artifacts:
@@ -328,29 +336,43 @@ Xray Audit:
             . ./build.env
             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
 
-            # Splunk + Artifactory secrets via global-var shim.
-            # ARTIFACTORY_URL / _PROJECT come straight from bamboo
-            # plan vars (no rename) — re-export here because this
-            # script doesn't go through build.sh's auto-importer.
-            export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
-            export SPLUNK_HEC_URL="${bamboo_SPLUNK_HEC_URL:-}"
-            export SPLUNK_HEC_INDEX="${bamboo_SPLUNK_HEC_INDEX:-}"
-            export SPLUNK_HEC_SOURCETYPE="${bamboo_SPLUNK_HEC_SOURCETYPE:-}"
+            # Renamed shared globals → script-expected names. Everything
+            # else (URLs, install paths) flows through the auto-importer
+            # inside the script itself.
             export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
             export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
-            export ARTIFACTORY_URL="${bamboo_ARTIFACTORY_URL:-}"
-            export ARTIFACTORY_PROJECT="${bamboo_ARTIFACTORY_PROJECT:-}"
-            export JF_BINARY_URL="${bamboo_JF_BINARY_URL:-}"
-            export JF_DEB_URL="${bamboo_JF_DEB_URL:-}"
-            export JF_RPM_URL="${bamboo_JF_RPM_URL:-}"
+            export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
 
-            bash ./scripts/xray-scan-post.sh
+            bash ./scripts/scan/xray-vuln.sh
   artifacts:
     - name: xray-scan
       location: .
       pattern: xray-scan.json
       shared: true
       required: false
+  requirements:
+    - system.docker.executable
+
+Xray SBOM:
+  tasks:
+    - artifact-download:
+        artifacts:
+          - name: build-env
+            destination: .
+    - script:
+        interpreter: BASH
+        scripts:
+          - |-
+            set -euo pipefail
+            . ./build.env
+            [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
+
+            bash ./scripts/scan/xray-sbom.sh
+  artifacts:
     - name: xray-sbom
       location: .
       pattern: xray-sbom.cdx.json

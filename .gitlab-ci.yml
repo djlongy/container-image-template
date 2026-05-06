@@ -427,19 +427,15 @@ grype:
   rules: *build-rules
 
 # ═══════════════════════════════════════════════════════════════════
-# SCAN — Xray audit → Splunk
+# SCAN — Xray vuln scan → Splunk (one of two paired Xray jobs)
 # ═══════════════════════════════════════════════════════════════════
 # Runs `jf docker scan --format=simple-json` against the upstream
-# image and ships the JSON to Splunk HEC for SecOps audit trail. The
-# script is a no-op when SPLUNK_HEC_URL or SPLUNK_HEC_TOKEN is unset,
-# so this stage stays green before Splunk is wired up — set both as
-# group-level CI variables to enable.
-xray-audit:
+# image, produces xray-scan.json, ships JSON to Splunk HEC. The
+# script is a no-op when scan-side Artifactory creds are unset.
+# Pairs with xray-sbom (CycloneDX SBOM) — they run in parallel.
+xray-vuln:
   stage: scan
   image: ${DOCKER_CLI_IMAGE}
-  # `jf docker scan` calls `docker save` on the local daemon, so the
-  # job needs a docker:dind sidecar (same shape as the build job).
-  # The script handles `docker pull` itself before scanning.
   services:
     - name: ${DOCKER_DIND_IMAGE}
       alias: docker
@@ -449,17 +445,46 @@ xray-audit:
   before_script:
     - *install-tools
   script:
-    - bash ./scripts/xray-scan-post.sh
+    - bash ./scripts/scan/xray-vuln.sh
   artifacts:
     paths:
       - xray-scan.json
+    expire_in: 1 month
+    when: always
+  rules: *build-rules
+  # Audit shipping is non-blocking — Splunk outage / Xray-side outage
+  # shouldn't fail the pipeline. Script warns + exits 0; this flag is
+  # belt-and-suspenders for any other unexpected error.
+  allow_failure: true
+
+# ═══════════════════════════════════════════════════════════════════
+# SCAN — Xray CycloneDX SBOM → sbom-post sinks (Splunk, DT, etc.)
+# ═══════════════════════════════════════════════════════════════════
+# Runs `jf docker scan --format=cyclonedx --sbom` against the upstream
+# image, produces xray-sbom.cdx.json, hands off to sbom-post.sh which
+# ships to every configured sink (Splunk, Dependency-Track, Artifactory,
+# webhook). Default ON because Xray is the only approved SBOM source
+# while Trivy is banned and Syft awaits security review. Disable via
+# XRAY_GENERATE_SBOM=false in image.env when Syft is producing the BOM.
+xray-sbom:
+  stage: scan
+  image: ${DOCKER_CLI_IMAGE}
+  services:
+    - name: ${DOCKER_DIND_IMAGE}
+      alias: docker
+  needs:
+    - job: build
+      artifacts: true
+  before_script:
+    - *install-tools
+  script:
+    - bash ./scripts/scan/xray-sbom.sh
+  artifacts:
+    paths:
       - xray-sbom.cdx.json
     expire_in: 1 month
     when: always
   rules: *build-rules
-  # Audit shipping is non-blocking: a Splunk outage shouldn't fail
-  # the pipeline. The script itself warns + exits 0 on POST failure;
-  # this is belt-and-suspenders for any other unexpected error.
   allow_failure: true
 
 # ═══════════════════════════════════════════════════════════════════

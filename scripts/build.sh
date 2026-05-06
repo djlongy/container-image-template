@@ -79,22 +79,20 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
 # ════════════════════════════════════════════════════════════════════
-# Debug logging
+# Shared lib: image.env loader + bamboo_* importer + _dbg
 # ════════════════════════════════════════════════════════════════════
-# Set BUILD_DEBUG=true to get verbose, "why did this happen?" echoes
-# at every decision point — which file was sourced, which env var
-# came from where, why a default was applied, why a tool install was
-# attempted, etc. Off by default to keep normal build logs clean.
+# scripts/lib/load-image-env.sh provides:
+#   _dbg <msg>            — debug echo (BUILD_DEBUG=true to enable)
+#   import_bamboo_vars    — translate bamboo_* env vars to bare names
+#   load_image_env        — source ./image.env (REQUIRED), apply
+#                           shell-set overrides on top
 #
-# Usage:
-#   BUILD_DEBUG=true ./scripts/build.sh --push
-#
-# In CI: set BUILD_DEBUG=true as a plan/pipeline variable to flip it
-# without editing image.env.
-_dbg() {
-  [ "${BUILD_DEBUG:-false}" = "true" ] && echo "  [debug] $*" >&2
-  return 0
-}
+# Sourced once here. Other scripts (scan/xray-vuln.sh, scan/xray-sbom.sh,
+# sbom-post.sh) source the same lib so all config loading goes through
+# the same code path — same precedence, same debug logs, same fail-fast
+# message on missing image.env.
+# shellcheck source=lib/load-image-env.sh
+. "${REPO_ROOT}/scripts/lib/load-image-env.sh"
 
 # ════════════════════════════════════════════════════════════════════
 # PHASE 0 — Argument parsing
@@ -177,130 +175,22 @@ _build_parse_args() {
 }
 
 # ════════════════════════════════════════════════════════════════════
-# PHASE 1 — Config loading
+# PHASE 1 — Config loading (delegated to scripts/lib/load-image-env.sh)
 # ════════════════════════════════════════════════════════════════════
 # image.env is the SINGLE source of truth. It MUST exist or the build
 # fails — image.env.example is a TEMPLATE you copy from on first
-# checkout, never sourced as real config. (Reason: when the template
-# was a silent fallback, devs sometimes left it un-touched and were
-# confused why "their" REMEDIATE=false setting wasn't being honored —
-# they were editing image.env locally but the CI agent only had the
-# template's defaults. Failing fast removes the ambiguity.)
+# checkout, never sourced as real config.
 #
 # Two-layer precedence:
 #   1. image.env          — committed canonical config (REQUIRED)
 #   2. Shell / CI env     — always wins, for pipeline-level overrides
 #
 # Bamboo bonus: any env var named `bamboo_FOO` is auto-imported as
-# `FOO` before the snapshot, so plan vars and global vars Just Work
-# without a hand-written relay block in bamboo.yaml. Bamboo exposes
-# both plan vars and System → Global vars under the same prefix.
+# `FOO` before the snapshot via import_bamboo_vars (also in the lib).
 #
-# We snapshot the shell env first, then source image.env, then
-# re-apply the snapshot so exports still take precedence.
-
-# Translate every shell variable named `bamboo_<NAME>` into a bare
-# `<NAME>` export, so build.sh can be invoked as `./scripts/build.sh
-# --push` from a Bamboo task without a hand-written relay block.
-#
-# Only auto-imports vars that aren't already set under the bare name
-# (so an explicit `export REMEDIATE=true` in the task script wins
-# over a bamboo_REMEDIATE plan var, matching the precedence the rest
-# of the script assumes).
-#
-# For renamed vars (e.g. shared global `svc_artifactory_token` →
-# script-expected `ARTIFACTORY_TOKEN`), still write a one-line
-# `export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-}"` in
-# the bamboo.yaml task — the auto-import only handles exact-match.
-_build_import_bamboo_vars() {
-  # Only relevant in Bamboo (where bamboo_* env vars are set). On a
-  # GitLab runner or local shell this is a fast no-op.
-  local __bv __bare __count=0
-  while IFS= read -r __bv; do
-    [ -z "${__bv}" ] && continue
-    __bare="${__bv#bamboo_}"
-    # Don't override an already-set bare var (explicit shell export
-    # wins over Bamboo plan-var auto-import).
-    if [ -n "${!__bare-}" ]; then
-      _dbg "bamboo import skip: ${__bare} already set in shell"
-      continue
-    fi
-    # Use indirect expansion to read the bamboo_* value.
-    eval "export ${__bare}=\"\${${__bv}}\""
-    __count=$((__count+1))
-    _dbg "bamboo import: ${__bv} → ${__bare}"
-  done < <(env | grep -oE '^bamboo_[A-Za-z_][A-Za-z0-9_]*' || true)
-
-  if [ "${__count}" -gt 0 ]; then
-    echo "→ Auto-imported ${__count} bamboo_* env var(s) → bare names"
-    _dbg "(set BUILD_DEBUG=true to see the per-var breakdown)"
-  fi
-}
-
-_build_load_image_env() {
-  local __v __line
-  __SHELL_OVERRIDES=""
-  for __v in IMAGE_NAME DISTRO \
-             UPSTREAM_REGISTRY UPSTREAM_IMAGE UPSTREAM_TAG \
-             REMEDIATE INJECT_CERTS ORIGINAL_USER \
-             PUSH_REGISTRY PUSH_PROJECT VENDOR AUTHORS \
-             APK_MIRROR APT_MIRROR CA_CERT \
-             REGISTRY_KIND \
-             ARTIFACTORY_URL ARTIFACTORY_USER ARTIFACTORY_PASSWORD ARTIFACTORY_TOKEN \
-             ARTIFACTORY_PRO ARTIFACTORY_PROJECT \
-             ARTIFACTORY_TEAM ARTIFACTORY_ENVIRONMENT ARTIFACTORY_PUSH_HOST \
-             ARTIFACTORY_IMAGE_REF ARTIFACTORY_MANIFEST_PATH \
-             ARTIFACTORY_BUILD_NAME ARTIFACTORY_BUILD_NUMBER ARTIFACTORY_PROPERTIES \
-             ARTIFACTORY_SBOM_REPO ARTIFACTORY_GRYPE_DB_REPO \
-             ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS \
-             ARTIFACTORY_XRAY_PRESCAN ARTIFACTORY_XRAY_POSTSCAN \
-             CRANE_URL SYFT_INSTALLER_URL SYFT_VERSION \
-             JF_BINARY_URL JF_DEB_URL JF_RPM_URL JF_INSTALL_DIR \
-             SBOM_GENERATE SBOM_TARGET SBOM_FILE \
-             APPEND_GIT_SHORT \
-             SPLUNK_HEC_URL SPLUNK_HEC_TOKEN SPLUNK_HEC_INDEX SPLUNK_HEC_SOURCETYPE \
-             VAULT_KV_MOUNT VAULT_CA_PATH; do
-    # Snapshot only when the var is set AND non-empty. Using the bare
-    # `+set` test let an empty-string export from the agent shell
-    # clobber a non-empty image.env value on replay. Empty-set vars
-    # carry no signal of intent, so let image.env win for those.
-    if [ -n "${!__v-}" ]; then
-      __SHELL_OVERRIDES="${__SHELL_OVERRIDES}${__v}=$(printf '%q' "${!__v}")"$'\n'
-      _dbg "shell-set override captured: ${__v}"
-    fi
-  done
-
-  if [ ! -f image.env ]; then
-    echo "ERROR: image.env not found at $(pwd)/image.env" >&2
-    echo "" >&2
-    echo "  image.env is the single source of truth for this build." >&2
-    echo "  image.env.example is a TEMPLATE — it is NOT sourced as a" >&2
-    echo "  fallback (was previously, but that masked config drift" >&2
-    echo "  between dev local edits and CI's untouched template)." >&2
-    echo "" >&2
-    echo "  To fix:" >&2
-    echo "    cp image.env.example image.env" >&2
-    echo "    \$EDITOR image.env       # adjust UPSTREAM_TAG, REMEDIATE, etc." >&2
-    echo "    git add image.env && git commit -m 'add image.env'" >&2
-    echo "" >&2
-    echo "  image.env is committed (intentionally — it's the per-fork config)." >&2
-    echo "  Keep secrets OUT of image.env; pass tokens via CI plan vars." >&2
-    return 1
-  fi
-  echo "→ Sourcing image.env"
-  _dbg "image.env present in $(pwd)"
-  # shellcheck disable=SC1091
-  . ./image.env
-
-  if [ -n "${__SHELL_OVERRIDES}" ]; then
-    _dbg "re-applying shell-set overrides on top of image.env"
-    while IFS= read -r __line; do
-      [ -z "${__line}" ] && continue
-      eval "export ${__line}"
-    done <<< "${__SHELL_OVERRIDES}"
-  fi
-  unset __SHELL_OVERRIDES
-}
+# Implementation lives in scripts/lib/load-image-env.sh and is shared
+# by all scripts that read image.env (xray-vuln.sh, xray-sbom.sh,
+# sbom-post.sh, etc.). See that file for the snapshot/restore details.
 
 # Validate required fields + apply defaults + lowercase-normalise
 # booleans so TRUE/True/true all work. Fails fast on missing required.
@@ -804,8 +694,8 @@ _build_generate_sbom() {
 # failure returns non-zero here and the orchestrator exits.
 
 _build_parse_args "$@"
-_build_import_bamboo_vars
-_build_load_image_env
+import_bamboo_vars   # from scripts/lib/load-image-env.sh
+load_image_env       # from scripts/lib/load-image-env.sh
 _build_apply_defaults_and_normalise
 
 _build_compute_tag
