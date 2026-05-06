@@ -200,6 +200,16 @@ if [ ! -s "${SCAN_FILE}" ]; then
 fi
 echo "  ✓ vuln scan: ${SCAN_FILE} ($(wc -c < "${SCAN_FILE}") bytes, rc=${SCAN_RC})"
 
+# ── Free disk: image tarball + indexer can each be 100s of MB ─────
+# `jf docker scan` writes the saved image to /tmp/jfrog.cli.temp.* and
+# downloads the Xray indexer + analyzer-manager (~300MB combined) on
+# first run. Across many scans on a long-lived runner these add up
+# and cause `no space left on device`. Clean up our own footprint.
+rm -rf /tmp/jfrog.cli.temp.* 2>/dev/null || true
+if command -v docker >/dev/null 2>&1; then
+  docker rmi -f "${SCAN_REF}" >/dev/null 2>&1 || true
+fi
+
 # ── Ship to Splunk HEC (no-op when unset) ─────────────────────────
 # Build the event content (scanned_image + git_commit + xray scan
 # nested under .xray) and hand to the shared poster.

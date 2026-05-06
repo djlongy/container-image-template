@@ -191,6 +191,12 @@ else
   echo "  ✓ Xray SBOM: ${SBOM_FILE_OUT} ($(wc -c < "${SBOM_FILE_OUT}") bytes, rc=${SBOM_RC})"
 fi
 
+# ── Free disk (mirrors xray-vuln.sh's cleanup) ─────────────────────
+rm -rf /tmp/jfrog.cli.temp.* 2>/dev/null || true
+if command -v docker >/dev/null 2>&1; then
+  docker rmi -f "${SCAN_REF}" >/dev/null 2>&1 || true
+fi
+
 # ── Hand off to sbom-post.sh ──────────────────────────────────────
 # sbom-post.sh is vendor-agnostic — same downstream sinks (Splunk
 # HEC, Dependency-Track, Artifactory, webhook) handle the Xray SBOM

@@ -488,6 +488,19 @@ _artifactory_require_tools() {
     echo "ERROR: 'docker' CLI not found on PATH" >&2
     missing=1
   fi
+  # python3 is ONLY needed by the Free-tier flow's hand-merged build-info
+  # publish (lib/build-info-merge.py + 5 inline `python3 -c '...'` JSON
+  # parsers). Pro tier uses `jf docker push` + `jf build-publish` which
+  # handle build-info natively — no python3 needed. Check matches the
+  # FREE/PRO dispatch in push_to_backend().
+  if [ "${ARTIFACTORY_PRO:-false}" != "true" ] && ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: 'python3' required for the Free-tier build-info merge flow" >&2
+    echo "       (build-info-merge.py + JSON parsers in artifactory.sh)" >&2
+    echo "       Install python3 (alpine: apk add python3) OR set ARTIFACTORY_PRO=true" >&2
+    echo "       if you have a Pro / Cloud Artifactory licence — that path uses jf's" >&2
+    echo "       native build-info publishing and doesn't need python3." >&2
+    missing=1
+  fi
   return "${missing}"
 }
 
