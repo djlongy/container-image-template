@@ -8,10 +8,10 @@
 # change required.
 #
 # ── Where do the sink env vars come from? ────────────────────────────
-# Any of: shell / CI env, image.env (gitignored), or image.env.example
-# (tracked). Precedence: shell > image.env > image.env.example. In CI
-# these are typically masked group/project variables; locally they
-# usually sit in image.env. See image.env.example for descriptions.
+# Either shell / CI env or image.env (committed). Precedence: shell
+# beats file. In CI these are typically masked group/project variables;
+# locally they sit in image.env. See image.env.example for descriptions
+# (template only — image.env.example is never read by the build).
 # This script doesn't source anything itself — callers export the
 # relevant vars (or let build.sh's shell-snapshot propagate them) and
 # then invoke `./scripts/sbom-post.sh <cdx.json>`.

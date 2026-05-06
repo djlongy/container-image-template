@@ -179,10 +179,17 @@ _build_parse_args() {
 # ════════════════════════════════════════════════════════════════════
 # PHASE 1 — Config loading
 # ════════════════════════════════════════════════════════════════════
-# image.env is the single source of truth. Three-layer precedence:
-#   1. image.env.example  — committed reference template
-#   2. image.env          — committed canonical config (preferred)
-#   3. Shell / CI env     — always wins, for pipeline-level overrides
+# image.env is the SINGLE source of truth. It MUST exist or the build
+# fails — image.env.example is a TEMPLATE you copy from on first
+# checkout, never sourced as real config. (Reason: when the template
+# was a silent fallback, devs sometimes left it un-touched and were
+# confused why "their" REMEDIATE=false setting wasn't being honored —
+# they were editing image.env locally but the CI agent only had the
+# template's defaults. Failing fast removes the ambiguity.)
+#
+# Two-layer precedence:
+#   1. image.env          — committed canonical config (REQUIRED)
+#   2. Shell / CI env     — always wins, for pipeline-level overrides
 #
 # Bamboo bonus: any env var named `bamboo_FOO` is auto-imported as
 # `FOO` before the snapshot, so plan vars and global vars Just Work
@@ -263,22 +270,27 @@ _build_load_image_env() {
     fi
   done
 
-  local _image_env_file=""
-  if [ -f image.env ]; then
-    _image_env_file="image.env"
-    _dbg "image.env present in $(pwd)"
-  elif [ -f image.env.example ]; then
-    _image_env_file="image.env.example"
-    _dbg "image.env not found — falling back to image.env.example"
-  else
-    echo "ERROR: neither image.env nor image.env.example found at repo root" >&2
-    echo "       cwd=$(pwd)" >&2
-    echo "       One of these files declares what image the repo builds." >&2
+  if [ ! -f image.env ]; then
+    echo "ERROR: image.env not found at $(pwd)/image.env" >&2
+    echo "" >&2
+    echo "  image.env is the single source of truth for this build." >&2
+    echo "  image.env.example is a TEMPLATE — it is NOT sourced as a" >&2
+    echo "  fallback (was previously, but that masked config drift" >&2
+    echo "  between dev local edits and CI's untouched template)." >&2
+    echo "" >&2
+    echo "  To fix:" >&2
+    echo "    cp image.env.example image.env" >&2
+    echo "    \$EDITOR image.env       # adjust UPSTREAM_TAG, REMEDIATE, etc." >&2
+    echo "    git add image.env && git commit -m 'add image.env'" >&2
+    echo "" >&2
+    echo "  image.env is committed (intentionally — it's the per-fork config)." >&2
+    echo "  Keep secrets OUT of image.env; pass tokens via CI plan vars." >&2
     return 1
   fi
-  echo "→ Sourcing ${_image_env_file}"
-  # shellcheck disable=SC1090
-  . "./${_image_env_file}"
+  echo "→ Sourcing image.env"
+  _dbg "image.env present in $(pwd)"
+  # shellcheck disable=SC1091
+  . ./image.env
 
   if [ -n "${__SHELL_OVERRIDES}" ]; then
     _dbg "re-applying shell-set overrides on top of ${_image_env_file}"

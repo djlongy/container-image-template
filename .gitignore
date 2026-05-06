@@ -2,11 +2,11 @@
 build.env
 *.log
 
-# image.env IS the canonical, committed config — image.env.example is
-# the reference template you copy from on first checkout. Both are in
-# the repo; build.sh prefers image.env, falls back to image.env.example.
-# Secret values (tokens, passwords) MUST stay out of image.env — pass
-# those via CI plan vars / GitLab CI variables instead.
+# image.env IS the canonical, committed config (required). image.env.example
+# is a TEMPLATE only — never sourced by the build. First-time setup:
+#   cp image.env.example image.env  &&  $EDITOR image.env  &&  git add image.env
+# Secrets (tokens, passwords) MUST stay out of image.env — pass those
+# via CI plan vars / GitLab CI variables instead.
 
 # CA certificates and key material — injected at build time, never committed
 certs/*.crt

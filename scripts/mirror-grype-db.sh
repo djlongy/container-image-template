@@ -13,10 +13,10 @@
 #   - On a cron schedule (GitLab scheduled pipeline) for daily freshness
 #
 # ── Where do the env vars come from? ─────────────────────────────────
-# Any of: shell / CI env, image.env (gitignored), or image.env.example
-# (tracked). Precedence: shell > image.env > image.env.example. CI
-# typically uses masked group/project variables; local runs can
-# populate image.env. See image.env.example for descriptions.
+# Either shell / CI env or image.env (committed). Precedence: shell
+# beats file. CI typically uses masked group/project variables; local
+# runs can populate image.env. (image.env.example is a template only,
+# never sourced — see image.env.example for documented descriptions.)
 #
 # Required variables:
 #   ARTIFACTORY_URL          e.g. https://artifactory.example.com

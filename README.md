@@ -47,26 +47,32 @@ fleet fabric:
 ## Quick start — fork and rebrand
 
 **One file defines what this repo builds.** Everything about the
-image — upstream registry/image/tag, behavior toggles — lives in a
-single `image.env.example`. The Dockerfile and `scripts/build.sh` are
-generic; they read this file and pass values through as `--build-arg`.
-The upstream tag IS the version; the pushed tag is
-`<UPSTREAM_TAG>-<gitShort>`. No internal semver.
+image — upstream registry/image/tag, behavior toggles — lives in
+`image.env`. The Dockerfile and `scripts/build.sh` are generic; they
+read this file and pass values through as `--build-arg`. The upstream
+tag IS the version; the pushed tag is `<UPSTREAM_TAG>-<gitShort>`.
+No internal semver.
+
+`image.env.example` is a **template only**. The build never reads it
+— if `image.env` doesn't exist the build fails fast with a clear "copy
+the template" message. (Previous versions silently fell back, which
+masked dev-vs-CI config drift; we made it strict on purpose.)
 
 ```bash
 # 1. Clone as a new per-image repo
 git clone <this-repo-url> my-app
 cd my-app
 
-# 2. Edit THE ONE FILE
-$EDITOR image.env.example
+# 2. Materialise image.env from the template, then edit
+cp image.env.example image.env
+$EDITOR image.env
 #    UPSTREAM_REGISTRY    docker.io/library (or your Artifactory proxy)
 #    UPSTREAM_IMAGE       nginx
 #    UPSTREAM_TAG         1.25.3-alpine  (Renovate auto-bumps via hint)
 #    IMAGE_NAME           optional — defaults to UPSTREAM_IMAGE
 #    DISTRO               alpine | debian | ubuntu | ubi
-#    REMEDIATE            true / false
-#    INJECT_CERTS         true / false
+#    REMEDIATE            true / false  (default false — opt in)
+#    INJECT_CERTS         true / false  (default false)
 #    ORIGINAL_USER        root / nginx / whatever upstream expects
 
 # 3. (Optional) If your upstream uses a distro family not covered
@@ -74,37 +80,40 @@ $EDITOR image.env.example
 #    scripts/remediate/<distro>.sh and set DISTRO=<distro>.
 #    The Dockerfile doesn't need any edit.
 
-# 4. Sanity-check locally (no push)
+# 4. Commit image.env (it's the per-fork canonical config)
+git add image.env && git commit -m 'add image.env for <my-image>'
+
+# 5. Sanity-check locally (no push)
 ./scripts/build.sh
 
-# 5. Push to your own GitLab / Bamboo / GitHub and set CI variables
-#    (PUSH_REGISTRY, PUSH_PROJECT, credentials — see below)
+# 6. Push to GitLab / Bamboo / GitHub and set CI variables
+#    (secrets only — PUSH_REGISTRY_PASSWORD etc. — see below)
 ```
 
 ### image.env resolution order
 
-| Layer | File | Purpose |
+| Layer | Source | Purpose |
 |---|---|---|
-| 1 (fallback) | `image.env.example` *(tracked)* | Canonical template; what CI and fresh clones see |
-| 2 (override) | `image.env` *(gitignored)* | Optional per-dev file for local experimentation |
-| 3 (top) | shell / CI environment | Always wins; used by CI variable overrides |
+| 1 (base) | `image.env` *(committed, REQUIRED)* | Per-fork canonical config |
+| 2 (top) | shell / CI environment | Always wins; used by CI variable overrides |
 
-Fresh clones build with zero setup — `build.sh` falls through to
-`image.env.example` when no local `image.env` exists. Devs can
-`cp image.env.example image.env` and edit freely without touching
-committed state. CI overrides anything via plain env variables.
+`image.env.example` is **not** in the resolution order — it's a
+template you copy from on first checkout. If you delete `image.env`,
+the build fails. Secrets stay in CI plan vars (never committed to
+`image.env`).
 
 ### What you edit when forking, vs. what stays generic
 
 | File | Edit when forking? | Notes |
 |---|---|---|
-| `image.env.example` | **Always** | The whole image definition lives here |
+| `image.env` | **Always** (created from `image.env.example`) | The whole image definition lives here |
+| `image.env.example` | Only when adding new template-level documentation | Template / reference only — never sourced |
 | `scripts/extend/` | When you need app-specific RUN/COPY | Drop a `customise.sh` hook and/or `files/` directory — see `scripts/extend/README.md`. One surface for all fork-owned customisation |
 | `Dockerfile` | Only for rare multi-stage `COPY --from=…` patterns | Otherwise generic; extensions go in `scripts/extend/` |
 | `scripts/build.sh` | Never | Reads `image.env`, invokes buildx, handles backend dispatch |
-| `scripts/sbom-post.sh` | Only to add new SBOM sinks | Generic; 3 sinks built in |
+| `scripts/sbom-post.sh` | Only to add new SBOM sinks | Generic; 4 sinks built in (webhook, DT, Artifactory, Splunk HEC) |
 | `scripts/push-backends/artifactory.sh` | Never | Ported from monorepo, same layout templates |
-| `.gitlab-ci.yml`, `bamboo-specs/bamboo.yaml` | Only to change pipeline structure | Default flow: build → sbom → grype → sign → ingest → promote |
+| `.gitlab-ci.yml`, `bamboo-specs/bamboo.yaml` | Only to change pipeline structure | Default flow: build → sbom → grype → xray-audit → sign → ingest → promote |
 | `renovate.json` | Only to add more Renovate hints | Custom manager already wired for `UPSTREAM_TAG` in `image.env` |
 
 ## Required CI variables
