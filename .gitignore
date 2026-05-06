@@ -2,12 +2,11 @@
 build.env
 *.log
 
-# Local image.env override. image.env.example is the tracked template
-# and the fallback when no override is present. Copy and edit for
-# per-dev experiments without touching the committed version:
-#   cp image.env.example image.env
-#   $EDITOR image.env
-image.env
+# image.env IS the canonical, committed config — image.env.example is
+# the reference template you copy from on first checkout. Both are in
+# the repo; build.sh prefers image.env, falls back to image.env.example.
+# Secret values (tokens, passwords) MUST stay out of image.env — pass
+# those via CI plan vars / GitLab CI variables instead.
 
 # CA certificates and key material — injected at build time, never committed
 certs/*.crt

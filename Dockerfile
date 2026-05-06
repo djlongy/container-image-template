@@ -34,7 +34,13 @@ ARG UPSTREAM_IMAGE=nginx
 # Pinned default for safety; build.sh always overrides via --build-arg from image.env
 ARG UPSTREAM_TAG=1.29.8-alpine
 ARG INJECT_CERTS=false
-ARG REMEDIATE=true
+# REMEDIATE default is FALSE — safe-by-default. The remediate-true
+# stage only runs when build.sh (or a direct `docker build`) explicitly
+# passes `--build-arg REMEDIATE=true`. This guards against the case
+# where build.sh isn't used (e.g. someone runs `docker build .`
+# directly) or where image.env is missing — neither path will trigger
+# surprise package upgrades.
+ARG REMEDIATE=false
 ARG ORIGINAL_USER=root
 ARG DISTRO=alpine
 ARG APK_MIRROR=""

@@ -20,7 +20,11 @@
 #   UPSTREAM_TAG        default: read from Dockerfile's `ARG UPSTREAM_TAG=...`
 #   IMAGE_NAME          default: value of UPSTREAM_IMAGE
 #   INJECT_CERTS        default: false  — set true to run the certs-true stage
-#   REMEDIATE           default: true   — set false to skip apk upgrade
+#   REMEDIATE           default: false  — set true to run scripts/remediate/${DISTRO}.sh
+#                       (apk upgrade for alpine, apt-get upgrade for debian/ubuntu).
+#                       Default flipped from true → false to make the bare-minimum
+#                       build path safe: "pull → retag → push" with no surprises
+#                       when image.env is missing.
 #   ORIGINAL_USER       default: root
 #   VENDOR              default: example.com
 #   CA_CERT             PEM content of a CA cert to inject (writes to certs/
@@ -73,6 +77,24 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
+
+# ════════════════════════════════════════════════════════════════════
+# Debug logging
+# ════════════════════════════════════════════════════════════════════
+# Set BUILD_DEBUG=true to get verbose, "why did this happen?" echoes
+# at every decision point — which file was sourced, which env var
+# came from where, why a default was applied, why a tool install was
+# attempted, etc. Off by default to keep normal build logs clean.
+#
+# Usage:
+#   BUILD_DEBUG=true ./scripts/build.sh --push
+#
+# In CI: set BUILD_DEBUG=true as a plan/pipeline variable to flip it
+# without editing image.env.
+_dbg() {
+  [ "${BUILD_DEBUG:-false}" = "true" ] && echo "  [debug] $*" >&2
+  return 0
+}
 
 # ════════════════════════════════════════════════════════════════════
 # PHASE 0 — Argument parsing
@@ -158,12 +180,55 @@ _build_parse_args() {
 # PHASE 1 — Config loading
 # ════════════════════════════════════════════════════════════════════
 # image.env is the single source of truth. Three-layer precedence:
-#   1. image.env.example  — tracked, canonical, the template
-#   2. image.env          — gitignored, local override for dev work
-#   3. Shell / CI env     — always wins, for pipeline overrides
+#   1. image.env.example  — committed reference template
+#   2. image.env          — committed canonical config (preferred)
+#   3. Shell / CI env     — always wins, for pipeline-level overrides
+#
+# Bamboo bonus: any env var named `bamboo_FOO` is auto-imported as
+# `FOO` before the snapshot, so plan vars and global vars Just Work
+# without a hand-written relay block in bamboo.yaml. Bamboo exposes
+# both plan vars and System → Global vars under the same prefix.
 #
 # We snapshot the shell env first, then source image.env, then
 # re-apply the snapshot so exports still take precedence.
+
+# Translate every shell variable named `bamboo_<NAME>` into a bare
+# `<NAME>` export, so build.sh can be invoked as `./scripts/build.sh
+# --push` from a Bamboo task without a hand-written relay block.
+#
+# Only auto-imports vars that aren't already set under the bare name
+# (so an explicit `export REMEDIATE=true` in the task script wins
+# over a bamboo_REMEDIATE plan var, matching the precedence the rest
+# of the script assumes).
+#
+# For renamed vars (e.g. shared global `svc_artifactory_token` →
+# script-expected `ARTIFACTORY_TOKEN`), still write a one-line
+# `export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-}"` in
+# the bamboo.yaml task — the auto-import only handles exact-match.
+_build_import_bamboo_vars() {
+  # Only relevant in Bamboo (where bamboo_* env vars are set). On a
+  # GitLab runner or local shell this is a fast no-op.
+  local __bv __bare __count=0
+  while IFS= read -r __bv; do
+    [ -z "${__bv}" ] && continue
+    __bare="${__bv#bamboo_}"
+    # Don't override an already-set bare var (explicit shell export
+    # wins over Bamboo plan-var auto-import).
+    if [ -n "${!__bare-}" ]; then
+      _dbg "bamboo import skip: ${__bare} already set in shell"
+      continue
+    fi
+    # Use indirect expansion to read the bamboo_* value.
+    eval "export ${__bare}=\"\${${__bv}}\""
+    __count=$((__count+1))
+    _dbg "bamboo import: ${__bv} → ${__bare}"
+  done < <(env | grep -oE '^bamboo_[A-Za-z_][A-Za-z0-9_]*' || true)
+
+  if [ "${__count}" -gt 0 ]; then
+    echo "→ Auto-imported ${__count} bamboo_* env var(s) → bare names"
+    _dbg "(set BUILD_DEBUG=true to see the per-var breakdown)"
+  fi
+}
 
 _build_load_image_env() {
   local __v __line
@@ -183,20 +248,31 @@ _build_load_image_env() {
              ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS \
              ARTIFACTORY_XRAY_PRESCAN ARTIFACTORY_XRAY_POSTSCAN \
              CRANE_URL SYFT_INSTALLER_URL SYFT_VERSION \
+             JF_BINARY_URL JF_DEB_URL JF_RPM_URL JF_INSTALL_DIR \
              SBOM_GENERATE SBOM_TARGET SBOM_FILE \
+             APPEND_GIT_SHORT \
+             SPLUNK_HEC_URL SPLUNK_HEC_TOKEN SPLUNK_HEC_INDEX SPLUNK_HEC_SOURCETYPE \
              VAULT_KV_MOUNT VAULT_CA_PATH; do
-    if [ "${!__v+set}" = "set" ]; then
+    # Snapshot only when the var is set AND non-empty. Using the bare
+    # `+set` test let an empty-string export from the agent shell
+    # clobber a non-empty image.env value on replay. Empty-set vars
+    # carry no signal of intent, so let image.env win for those.
+    if [ -n "${!__v-}" ]; then
       __SHELL_OVERRIDES="${__SHELL_OVERRIDES}${__v}=$(printf '%q' "${!__v}")"$'\n'
+      _dbg "shell-set override captured: ${__v}"
     fi
   done
 
   local _image_env_file=""
   if [ -f image.env ]; then
     _image_env_file="image.env"
+    _dbg "image.env present in $(pwd)"
   elif [ -f image.env.example ]; then
     _image_env_file="image.env.example"
+    _dbg "image.env not found — falling back to image.env.example"
   else
     echo "ERROR: neither image.env nor image.env.example found at repo root" >&2
+    echo "       cwd=$(pwd)" >&2
     echo "       One of these files declares what image the repo builds." >&2
     return 1
   fi
@@ -205,6 +281,7 @@ _build_load_image_env() {
   . "./${_image_env_file}"
 
   if [ -n "${__SHELL_OVERRIDES}" ]; then
+    _dbg "re-applying shell-set overrides on top of ${_image_env_file}"
     while IFS= read -r __line; do
       [ -z "${__line}" ] && continue
       eval "export ${__line}"
@@ -222,9 +299,24 @@ _build_apply_defaults_and_normalise() {
   : "${UPSTREAM_IMAGE:?UPSTREAM_IMAGE must be set in image.env}"
   : "${UPSTREAM_TAG:?UPSTREAM_TAG must be set in image.env}"
 
+  # Defaults are SAFE-BY-DEFAULT: every optional behaviour is OFF
+  # unless explicitly turned on. The bare-minimum build path is
+  # "pull → retag → push" with no remediation, no cert injection,
+  # no Xray, no SBOM. This is deliberate — past versions defaulted
+  # REMEDIATE=true and people got surprise package upgrades when
+  # image.env was missing (e.g. fresh Bamboo checkouts where
+  # image.env was gitignored). Opt in via image.env, never have to
+  # opt out via troubleshooting.
+  [ -z "${IMAGE_NAME:-}"     ] && _dbg "default applied: IMAGE_NAME=${UPSTREAM_IMAGE} (was unset)"
+  [ -z "${DISTRO:-}"         ] && _dbg "default applied: DISTRO=alpine (was unset)"
+  [ -z "${REMEDIATE:-}"      ] && _dbg "default applied: REMEDIATE=false (was unset/empty — set REMEDIATE=true in image.env to run apk/apt upgrade)"
+  [ -z "${INJECT_CERTS:-}"   ] && _dbg "default applied: INJECT_CERTS=false (was unset/empty)"
+  [ -z "${ORIGINAL_USER:-}"  ] && _dbg "default applied: ORIGINAL_USER=root (was unset)"
+  [ -z "${VENDOR:-}"         ] && _dbg "default applied: VENDOR=example.com (was unset)"
+
   IMAGE_NAME="${IMAGE_NAME:-${UPSTREAM_IMAGE}}"
   DISTRO="${DISTRO:-alpine}"
-  REMEDIATE="${REMEDIATE:-true}"
+  REMEDIATE="${REMEDIATE:-false}"
   INJECT_CERTS="${INJECT_CERTS:-false}"
   ORIGINAL_USER="${ORIGINAL_USER:-root}"
   VENDOR="${VENDOR:-example.com}"
@@ -233,6 +325,8 @@ _build_apply_defaults_and_normalise() {
   INJECT_CERTS="$(printf '%s' "${INJECT_CERTS}"          | tr '[:upper:]' '[:lower:]')"
   SBOM_GENERATE="$(printf '%s' "${SBOM_GENERATE:-false}" | tr '[:upper:]' '[:lower:]')"
   SBOM_TARGET="$(printf '%s'   "${SBOM_TARGET:-image}"   | tr '[:upper:]' '[:lower:]')"
+
+  _dbg "resolved: REMEDIATE=${REMEDIATE} INJECT_CERTS=${INJECT_CERTS} DISTRO=${DISTRO} SBOM_GENERATE=${SBOM_GENERATE}"
 
   if [ "${REMEDIATE}" = "true" ] && [ ! -f "scripts/remediate/${DISTRO}.sh" ]; then
     echo "ERROR: REMEDIATE=true but scripts/remediate/${DISTRO}.sh does not exist" >&2
@@ -260,7 +354,24 @@ _build_compute_tag() {
     GIT_SHORT=$(git rev-parse --short=7 HEAD)
   fi
   CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  FULL_TAG="${UPSTREAM_TAG}-${GIT_SHORT}"
+
+  # APPEND_GIT_SHORT controls whether the pushed tag carries the
+  # git short SHA. Default true (build differentiation matters when
+  # rebuilding the same upstream tag). Set to false/0/no to keep the
+  # raw upstream tag — useful when UPSTREAM_TAG is a moving alias
+  # like "latest" or "stable" and you want the local image tag to
+  # mirror that exactly. Falsy values: false/False/FALSE/0/no/No/NO.
+  local _append="${APPEND_GIT_SHORT:-true}"
+  case "$(printf '%s' "${_append}" | tr '[:upper:]' '[:lower:]')" in
+    false|0|no|off)
+      FULL_TAG="${UPSTREAM_TAG}"
+      _dbg "APPEND_GIT_SHORT=${_append} → tag=${FULL_TAG} (no SHA suffix)"
+      ;;
+    *)
+      FULL_TAG="${UPSTREAM_TAG}-${GIT_SHORT}"
+      _dbg "APPEND_GIT_SHORT=${_append} → tag=${FULL_TAG}"
+      ;;
+  esac
 }
 
 # CI-supplied source URL (GitLab / Bamboo) or git remote fallback.
@@ -287,11 +398,13 @@ _build_materialise_certs() {
   if [ -n "${CA_CERT:-}" ]; then
     echo "${CA_CERT}" > certs/ci-injected.crt
     echo "→ Wrote CA_CERT to certs/ci-injected.crt ($(wc -c < certs/ci-injected.crt) bytes)"
+    _dbg "CA_CERT was set in env → flipping INJECT_CERTS to true"
     INJECT_CERTS=true
     return 0
   fi
 
   if [ -n "${VAULT_CA_PATH:-}" ] && command -v vault >/dev/null 2>&1; then
+    _dbg "VAULT_CA_PATH=${VAULT_CA_PATH} and vault CLI available — attempting pull"
     if vault kv get -mount="${VAULT_KV_MOUNT:-secret}" \
          -field=certificate "${VAULT_CA_PATH}" \
          > certs/vault-ca.crt 2>/dev/null; then
@@ -301,6 +414,8 @@ _build_materialise_certs() {
       echo "  WARN: Vault pull failed — falling back to certs/ on disk" >&2
       rm -f certs/vault-ca.crt
     fi
+  else
+    _dbg "no CA_CERT in env and (VAULT_CA_PATH unset or vault CLI missing) — using certs/ on disk as-is"
   fi
 }
 
@@ -315,17 +430,21 @@ _build_materialise_certs() {
 
 _build_resolve_push_target() {
   REGISTRY_KIND_LC="$(echo "${REGISTRY_KIND:-}" | tr '[:upper:]' '[:lower:]')"
+  _dbg "REGISTRY_KIND=${REGISTRY_KIND:-<unset>} → backend=${REGISTRY_KIND_LC:-default-harbor-style}"
 
   if [ "${REGISTRY_KIND_LC}" = "artifactory" ]; then
     if [ -z "${PUSH_REGISTRY:-}" ] && [ -n "${ARTIFACTORY_PUSH_HOST:-}" ]; then
       PUSH_REGISTRY="${ARTIFACTORY_PUSH_HOST}"
+      _dbg "PUSH_REGISTRY auto-derived from ARTIFACTORY_PUSH_HOST=${PUSH_REGISTRY}"
     elif [ -z "${PUSH_REGISTRY:-}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
       PUSH_REGISTRY="${ARTIFACTORY_URL#https://}"
       PUSH_REGISTRY="${PUSH_REGISTRY#http://}"
       PUSH_REGISTRY="${PUSH_REGISTRY%%/*}"
+      _dbg "PUSH_REGISTRY auto-derived from ARTIFACTORY_URL=${PUSH_REGISTRY}"
     fi
     if [ -z "${PUSH_PROJECT:-}" ] && [ -n "${ARTIFACTORY_TEAM:-}" ]; then
       PUSH_PROJECT="${ARTIFACTORY_TEAM}"
+      _dbg "PUSH_PROJECT auto-derived from ARTIFACTORY_TEAM=${PUSH_PROJECT}"
     fi
   fi
 
@@ -410,12 +529,16 @@ _build_derive_crane_url() {
 # Try to install crane into ${REPO_ROOT}/.bin from CRANE_URL. Never
 # fatal — returns 0 on success, 1 on failure (caller falls back).
 _build_install_crane() {
-  command -v crane >/dev/null 2>&1 && return 0
+  if command -v crane >/dev/null 2>&1; then
+    _dbg "crane already on PATH: $(command -v crane)"
+    return 0
+  fi
   _build_derive_crane_url
 
   if [ -z "${CRANE_URL:-}" ]; then
     echo "  NOTE: crane not on PATH and CRANE_URL not set — skipping install" >&2
     echo "        (will fall back to docker buildx imagetools inspect)" >&2
+    _dbg "uname=$(uname -s)/$(uname -m) didn't match a known crane release URL"
     return 1
   fi
 
@@ -572,8 +695,12 @@ EOF
 }
 
 _build_push_and_emit_env() {
-  [ "${WANT_PUSH}" -eq 1 ] || return 0
+  if [ "${WANT_PUSH}" -ne 1 ]; then
+    _dbg "WANT_PUSH=0 (no --push flag) — skipping push + build.env emission"
+    return 0
+  fi
 
+  _dbg "dispatching push: backend=${REGISTRY_KIND_LC:-default} target=${FULL_IMAGE}"
   if [ "${REGISTRY_KIND_LC}" = "artifactory" ]; then
     _build_push_artifactory || return 1
   else
@@ -665,6 +792,7 @@ _build_generate_sbom() {
 # failure returns non-zero here and the orchestrator exits.
 
 _build_parse_args "$@"
+_build_import_bamboo_vars
 _build_load_image_env
 _build_apply_defaults_and_normalise
 
