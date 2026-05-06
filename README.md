@@ -287,8 +287,10 @@ Artifactory generic repo that mirrors the binary:
 | `SYFT_INSTALLER_URL` | `https://raw.githubusercontent.com/anchore/syft/main/install.sh` |
 | `GRYPE_INSTALLER_URL` | `https://raw.githubusercontent.com/anchore/grype/main/install.sh` |
 | `COSIGN_URL` | `https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64` |
-| `JF_INSTALLER_URL` | `https://install-cli.jfrog.io` |
-| `JF_BINARY_URL` | Direct URL to `jf` binary (alternative to installer script) |
+| `JF_BINARY_URL` | Direct URL to standalone `jf` binary (preferred) |
+| `JF_DEB_URL` | Debian package URL — extracted with `dpkg-deb -x` (or `ar`+`tar`), no `dpkg -i` |
+| `JF_RPM_URL` | RPM package URL — extracted with `rpm2cpio`+`cpio`, no `rpm -i` |
+| `JF_INSTALL_DIR` | Where the binary lands (default `${HOME}/.local/bin`, no sudo) |
 
 **5. Grype vulnerability database.** Grype fetches its CVE database
 from `grype.anchore.io` by default (~100 MB). For air-gap, mirror it

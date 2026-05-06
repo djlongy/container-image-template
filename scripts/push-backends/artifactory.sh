@@ -65,7 +65,7 @@
 #   ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS
 #
 # Auto-install (air-gap support):
-#   JF_BINARY_URL, JF_INSTALLER_URL, JF_INSTALL_DIR
+#   JF_BINARY_URL, JF_DEB_URL, JF_RPM_URL, JF_INSTALL_DIR
 #
 # See image.env.example for what each variable does and its default.
 
@@ -491,50 +491,15 @@ _artifactory_require_tools() {
   return "${missing}"
 }
 
-# Auto-install the JFrog CLI if not present.
-#
-# Two environment variables control where jf is fetched from:
-#
-#   JF_BINARY_URL     Direct URL to the jf binary (Method 1 — fastest).
-#                     e.g. https://artifactory.example.com/artifactory/
-#                          jfrog-releases-remote/jfrog-cli/v2-jf/
-#                          [RELEASE]/jfrog-cli-linux-amd64/jf
-#
-#   JF_INSTALLER_URL  URL to the JFrog CLI installer script (Method 2).
-#                     Default: https://install.jfrog.io
-#                     For air-gap: proxy this through an Artifactory
-#                     generic-remote repo.
-#
-# Neither set? Falls back to JFrog's public installer.
+# Auto-install the JFrog CLI if not present. Delegates to the shared
+# helper at scripts/lib/install-jf.sh so Bamboo, GitLab CI, and the
+# backend all install the same way (no sudo, JF_BINARY_URL takes
+# precedence, falls back to the public installer). See that file for
+# JF_BINARY_URL / JF_DEB_URL / JF_RPM_URL / JF_INSTALL_DIR documentation.
 _artifactory_install_jf() {
-  echo "  jf CLI not found — auto-installing..."
-  local install_dir="${JF_INSTALL_DIR:-/usr/local/bin}"
-
-  # Method 1: direct binary URL (fastest, works in CI containers)
-  if [ -n "${JF_BINARY_URL:-}" ]; then
-    echo "  → downloading jf binary from JF_BINARY_URL"
-    if curl -fsSL "${JF_BINARY_URL}" -o "${install_dir}/jf" && chmod +x "${install_dir}/jf"; then
-      echo "  ✓ jf installed: $(jf --version 2>/dev/null || echo 'unknown version')"
-      return 0
-    fi
-    echo "  ✗ binary download failed" >&2
-    return 1
-  fi
-
-  # Method 2: installer script (variable-driven, air-gap safe)
-  local installer_url="${JF_INSTALLER_URL:-https://install.jfrog.io}"
-  echo "  → running installer from ${installer_url}"
-  if curl -fsSL "${installer_url}" | bash -s 2>/dev/null; then
-    if command -v jf >/dev/null 2>&1; then
-      echo "  ✓ jf installed: $(jf --version 2>/dev/null)"
-      return 0
-    fi
-  fi
-
-  echo "ERROR: 'jf' CLI not found and auto-install failed" >&2
-  echo "  Install manually: https://jfrog.com/getcli/" >&2
-  echo "  For air-gap: set JF_BINARY_URL or JF_INSTALLER_URL" >&2
-  return 1
+  # shellcheck source=../lib/install-jf.sh
+  . "$(dirname "${BASH_SOURCE[0]}")/../lib/install-jf.sh"
+  install_jf
 }
 
 _artifactory_jf_config() {
