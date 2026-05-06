@@ -331,9 +331,20 @@ Xray Audit:
             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
 
             # Splunk + Artifactory secrets via global-var shim.
+            # ARTIFACTORY_URL / _PROJECT come straight from bamboo
+            # plan vars (no rename) — re-export here because this
+            # script doesn't go through build.sh's auto-importer.
             export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
+            export SPLUNK_HEC_URL="${bamboo_SPLUNK_HEC_URL:-}"
+            export SPLUNK_HEC_INDEX="${bamboo_SPLUNK_HEC_INDEX:-}"
+            export SPLUNK_HEC_SOURCETYPE="${bamboo_SPLUNK_HEC_SOURCETYPE:-}"
             export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
             export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+            export ARTIFACTORY_URL="${bamboo_ARTIFACTORY_URL:-}"
+            export ARTIFACTORY_PROJECT="${bamboo_ARTIFACTORY_PROJECT:-}"
+            export JF_BINARY_URL="${bamboo_JF_BINARY_URL:-}"
+            export JF_DEB_URL="${bamboo_JF_DEB_URL:-}"
+            export JF_RPM_URL="${bamboo_JF_RPM_URL:-}"
 
             bash ./scripts/xray-scan-post.sh
   artifacts:
