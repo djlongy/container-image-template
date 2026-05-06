@@ -452,6 +452,13 @@ xray-vuln:
     expire_in: 1 month
     when: always
   rules: *build-rules
+  # JFrog Cloud trial / shared-instance Xray hates concurrent scans
+  # (we hung at 10+ minutes when both jobs ran in parallel against
+  # <yourorg>.jfrog.io). resource_group serialises Xray jobs across
+  # ALL pipelines on this project, so xray-vuln and xray-sbom can't
+  # both be running at once. Drop the resource_group when you've
+  # moved to a Pro/Self-hosted Xray with proper concurrency.
+  resource_group: xray-scan
   # Audit shipping is non-blocking — Splunk outage / Xray-side outage
   # shouldn't fail the pipeline. Script warns + exits 0; this flag is
   # belt-and-suspenders for any other unexpected error.
