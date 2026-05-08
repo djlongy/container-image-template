@@ -2,11 +2,14 @@
 
 A minimal, fork-per-image template for building **one** container image
 through a DevSecOps pipeline. Ships with a working nginx example that
-exercises the full flow: upstream pull, optional CVE remediation,
-optional cert injection, OCI labels via BuildKit, dual SBOM tracks
-(Syft and JFrog Xray), Grype + Xray vulnerability scans, optional
-cosign signing scaffold, and pluggable SBOM/scan ingestion (Splunk
-HEC, Dependency-Track, Artifactory, generic webhook).
+exercises the full flow: upstream pull, optional cert injection, OCI
+labels via BuildKit, dual SBOM tracks (Syft and JFrog Xray), Grype +
+Xray vulnerability scans, optional cosign signing scaffold, and
+pluggable SBOM/scan ingestion (Splunk HEC, Dependency-Track,
+Artifactory, generic webhook). Bespoke per-image work (package
+upgrades, extra installs, ENV/HEALTHCHECK lines) goes directly in
+the Dockerfile's marked fork-edit region — no separate extension
+surface, no DISTRO selector, no remediate stage.
 
 **When to fork this repo vs. use the monorepo** ([container-images](../container-images)):
 
@@ -20,12 +23,15 @@ HEC, Dependency-Track, Artifactory, generic webhook).
 Features — everything in the monorepo's fleet pipeline, minus the
 fleet fabric:
 
-- **Remediate**: distro-aware CVE package upgrade stage. Four
-  distros ship in the template (`alpine`, `debian`, `ubuntu`, `ubi`),
-  each with its own script under `scripts/remediate/`. Pick which
-  one runs via `DISTRO` in `image.env`
 - **Cert injection**: optional CA cert stage, picks up anything in
-  `certs/` or a PEM string from the `CA_CERT` CI variable
+  `certs/` or a PEM string from the `CA_CERT` CI variable. Stage is
+  distro-agnostic — appends to both `ca-certificates.crt` and
+  `cert.pem`, then runs `update-ca-certificates` if present
+- **Bespoke per-image work**: edit the Dockerfile's marked fork-edit
+  region directly. Use it for `apk upgrade` / `apt-get upgrade` (CVE
+  remediation), extra packages, config drops, healthchecks, ENV.
+  No env-var toggles, no separate extension scripts — the file every
+  fork already owns is the customisation surface
 - **Upstream-version tagging**: pushes at
   `<image>:<UPSTREAM_TAG>-<gitShort>` (e.g. `nginx:1.25.3-alpine-a1b2c3d`).
   The upstream tag IS the version — no second version axis. Matches
@@ -85,18 +91,17 @@ $EDITOR image.env
 #    UPSTREAM_IMAGE       nginx
 #    UPSTREAM_TAG         1.25.3-alpine  (Renovate auto-bumps via hint)
 #    IMAGE_NAME           optional — defaults to UPSTREAM_IMAGE
-#    DISTRO               alpine | debian | ubuntu | ubi
-#    REMEDIATE            true / false  (default false — opt in)
 #    INJECT_CERTS         true / false  (default false)
 #    ORIGINAL_USER        root / nginx / whatever upstream expects
+#    VENDOR               your company / team
 
-# 3. (Optional) If your upstream uses a distro family not covered
-#    by the four shipped scripts, drop a new
-#    scripts/remediate/<distro>.sh and set DISTRO=<distro>.
-#    The Dockerfile doesn't need any edit.
+# 3. (Optional) Add bespoke per-image work directly in the Dockerfile
+#    — find the "FORK EDITS GO HERE" region between the certs stage
+#    and the final USER flip. Drop in `RUN apk upgrade`, extra
+#    package installs, COPY of static configs, HEALTHCHECK, etc.
 
-# 4. Commit image.env (it's the per-fork canonical config)
-git add image.env && git commit -m 'add image.env for <my-image>'
+# 4. Commit image.env + Dockerfile (both travel with the fork)
+git add image.env Dockerfile && git commit -m 'configure for <my-image>'
 
 # 5. Sanity-check locally (no push)
 ./scripts/build.sh
@@ -121,10 +126,9 @@ the build fails. Secrets stay in CI plan vars (never committed to
 
 | File | Edit when forking? | Notes |
 |---|---|---|
-| `image.env` | **Always** (created from `image.env.example`) | The whole image definition lives here |
+| `image.env` | **Always** (created from `image.env.example`) | Whole image definition's behavioural toggles + targets live here |
 | `image.env.example` | Only when adding new template-level documentation | Template / reference only — never sourced |
-| `scripts/extend/` | When you need app-specific RUN/COPY | Drop a `customise.sh` hook and/or `files/` directory — see `scripts/extend/README.md`. One surface for all fork-owned customisation |
-| `Dockerfile` | Only for rare multi-stage `COPY --from=…` patterns | Otherwise generic; extensions go in `scripts/extend/` |
+| `Dockerfile` | **Often** — fork-edit region between certs stage and final USER | Drop `RUN apk upgrade`, `RUN apk add curl jq`, `COPY config/`, `HEALTHCHECK`, etc. directly. The region is clearly marked; everything outside it is template-owned and should not be edited |
 | `scripts/build.sh` | Never | Reads `image.env`, invokes buildx, handles backend dispatch |
 | `scripts/sbom-post.sh` | Only to add new SBOM sinks | Generic; 4 sinks built in (webhook, DT, Artifactory, Splunk HEC) |
 | `scripts/push-backends/artifactory.sh` | Never | Ported from monorepo, same layout templates |
@@ -165,9 +169,8 @@ where they came from.
 PUSH_HOST/IMAGE_REF/MANIFEST_PATH`, `XRAY_ARTIFACTORY_URL/USER`,
 `SPLUNK_HEC_URL/INSECURE/INDEX/SOURCETYPE`, `JF_BINARY_URL/DEB_URL/RPM_URL`,
 `SBOM_WEBHOOK_URL`, `DEPENDENCY_TRACK_URL/PROJECT`, `ARTIFACTORY_SBOM_REPO`,
-`UPSTREAM_*`, `REMEDIATE`, `INJECT_CERTS`, `DISTRO`, `APPEND_GIT_SHORT`,
-`XRAY_GENERATE_SBOM`, `XRAY_FAIL_ON_SEVERITY`, etc. Each is documented
-in `image.env.example`.
+`UPSTREAM_*`, `INJECT_CERTS`, `APPEND_GIT_SHORT`, `XRAY_GENERATE_SBOM`,
+`XRAY_FAIL_ON_SEVERITY`, etc. Each is documented in `image.env.example`.
 
 **Optional shell env / CI overrides (any of these still work):**
 
@@ -329,18 +332,7 @@ UPSTREAM_IMAGE=nginx
 #   dockerhub.artifactory.example.com/library/nginx:${UPSTREAM_TAG}
 ```
 
-**3. Alpine apk packages** — both inside the Dockerfile's remediate
-stage AND inside the CI job containers that need `apk add bash git
-curl …`. Single variable covers both:
-
-| Variable | Default | Example override |
-|---|---|---|
-| `APK_MIRROR` | (unset → dl-cdn) | `https://nexus.example.com/repository/alpine-proxy` |
-
-When set, `sed` rewrites `/etc/apk/repositories` before any `apk`
-command, preserving `v3.20/main`, `v3.20/community`, etc.
-
-**4. Tool binaries** (crane, buildx, syft, grype, cosign, jf) — most
+**3. Tool binaries** (crane, buildx, syft, grype, cosign, jf) — most
 closed networks whitelist `github.com` releases and
 `raw.githubusercontent.com`, so the defaults often work untouched. If
 your network blocks those too, override each URL to point at an
@@ -358,7 +350,7 @@ Artifactory generic repo that mirrors the binary:
 | `JF_RPM_URL` | RPM package URL — extracted with `rpm2cpio`+`cpio`, no `rpm -i` |
 | `JF_INSTALL_DIR` | Where the binary lands (default `${HOME}/.local/bin`, no sudo) |
 
-**5. Grype vulnerability database.** Grype fetches its CVE database
+**4. Grype vulnerability database.** Grype fetches its CVE database
 from `grype.anchore.io` by default (~100 MB). For air-gap, mirror it
 to an Artifactory generic repo and point Grype at the mirror:
 
@@ -384,7 +376,7 @@ uploads both to `<repo>/<subpath>/`. Grype reads from the mirror
 via `GRYPE_DB_UPDATE_URL` which the CI job constructs automatically
 when `ARTIFACTORY_GRYPE_DB_REPO` is set.
 
-**6. Nothing else.** The pipeline does not call any other network
+**5. Nothing else.** The pipeline does not call any other network
 endpoint at runtime. Git checkout comes from GitLab itself (already
 on your internal network), `cosign sign` talks to your registry (not
 Sigstore — `--tlog-upload=false` is set), and SBOM ingestion talks
@@ -400,7 +392,6 @@ DOCKER_CLI_IMAGE      = dockerhub.artifactory.example.com/library/docker:27-cli
 DOCKER_DIND_IMAGE     = dockerhub.artifactory.example.com/library/docker:27-dind
 ALPINE_IMAGE          = dockerhub.artifactory.example.com/library/alpine:3.20
 UPSTREAM_REGISTRY     = dockerhub.artifactory.example.com/library
-APK_MIRROR            = https://artifactory.example.com/artifactory/alpine-proxy
 # Tool URLs optional if GitHub is whitelisted; override per above table if not.
 ```
 
@@ -426,7 +417,7 @@ run here, scanning the upstream's tag verbatim.
 
 **`postscan` (IMAGE_DIGEST)** — runs AFTER build. Scans what consumers
 actually pull, including any remediation, cert injection, or
-`scripts/extend/` customisations applied during build. Xray vuln +
+Dockerfile fork-edit customisations applied during build. Xray vuln +
 Xray SBOM both default to scanning `IMAGE_DIGEST` from `build.env`
 (via GitLab's dotenv artifact import / Bamboo's `. ./build.env`).
 Same scripts as prescan — different target.
@@ -471,46 +462,57 @@ dev pipeline transfers to the prod tag. The dev pipeline keeps
 copy from. No automated CI promotion job exists, deliberately: the
 human-in-the-loop check is the gate.
 
-## Distro-aware remediation
+## Per-image customisation — edit the Dockerfile directly
 
-`REMEDIATE=true` runs `scripts/remediate/${DISTRO}.sh` inside the
-image during build. Four distros ship in the template out of the box:
+There is **no extension surface, no hook script, no DISTRO selector,
+no remediate stage**. Bespoke per-image work goes in the Dockerfile's
+clearly-marked fork-edit region, between the cert-injection stage
+and the final `USER ${ORIGINAL_USER}` flip:
 
-| `DISTRO` | Script | What it runs |
-|---|---|---|
-| `alpine` | `scripts/remediate/alpine.sh` | `apk update && apk upgrade --no-cache`, honors `APK_MIRROR` |
-| `debian` | `scripts/remediate/debian.sh` | `apt-get -y --only-upgrade upgrade`, rewrites `deb.debian.org` / `security.debian.org` via `APT_MIRROR` |
-| `ubuntu` | `scripts/remediate/ubuntu.sh` | `apt-get -y --only-upgrade upgrade`, rewrites `archive.ubuntu.com` / `security.ubuntu.com` / `ports.ubuntu.com` via `APT_MIRROR` |
-| `ubi` | `scripts/remediate/ubi.sh` | `microdnf -y update` (falls back to `dnf` / `yum` for older UBI / RHEL bases) |
+```dockerfile
+# ═══════════════════════════════════════════════════════════════════
+# ▼▼▼  FORK EDITS GO HERE  ▼▼▼
+# ═══════════════════════════════════════════════════════════════════
+#   # CVE remediation — pick the line that matches your distro.
+RUN apk update && apk upgrade --no-cache
+# RUN apt-get update && apt-get -y --only-upgrade upgrade && rm -rf /var/lib/apt/lists/*
+# RUN microdnf -y update && microdnf clean all
 
-**Adding a new distro family** is a two-step change:
+#   # Extra packages
+RUN apk add --no-cache curl jq
 
-1. Drop a new `scripts/remediate/<name>.sh` (plain POSIX shell, reads
-   `APK_MIRROR` / `APT_MIRROR` from env if relevant)
-2. Set `DISTRO=<name>` in `image.env`
+#   # Static config drop-in
+COPY config/nginx.conf /etc/nginx/nginx.conf
 
-The Dockerfile never needs an edit — it's generic: `COPY scripts/remediate/`
-+ `RUN /tmp/remediate/${DISTRO}.sh`. `build.sh` validates that the
-script for the selected `DISTRO` exists before invoking buildx, so
-typos fail fast with a clear error instead of deep inside the build.
+#   # Health check
+HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://localhost/ || exit 1
+# ═══════════════════════════════════════════════════════════════════
+# ▲▲▲  END FORK EDITS  ▲▲▲
+# ═══════════════════════════════════════════════════════════════════
+```
 
-**For images where OS-level remediation doesn't apply** (distroless,
-scratch, busybox, statically-linked bases), set `REMEDIATE=false` in
-`image.env` and the stage is skipped entirely — `DISTRO` becomes
-irrelevant.
+The fork-edit region inherits `USER root` from the certs stage above
+it — apk/apt/chown/COPY all work without an explicit `USER root`. The
+`ORIGINAL_USER` flip happens AFTER your edits, so the final image runs
+as the upstream user.
 
-**Closed-network note**: `APK_MIRROR` and `APT_MIRROR` are passed
-through as `--build-arg` so a single CI variable (set at group
-level) rewires all apk and apt traffic through your Artifactory /
-Nexus proxies inside the build. See "Closed-network deployment"
-below for the full list.
+For images where OS-level package upgrades don't apply (distroless,
+scratch, busybox, statically-linked bases), simply leave the region
+empty.
+
+Earlier versions used a `scripts/remediate/${DISTRO}.sh` indirection
+plus a `scripts/extend/customise.sh` hook. Both are removed: Bamboo's
+docker plugin doesn't reliably resolve nested ARG-gated stages, and
+the extension hook drifted out of sync with what forks actually
+needed. Editing the file every fork already owns is simpler and
+survives every CI runner.
 
 ## Tagging convention
 
 We're not the upstream — we're a **variant** of the upstream. We
-pulled `nginx:1.25.3-alpine`, remediated its CVEs, optionally
-injected a corp CA, and produced something that's no longer
-bit-for-bit identical to what's on Docker Hub. The tagging
+pulled `nginx:1.25.3-alpine`, optionally injected a corp CA and
+applied any fork-edit RUN/COPY lines, and produced something that's
+no longer bit-for-bit identical to what's on Docker Hub. The tagging
 convention makes that delineation explicit.
 
 ```
@@ -542,7 +544,7 @@ set keys we explicitly want to own:
 
 | Label | Source |
 |---|---|
-| `org.opencontainers.image.version` | `${UPSTREAM_TAG}-${gitShort}` — matches the pushed tag exactly. This makes it explicit that the image is a **variant** of the upstream (remediated / cert-injected), not the untouched upstream |
+| `org.opencontainers.image.version` | `${UPSTREAM_TAG}-${gitShort}` — matches the pushed tag exactly. This makes it explicit that the image is a **variant** of the upstream (cert-injected / fork-edited), not the untouched upstream |
 | `org.opencontainers.image.revision` | `git rev-parse HEAD` |
 | `org.opencontainers.image.created` | `date -u` at build time |
 | `org.opencontainers.image.base.name` | `UPSTREAM_REGISTRY/UPSTREAM_IMAGE:UPSTREAM_TAG` |
@@ -565,7 +567,7 @@ reports the upstream tag, which is what OCI consumers expect.
 container-image-template/
 ├── image.env                  # ★ Per-fork canonical config (REQUIRED, committed)
 ├── image.env.example          # Template — copy to image.env, then edit. NEVER sourced
-├── Dockerfile                 # Generic multi-stage: base → certs → remediate → final
+├── Dockerfile                 # base → certs-{false,true} AS final → fork-edit region → USER
 ├── renovate.json              # Custom manager tracks UPSTREAM_TAG in image.env
 ├── certs/                     # Gitignored *.crt; populated at build time
 │   └── .gitkeep
@@ -584,11 +586,9 @@ container-image-template/
 │   │   └── xray-sbom.sh       # `jf docker scan --format=cyclonedx --sbom` → sbom-post handoff
 │   ├── push-backends/
 │   │   └── artifactory.sh     # REGISTRY_KIND=artifactory backend (layout templates, Pro/Free)
-│   ├── remediate/             # Distro-aware remediation (alpine/debian/ubuntu/ubi)
-│   ├── extend/                # Fork-owned customisation (customise.sh + files/)
 │   └── test/
-│       └── regression.sh      # 37 local scenarios — REMEDIATE/INJECT_CERTS/CA_CERT/precedence/
-│                              # backends/no-creds/argv. Run with: bash scripts/test/regression.sh
+│       └── regression.sh      # local scenarios — INJECT_CERTS/CA_CERT/precedence/backends/
+│                              # no-creds/argv/scan-target. Run with: bash scripts/test/regression.sh
 ├── .gitlab-ci.yml             # GitLab pipeline — prescan → build → postscan → ingest
 ├── bamboo-specs/
 │   └── bamboo.yaml            # Bamboo plan spec (1:1 parity with GitLab)
@@ -602,7 +602,7 @@ container-image-template/
 ```bash
 # 0. First time: materialise image.env from the template
 cp image.env.example image.env
-$EDITOR image.env       # populate UPSTREAM_*, REMEDIATE, etc.
+$EDITOR image.env       # populate UPSTREAM_*, INJECT_CERTS, etc.
 
 # 1. Sanity-check resolved config (no docker pull, no build)
 ./scripts/build.sh --dry-run
@@ -628,16 +628,18 @@ behavioural permutation we've shipped (37 scenarios) — far faster than
 waiting for a CI round-trip:
 
 ```bash
-bash scripts/test/regression.sh                  # all 37
-bash scripts/test/regression.sh remediate        # filter by name substring
+bash scripts/test/regression.sh                  # full suite
+bash scripts/test/regression.sh inject-certs     # filter by name substring
 ```
 
-Coverage includes: REMEDIATE on/off + supported/unsupported distros,
-INJECT_CERTS variants, CA_CERT env auto-flip, APPEND_GIT_SHORT toggle,
-required-field validation, argv handling, REGISTRY_KIND backend
-selection, `bamboo_*` auto-import precedence, scan-target resolution
-chain (`$1 > XRAY_SCAN_REF > IMAGE_DIGEST > IMAGE_REF > UPSTREAM_REF`),
-and the silent-fail regression (pull/scan failure must exit non-zero).
+Coverage includes: INJECT_CERTS variants + boolean normalisation,
+shell-vs-file precedence (snapshot/restore correctness), CA_CERT env
+auto-flip, APPEND_GIT_SHORT toggle, required-field validation, argv
+handling (--push / --dry-run / --help / extra args / unknown flags),
+REGISTRY_KIND backend selection + auto-derive paths, `bamboo_*`
+auto-import precedence, scan-target resolution chain (`$1 >
+XRAY_SCAN_REF > IMAGE_DIGEST > IMAGE_REF > UPSTREAM_REF`), and the
+silent-fail regression (pull/scan failure must exit non-zero).
 
 ## License
 

@@ -24,8 +24,8 @@
 #                           fallback — it's a template only. Snapshot/
 #                           restore semantics: shell-set non-empty vars
 #                           override image.env values; empty-set shell
-#                           vars don't (so a stray `REMEDIATE=` in the
-#                           agent env can't clobber the file value).
+#                           vars don't (so a stray `INJECT_CERTS=` in
+#                           the agent env can't clobber the file value).
 #
 # Why a shared library: the old build.sh had this logic inline as
 # `_build_load_image_env` and `_build_import_bamboo_vars`, and other
@@ -90,14 +90,14 @@ import_bamboo_vars() {
 # Three-step:
 #   1. Snapshot all known config vars that are SET AND NON-EMPTY in
 #      the caller's shell. (Empty-set is intentionally excluded —
-#      a stray `REMEDIATE=` exported by the runner shouldn't override
-#      the file's REMEDIATE=true.)
+#      a stray `INJECT_CERTS=` exported by the runner shouldn't override
+#      the file's INJECT_CERTS=true.)
 #   2. Source image.env from the caller's CWD. Fail if missing.
 #   3. Re-export the snapshot so shell values win over file values.
 #
 # Pre-fail behaviour: the caller's shell may have run import_bamboo_vars
-# already, which means `bamboo_REMEDIATE=false` becomes a bare
-# `REMEDIATE=false` BEFORE this function snapshots. So plan-var values
+# already, which means `bamboo_INJECT_CERTS=true` becomes a bare
+# `INJECT_CERTS=true` BEFORE this function snapshots. So plan-var values
 # survive the snapshot/restore round-trip and override the file.
 load_image_env() {
   if [ ! -f image.env ]; then
@@ -110,7 +110,7 @@ load_image_env() {
     echo "" >&2
     echo "  To fix:" >&2
     echo "    cp image.env.example image.env" >&2
-    echo "    \$EDITOR image.env       # adjust UPSTREAM_TAG, REMEDIATE, etc." >&2
+    echo "    \$EDITOR image.env       # adjust UPSTREAM_TAG, INJECT_CERTS, etc." >&2
     echo "    git add image.env && git commit -m 'add image.env'" >&2
     echo "" >&2
     echo "  image.env is committed (intentionally — it's the per-fork config)." >&2
@@ -119,11 +119,11 @@ load_image_env() {
   fi
 
   local __v __line __SHELL_OVERRIDES=""
-  for __v in IMAGE_NAME DISTRO \
+  for __v in IMAGE_NAME \
              UPSTREAM_REGISTRY UPSTREAM_IMAGE UPSTREAM_TAG UPSTREAM_REF \
-             REMEDIATE INJECT_CERTS ORIGINAL_USER \
+             INJECT_CERTS ORIGINAL_USER \
              PUSH_REGISTRY PUSH_PROJECT VENDOR AUTHORS \
-             APK_MIRROR APT_MIRROR CA_CERT \
+             CA_CERT \
              REGISTRY_KIND \
              ARTIFACTORY_URL ARTIFACTORY_USER ARTIFACTORY_PASSWORD ARTIFACTORY_TOKEN \
              ARTIFACTORY_PRO ARTIFACTORY_PROJECT \
@@ -145,8 +145,7 @@ load_image_env() {
              SBOM_WEBHOOK_URL SBOM_WEBHOOK_AUTH_HEADER \
              DEPENDENCY_TRACK_URL DEPENDENCY_TRACK_API_KEY DEPENDENCY_TRACK_PROJECT \
              SPLUNK_HEC_URL SPLUNK_HEC_TOKEN SPLUNK_HEC_INDEX \
-             SPLUNK_HEC_SOURCETYPE SPLUNK_SBOM_SOURCETYPE SPLUNK_HEC_INSECURE \
-             VAULT_KV_MOUNT VAULT_CA_PATH; do
+             SPLUNK_HEC_SOURCETYPE SPLUNK_SBOM_SOURCETYPE SPLUNK_HEC_INSECURE; do
     if [ -n "${!__v-}" ]; then
       __SHELL_OVERRIDES="${__SHELL_OVERRIDES}${__v}=$(printf '%q' "${!__v}")"$'\n'
       _dbg "shell-set override captured: ${__v}"

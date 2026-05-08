@@ -1,15 +1,18 @@
 #
 # Single-image template Dockerfile.
 #
-# The build shape is: upstream base → optional cert injection → optional
-# CVE remediation → final user restoration. Each stage is ARG-gated, and
+# Build shape: upstream base → optional cert injection → fork-owned
+# extension → final user restoration. The cert stage is ARG-gated, and
 # the final stage is selected at build time via `FROM stage-${ARG}` so
 # unused branches never run. BuildKit prunes the unselected graph.
 #
-# This file ships tuned for Alpine-based upstream images (nginx is the
-# demo). For Debian/Ubuntu/UBI bases, swap the `apk` line in the
-# remediate-true stage for the appropriate package manager. Everything
-# else stays the same.
+# This Dockerfile is intentionally MINIMAL. Bamboo's docker plugin and
+# some older buildx versions don't reliably resolve nested ARG-gated
+# stages, so we keep exactly one toggle here (INJECT_CERTS). All
+# bespoke per-image work — package upgrades, extra installs, file
+# drops, healthchecks, ENV — goes directly into the marked
+# "FORK EDITS GO HERE" region below. Editing the Dockerfile is the
+# expected fork pattern; there is no separate extension surface.
 #
 # Dynamic OCI labels (version, revision, created, base.digest, source,
 # etc.) are intentionally NOT set here with LABEL. They're passed by
@@ -21,30 +24,17 @@
 
 # ── Global ARGs (available to FROM lines of all stages) ──────────────
 #
-# No hardcoded defaults. Values are supplied by scripts/build.sh from
-# image.env. The Renovate hint for UPSTREAM_TAG lives in image.env
-# (matched by a customManagers regex in renovate.json), not here —
-# keeping all image-specific values in one place.
-# Defaults here are only used if build.sh doesn't pass --build-arg
-# (e.g. running `docker build .` directly without the script).
-# build.sh always passes these from image.env, so the defaults below
-# are just to suppress BuildKit's InvalidDefaultArgInFrom warning.
+# build.sh passes these from image.env via --build-arg. The defaults
+# below only apply when someone runs `docker build .` directly without
+# the script — they exist to suppress BuildKit's InvalidDefaultArgInFrom
+# warning, not as canonical values. The Renovate hint for UPSTREAM_TAG
+# lives in image.env (matched by a customManagers regex in
+# renovate.json), keeping all image-specific values in one place.
 ARG UPSTREAM_REGISTRY=docker.io/library
 ARG UPSTREAM_IMAGE=nginx
-# Pinned default for safety; build.sh always overrides via --build-arg from image.env
 ARG UPSTREAM_TAG=1.29.8-alpine
 ARG INJECT_CERTS=false
-# REMEDIATE default is FALSE — safe-by-default. The remediate-true
-# stage only runs when build.sh (or a direct `docker build`) explicitly
-# passes `--build-arg REMEDIATE=true`. This guards against the case
-# where build.sh isn't used (e.g. someone runs `docker build .`
-# directly) or where image.env is missing — neither path will trigger
-# surprise package upgrades.
-ARG REMEDIATE=false
 ARG ORIGINAL_USER=root
-ARG DISTRO=alpine
-ARG APK_MIRROR=""
-ARG APT_MIRROR=""
 
 # ── Upstream base ────────────────────────────────────────────────────
 FROM ${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG} AS base
@@ -72,112 +62,108 @@ FROM ${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG} AS base
 
 # ── Cert injection (optional) ────────────────────────────────────────
 # When INJECT_CERTS=true, copy everything from certs/ into the system
-# trust store. The raw append to ca-certificates.crt covers Alpine and
-# distroless cases where `update-ca-certificates` isn't present; the
-# later `update-ca-certificates` call rebuilds the merged bundle on
-# Debian/Ubuntu/RHEL-family images. Both paths handled without distro
-# detection — whichever works, works.
+# trust store. The logic below auto-detects the right drop-in path at
+# build time (no DISTRO arg needed), so the same Dockerfile works
+# across alpine / debian / ubuntu / ubi / distroless:
+#
+#   1. /usr/local/share/ca-certificates/  — alpine / debian / ubuntu;
+#      followed by `update-ca-certificates` to rebuild the merged bundle.
+#   2. /etc/pki/ca-trust/source/anchors/  — UBI / RHEL / Fedora;
+#      followed by `update-ca-trust` to rebuild.
+#   3. Direct cat-append to /etc/ssl/certs/ca-certificates.crt and
+#      /etc/ssl/cert.pem — fallback for distroless / scratch / busybox
+#      images that lack both rebuild tools.
+#
+# Earlier versions of this stage append-then-rebuilt, which wiped our
+# certs because update-ca-certificates rebuilds the bundle from
+# /usr/local/share/ca-certificates/ — anything appended directly was
+# lost. Putting the cert in the rebuild source first guarantees it
+# survives.
 FROM base AS certs-false
 
 FROM base AS certs-true
 USER root
 COPY certs/ /tmp/certs/
 RUN set -eux; \
+    if [ -d /usr/local/share/ca-certificates ]; then \
+      DROP_DIR=/usr/local/share/ca-certificates; \
+      REBUILD=update-ca-certificates; \
+    elif [ -d /etc/pki/ca-trust/source/anchors ]; then \
+      DROP_DIR=/etc/pki/ca-trust/source/anchors; \
+      REBUILD=update-ca-trust; \
+    else \
+      DROP_DIR=""; \
+      REBUILD=""; \
+    fi; \
     found=0; \
     for f in /tmp/certs/*.crt /tmp/certs/*.pem; do \
       [ -f "$f" ] || continue; \
+      base="$(basename "$f")"; \
+      case "${base}" in \
+        *.crt|*.pem) base="${base%.*}" ;; \
+      esac; \
+      # Append to the bundle directly — this is what most TLS apps actually
+      # read (OPENSSL_DEFAULT_CA_FILE = /etc/ssl/cert.pem on alpine, which
+      # symlinks to /etc/ssl/certs/ca-certificates.crt). Alpine's
+      # update-ca-certificates only manages the per-cert symlinks under
+      # /etc/ssl/certs/*.pem and does NOT regenerate the bundle file from
+      # the package, so direct append is the only reliable way to inject
+      # there. On Debian/Ubuntu/UBI, update-ca-certificates regenerates
+      # the bundle from anchors below, which re-includes our cert via the
+      # drop-in step that follows — the append is redundant but harmless.
       cat "$f" >> /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true; \
       cat "$f" >> /etc/ssl/cert.pem 2>/dev/null || true; \
+      # Drop into the distro-aware anchors dir so update-ca-certificates /
+      # update-ca-trust create the per-cert symlinks (alpine) or rebuild
+      # the bundle including our cert (debian/ubuntu/ubi). For distroless
+      # / scratch images both DROP_DIR and REBUILD stay empty and only
+      # the bundle append above runs — still works.
+      [ -n "${DROP_DIR}" ] && cp "$f" "${DROP_DIR}/${base}.crt"; \
       found=$((found + 1)); \
     done; \
-    echo "Injected ${found} CA cert(s)"; \
+    echo "Injected ${found} CA cert(s) (drop_dir=${DROP_DIR:-fallback-append-only})"; \
     rm -rf /tmp/certs; \
-    if command -v update-ca-certificates >/dev/null 2>&1; then \
-      update-ca-certificates 2>/dev/null || true; \
+    if [ -n "${REBUILD}" ] && command -v "${REBUILD}" >/dev/null 2>&1; then \
+      "${REBUILD}" 2>/dev/null || true; \
     fi
 
 ARG INJECT_CERTS
-FROM certs-${INJECT_CERTS} AS with-certs
-
-# ── CVE remediation (optional, distro-aware) ─────────────────────────
-# When REMEDIATE=true, copies the scripts/remediate/ directory into
-# the image and executes /tmp/remediate/${DISTRO}.sh. Four distros
-# ship in the template by default: alpine, debian, ubuntu, ubi.
-# Add a new distro by dropping a script at scripts/remediate/<name>.sh
-# and setting DISTRO=<name> in image.env.
-#
-# The script inherits APK_MIRROR and APT_MIRROR as env vars so a
-# single CI variable can point all upgrade operations at a
-# closed-network proxy.
-FROM with-certs AS remediate-false
-
-FROM with-certs AS remediate-true
-ARG DISTRO
-ARG APK_MIRROR
-ARG APT_MIRROR
-USER root
-# Inject CA certs BEFORE remediation so apk/apt trust internal mirrors.
-# This runs regardless of INJECT_CERTS — the flag controls whether certs
-# persist in the FINAL shipped image, but the build always needs to trust
-# the mirror during package upgrades. Matches the monorepo pattern.
-COPY certs/ /tmp/build-certs/
-RUN set -eux; \
-    for f in /tmp/build-certs/*.crt /tmp/build-certs/*.pem; do \
-      [ -f "$f" ] || continue; \
-      cat "$f" >> /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true; \
-    done; \
-    rm -rf /tmp/build-certs
-COPY scripts/remediate/ /tmp/remediate/
-RUN set -eux; \
-    chmod +x /tmp/remediate/${DISTRO}.sh; \
-    APK_MIRROR="${APK_MIRROR}" APT_MIRROR="${APT_MIRROR}" \
-      /tmp/remediate/${DISTRO}.sh; \
-    rm -rf /tmp/remediate
-
-ARG REMEDIATE
-FROM remediate-${REMEDIATE} AS final
+FROM certs-${INJECT_CERTS} AS final
 
 # ═══════════════════════════════════════════════════════════════════
-# RESERVED EXTENSION POINT — fork-owned territory
+# ▼▼▼  FORK EDITS GO HERE  ▼▼▼
 # ═══════════════════════════════════════════════════════════════════
 #
-# This is the ONE place a fork customises the image. Everything above
-# is template-owned and updates cleanly when you pull from upstream.
-# See scripts/extend/README.md for the full contract.
+# This region is the ONLY place forks should add bespoke RUN / COPY /
+# ENV / HEALTHCHECK lines. Everything above is template-owned and
+# updates cleanly when you pull from upstream; everything here is
+# yours. We're already running as root (left over from the certs
+# stage), so apk/apt commands work without an explicit USER root.
 #
-# Two optional surfaces inside scripts/extend/:
+# Common patterns:
 #
-#   customise.sh   — shell hook. Runs as root, after remediation,
-#                    before the final USER flip. Use for apk/apt
-#                    installs, writing config, chowning paths, etc.
+#   # CVE remediation — package upgrades. Pick the line that matches
+#   # your upstream's distro (alpine / debian / ubi); delete the rest.
+#   RUN apk update && apk upgrade --no-cache
+#   # RUN apt-get update && apt-get -y --only-upgrade upgrade && rm -rf /var/lib/apt/lists/*
+#   # RUN microdnf -y update && microdnf clean all
 #
-#   files/         — directory. Contents copy verbatim to /opt/app/
-#                    inside the image. Use for static configs,
-#                    prebuilt binaries, templates, etc.
+#   # Extra packages
+#   # RUN apk add --no-cache curl jq
 #
-# Both are optional. Missing = no-op, no failure.
+#   # Static config drop-ins
+#   # COPY config/nginx.conf /etc/nginx/nginx.conf
 #
-# Ordering: files/ is copied BEFORE customise.sh runs, so the hook
-# can reference /opt/app/ if it needs to chmod/chown or rewrite
-# something. If customise.sh exits non-zero the build fails (set -eu).
+#   # Health check
+#   # HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://localhost/ || exit 1
 #
-# Dockerfile forks are still possible for the rare case of multi-stage
-# COPY --from=… patterns, but extending via scripts/extend/ avoids that
-# cost for ~95% of customisations (package installs, config drops, ENV
-# tweaks, healthcheck scripts, entrypoint wrappers).
-USER root
-COPY scripts/extend/ /tmp/extend/
-RUN set -eu; \
-    if [ -d /tmp/extend/files ] && [ "$(ls -A /tmp/extend/files 2>/dev/null || true)" ]; then \
-      mkdir -p /opt/app; \
-      cp -a /tmp/extend/files/. /opt/app/; \
-      echo "→ extension: copied scripts/extend/files/ → /opt/app/"; \
-    fi; \
-    if [ -x /tmp/extend/customise.sh ]; then \
-      echo "→ extension: running scripts/extend/customise.sh"; \
-      /tmp/extend/customise.sh; \
-    fi; \
-    rm -rf /tmp/extend
+# Keep edits minimal — this template is not the place for
+# multi-hundred-line image customisation. If your image needs that
+# much bespoke logic, fork the template and own it.
+#
+# ═══════════════════════════════════════════════════════════════════
+# ▲▲▲  END FORK EDITS  ▲▲▲
+# ═══════════════════════════════════════════════════════════════════
 
 # Restore whatever USER the upstream image ran as. Required for images
 # whose entrypoint expects a specific UID (e.g. nginx's entrypoint

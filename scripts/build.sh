@@ -20,15 +20,15 @@
 #   UPSTREAM_TAG        default: read from Dockerfile's `ARG UPSTREAM_TAG=...`
 #   IMAGE_NAME          default: value of UPSTREAM_IMAGE
 #   INJECT_CERTS        default: false  — set true to run the certs-true stage
-#   REMEDIATE           default: false  — set true to run scripts/remediate/${DISTRO}.sh
-#                       (apk upgrade for alpine, apt-get upgrade for debian/ubuntu).
-#                       Default flipped from true → false to make the bare-minimum
-#                       build path safe: "pull → retag → push" with no surprises
-#                       when image.env is missing.
 #   ORIGINAL_USER       default: root
 #   VENDOR              default: example.com
 #   CA_CERT             PEM content of a CA cert to inject (writes to certs/
-#                       before build, picked up by the COPY in Dockerfile)
+#                       before build, picked up by the COPY in Dockerfile).
+#                       Typical CI source: curl from an Artifactory generic
+#                       repo into a CI variable.
+#                       Package upgrades / extra installs / file drops are
+#                       NOT a build.sh concern — add those directly to the
+#                       Dockerfile in the marked fork-edit region.
 #   SBOM_GENERATE       default: false — opt-in. When true, syft emits a
 #                       CycloneDX JSON next to the built image. Generation
 #                       and shipping are intentionally decoupled: this
@@ -49,9 +49,6 @@
 #   CRANE_URL           default: auto-detected for host OS/arch —
 #                       override to point at an internal mirror for
 #                       air-gapped runners.
-#   SBOM_ATTEST         default: false — scaffolded for future cosign attest-sbom;
-#                       the active SBOM workflow is driven by .gitlab-ci.yml
-#                       calling syft/grype on the pushed image directly.
 #   REGISTRY_KIND       when unset (default), --push does a plain
 #                       `docker push` to PUSH_REGISTRY (Harbor baseline).
 #                       Set to "artifactory" to delegate the push step
@@ -114,29 +111,16 @@ Usage: ./scripts/build.sh [--push | --dry-run | --help]
                "what would this build with my current env?"
   --help, -h   This message.
 
-Customisation (fork-owned, no template edits required):
-
-  scripts/extend/customise.sh   optional shell hook. Runs as root
-                                after remediate, before the final
-                                USER flip. Use for apk/apt installs,
-                                chown, writing generated configs, etc.
-                                Failures fail the build (set -eu).
-
-  scripts/extend/files/         optional directory. Contents copy
-                                verbatim to /opt/app/ in the image
-                                (cp -a, permissions preserved). Use
-                                for static configs, entrypoint shims,
-                                prebuilt binaries.
-
-  Both are optional; missing = no-op. Hook runs AFTER files/ is copied,
-  so it can reference /opt/app/ freely. See scripts/extend/README.md
-  for the full contract.
+Per-fork customisation: edit the Dockerfile directly, in the
+"FORK EDITS GO HERE" region between the cert-injection stage and
+the final USER flip. Use that region for RUN \`apk upgrade\`/\`apt-get
+upgrade\` (CVE remediation), package installs, COPY of static configs,
+ENV/HEALTHCHECK lines, etc.
 
 All behavioural toggles are env-driven. See image.env.example for the
 full list. Commonly-used flags:
 
   REGISTRY_KIND=artifactory   use scripts/push-backends/artifactory.sh
-  REMEDIATE=false             skip scripts/remediate/\${DISTRO}.sh
   INJECT_CERTS=true           bake certs/*.crt into the trust store
   SBOM_GENERATE=true          emit <image>-<tag>.cdx.json after build
   ARTIFACTORY_PRO=true        enable Pro-tier push path
@@ -194,8 +178,8 @@ _build_parse_args() {
 
 # Validate required fields + apply defaults + lowercase-normalise
 # booleans so TRUE/True/true all work. Fails fast on missing required.
-# REMEDIATE/INJECT_CERTS MUST be lowercase for Dockerfile FROM selectors
-# (certs-${INJECT_CERTS}, remediate-${REMEDIATE}) to match their stages.
+# INJECT_CERTS MUST be lowercase for the Dockerfile FROM selector
+# (certs-${INJECT_CERTS}) to match its stage.
 _build_apply_defaults_and_normalise() {
   : "${UPSTREAM_REGISTRY:?UPSTREAM_REGISTRY must be set in image.env}"
   : "${UPSTREAM_IMAGE:?UPSTREAM_IMAGE must be set in image.env}"
@@ -203,40 +187,25 @@ _build_apply_defaults_and_normalise() {
 
   # Defaults are SAFE-BY-DEFAULT: every optional behaviour is OFF
   # unless explicitly turned on. The bare-minimum build path is
-  # "pull → retag → push" with no remediation, no cert injection,
-  # no Xray, no SBOM. This is deliberate — past versions defaulted
-  # REMEDIATE=true and people got surprise package upgrades when
-  # image.env was missing (e.g. fresh Bamboo checkouts where
-  # image.env was gitignored). Opt in via image.env, never have to
-  # opt out via troubleshooting.
+  # "pull → retag → push" with no cert injection, no Xray, no SBOM.
+  # Anything bespoke (package upgrades, extra installs, file drops)
+  # goes directly in the Dockerfile's fork-edit region — never sneaks
+  # into the upstream template path via env-var toggles.
   [ -z "${IMAGE_NAME:-}"     ] && _dbg "default applied: IMAGE_NAME=${UPSTREAM_IMAGE} (was unset)"
-  [ -z "${DISTRO:-}"         ] && _dbg "default applied: DISTRO=alpine (was unset)"
-  [ -z "${REMEDIATE:-}"      ] && _dbg "default applied: REMEDIATE=false (was unset/empty — set REMEDIATE=true in image.env to run apk/apt upgrade)"
   [ -z "${INJECT_CERTS:-}"   ] && _dbg "default applied: INJECT_CERTS=false (was unset/empty)"
   [ -z "${ORIGINAL_USER:-}"  ] && _dbg "default applied: ORIGINAL_USER=root (was unset)"
   [ -z "${VENDOR:-}"         ] && _dbg "default applied: VENDOR=example.com (was unset)"
 
   IMAGE_NAME="${IMAGE_NAME:-${UPSTREAM_IMAGE}}"
-  DISTRO="${DISTRO:-alpine}"
-  REMEDIATE="${REMEDIATE:-false}"
   INJECT_CERTS="${INJECT_CERTS:-false}"
   ORIGINAL_USER="${ORIGINAL_USER:-root}"
   VENDOR="${VENDOR:-example.com}"
 
-  REMEDIATE="$(printf '%s' "${REMEDIATE}"               | tr '[:upper:]' '[:lower:]')"
   INJECT_CERTS="$(printf '%s' "${INJECT_CERTS}"          | tr '[:upper:]' '[:lower:]')"
   SBOM_GENERATE="$(printf '%s' "${SBOM_GENERATE:-false}" | tr '[:upper:]' '[:lower:]')"
   SBOM_TARGET="$(printf '%s'   "${SBOM_TARGET:-image}"   | tr '[:upper:]' '[:lower:]')"
 
-  _dbg "resolved: REMEDIATE=${REMEDIATE} INJECT_CERTS=${INJECT_CERTS} DISTRO=${DISTRO} SBOM_GENERATE=${SBOM_GENERATE}"
-
-  if [ "${REMEDIATE}" = "true" ] && [ ! -f "scripts/remediate/${DISTRO}.sh" ]; then
-    echo "ERROR: REMEDIATE=true but scripts/remediate/${DISTRO}.sh does not exist" >&2
-    echo "       Available distros: $(ls scripts/remediate/ | sed 's/\.sh$//' | tr '\n' ' ')" >&2
-    echo "       Either add a script for '${DISTRO}', set DISTRO to a supported" >&2
-    echo "       value in image.env, or set REMEDIATE=false." >&2
-    return 1
-  fi
+  _dbg "resolved: INJECT_CERTS=${INJECT_CERTS} SBOM_GENERATE=${SBOM_GENERATE}"
 }
 
 # ════════════════════════════════════════════════════════════════════
@@ -288,10 +257,11 @@ _build_resolve_source_url() {
 # PHASE 3 — Cert materialisation
 # ════════════════════════════════════════════════════════════════════
 # If CA_CERT is set (CI secret), write it to certs/ so the certs-true
-# Dockerfile stage can COPY it. If VAULT_CA_PATH is set and `vault` is
-# available, pull from Vault instead. Either path flips INJECT_CERTS
-# to "true" so the correct stage is selected. Overwrites are
-# intentional — CI runs should be reproducible.
+# Dockerfile stage can COPY it, and flip INJECT_CERTS to "true" so the
+# correct stage is selected. Overwrites are intentional — CI runs
+# should be reproducible. Typical CI source: curl from an Artifactory
+# generic repo into the CA_CERT variable (or set the variable's value
+# to the PEM directly).
 
 _build_materialise_certs() {
   mkdir -p certs
@@ -305,20 +275,7 @@ _build_materialise_certs() {
     return 0
   fi
 
-  if [ -n "${VAULT_CA_PATH:-}" ] && command -v vault >/dev/null 2>&1; then
-    _dbg "VAULT_CA_PATH=${VAULT_CA_PATH} and vault CLI available — attempting pull"
-    if vault kv get -mount="${VAULT_KV_MOUNT:-secret}" \
-         -field=certificate "${VAULT_CA_PATH}" \
-         > certs/vault-ca.crt 2>/dev/null; then
-      echo "→ Pulled CA cert from Vault (${VAULT_KV_MOUNT:-secret}/${VAULT_CA_PATH})"
-      INJECT_CERTS=true
-    else
-      echo "  WARN: Vault pull failed — falling back to certs/ on disk" >&2
-      rm -f certs/vault-ca.crt
-    fi
-  else
-    _dbg "no CA_CERT in env and (VAULT_CA_PATH unset or vault CLI missing) — using certs/ on disk as-is"
-  fi
+  _dbg "no CA_CERT in env — using certs/ on disk as-is (empty dir = no injection)"
 }
 
 # ════════════════════════════════════════════════════════════════════
@@ -343,6 +300,19 @@ _build_resolve_push_target() {
       PUSH_REGISTRY="${PUSH_REGISTRY#http://}"
       PUSH_REGISTRY="${PUSH_REGISTRY%%/*}"
       _dbg "PUSH_REGISTRY auto-derived from ARTIFACTORY_URL=${PUSH_REGISTRY}"
+    fi
+    # Reverse derivation: if only PUSH_REGISTRY is set (homelab /
+    # single-host on-prem case where the same FQDN serves both Docker
+    # registry and REST API), populate ARTIFACTORY_URL from it so the
+    # backend's API calls have a target.
+    #
+    # NOT safe on JFrog Cloud SaaS — Cloud splits the hosts (REST at
+    # mycorp.jfrog.io, docker at mycorp-docker.jfrog.io). On Cloud,
+    # set ARTIFACTORY_URL explicitly in image.env so this branch is
+    # skipped.
+    if [ -z "${ARTIFACTORY_URL:-}" ] && [ -n "${PUSH_REGISTRY:-}" ]; then
+      ARTIFACTORY_URL="https://${PUSH_REGISTRY}"
+      _dbg "ARTIFACTORY_URL auto-derived from PUSH_REGISTRY=${ARTIFACTORY_URL} (homelab/single-host pattern; set explicitly on JFrog Cloud)"
     fi
     if [ -z "${PUSH_PROJECT:-}" ] && [ -n "${ARTIFACTORY_TEAM:-}" ]; then
       PUSH_PROJECT="${ARTIFACTORY_TEAM}"
@@ -389,12 +359,8 @@ _build_print_config_report() {
   echo "  Upstream digest:    <resolving...>"
   echo "  Git commit:         ${GIT_SHORT} (${GIT_SHA})"
   echo "  Created (UTC):      ${CREATED}"
-  echo "  Distro:             ${DISTRO}"
-  echo "  Remediate:          ${REMEDIATE}$([ "${REMEDIATE}" = "true" ] && echo " (scripts/remediate/${DISTRO}.sh)" || echo "")"
   echo "  Inject certs:       ${INJECT_CERTS}"
   echo "  Original user:      ${ORIGINAL_USER}"
-  echo "  APK mirror:         ${APK_MIRROR:-<none>}"
-  echo "  APT mirror:         ${APT_MIRROR:-<none>}"
   echo "  Vendor:             ${VENDOR}"
   echo "  Source URL:         ${SOURCE_URL:-<none>}"
   echo "=========================================="
@@ -511,11 +477,7 @@ _build_docker_build() {
     --build-arg "UPSTREAM_IMAGE=${UPSTREAM_IMAGE}"
     --build-arg "UPSTREAM_TAG=${UPSTREAM_TAG}"
     --build-arg "INJECT_CERTS=${INJECT_CERTS}"
-    --build-arg "REMEDIATE=${REMEDIATE}"
     --build-arg "ORIGINAL_USER=${ORIGINAL_USER}"
-    --build-arg "DISTRO=${DISTRO}"
-    --build-arg "APK_MIRROR=${APK_MIRROR:-}"
-    --build-arg "APT_MIRROR=${APT_MIRROR:-}"
   )
   local label_args=(
     --label "org.opencontainers.image.vendor=${VENDOR}"
@@ -536,8 +498,33 @@ _build_docker_build() {
     label_args+=(--label "org.opencontainers.image.url=${SOURCE_URL}")
   fi
 
+  # --provenance=false --sbom=false: force buildx to emit a FLAT
+  # single-arch v2 distribution manifest (config + layers in the tag
+  # dir) instead of an OCI image index wrapping the manifest +
+  # attestation manifest. The latter happens by default on:
+  #
+  #   - Docker Desktop / Colima (vz-rosetta) with the containerd
+  #     image store enabled — supports native index storage
+  #   - buildx >= 0.13 — defaults to `--provenance=mode=min`
+  #
+  # The index landing in JFrog as <tag>/list.manifest.json puts the
+  # actual layer blobs in <repo>/<image>/sha256:<digest>/ rather than
+  # in the tag dir, which makes our Free-tier build-info merger
+  # (lib/build-info-merge.py) see one file in the tag dir and report
+  # "1 artifact, 0 dependencies (fallback)" instead of the proper
+  # "manifest + config + N layers" count.
+  #
+  # We don't consume buildx's provenance/SBOM attestations — Xray
+  # scans cover provenance separately and Syft + sbom-post.sh cover
+  # SBOMs separately — so disabling these flags is no real loss.
+  # If you ever want the buildx-generated attestations back AND
+  # correct artifact counts, the alternative is teaching the merger
+  # to walk the OCI index → resolve per-arch manifest → fetch blobs
+  # from the digest path (see scripts/lib/build-info-merge.py
+  # `_compute_inherited_blob_digests`).
   echo "→ docker build"
-  docker build "${build_args[@]}" "${label_args[@]}" -t "${FULL_IMAGE}" .
+  docker build --provenance=false --sbom=false \
+    "${build_args[@]}" "${label_args[@]}" -t "${FULL_IMAGE}" .
   echo "→ build complete: ${FULL_IMAGE}"
 
   # Export derived values so the sourced backend script can pull them

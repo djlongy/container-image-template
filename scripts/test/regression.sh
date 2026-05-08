@@ -14,7 +14,7 @@
 #
 # Run with:
 #   bash scripts/test/regression.sh                  # all scenarios
-#   bash scripts/test/regression.sh remediate        # filter by name substring
+#   bash scripts/test/regression.sh inject-certs     # filter by name substring
 #
 # Exit 0 if every scenario passes, non-zero with summary otherwise.
 
@@ -104,7 +104,6 @@ end_scenario
 scenario "default-no-overrides"
 _run env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --dry-run >/dev/null
 _must_contain "→ Sourcing image.env"
-_must_contain "Remediate:          false"
 _must_contain "Inject certs:       false"
 _must_not_contain "ERROR"
 end_scenario
@@ -114,61 +113,23 @@ _run env -i HOME="$HOME" PATH="$PATH" BUILD_DEBUG=true ./scripts/build.sh --dry-
 _must_contain "[debug]"
 # A reliable [debug] line that's always present regardless of image.env contents:
 # the resolved-config summary fires after defaults+normalisation.
-_must_contain "[debug] resolved: REMEDIATE="
+_must_contain "[debug] resolved: INJECT_CERTS="
 end_scenario
 
-scenario "shell-empty-remediate-vs-file-true"
-# Sets REMEDIATE='' in shell + REMEDIATE=true in image.env.
+scenario "shell-empty-inject-certs-vs-file-true"
+# Sets INJECT_CERTS='' in shell + INJECT_CERTS=true in image.env.
 # This was the empty-string snapshot bug; file value should win.
-sed -i.bak -E 's|^REMEDIATE=.*|REMEDIATE="true"|' image.env && rm image.env.bak
-_run env -i HOME="$HOME" PATH="$PATH" REMEDIATE='' ./scripts/build.sh --dry-run >/dev/null
-_must_contain "Remediate:          true"
-_must_not_contain "Remediate:          false"
+sed -i.bak -E 's|^INJECT_CERTS=.*|INJECT_CERTS="true"|' image.env && rm image.env.bak
+_run env -i HOME="$HOME" PATH="$PATH" INJECT_CERTS='' ./scripts/build.sh --dry-run >/dev/null
+_must_contain "Inject certs:       true"
+_must_not_contain "Inject certs:       false"
 end_scenario
 
-scenario "shell-set-remediate-overrides-file"
-# Explicit non-empty REMEDIATE in shell beats image.env (correct precedence).
-sed -i.bak -E 's|^REMEDIATE=.*|REMEDIATE="true"|' image.env && rm image.env.bak
-_run env -i HOME="$HOME" PATH="$PATH" REMEDIATE=false ./scripts/build.sh --dry-run >/dev/null
-_must_contain "Remediate:          false"
-end_scenario
-
-# ════════════════════════════════════════════════════════════════════
-# REMEDIATE flag behaviour
-# ════════════════════════════════════════════════════════════════════
-
-scenario "remediate-true-alpine-supported"
-sed -i.bak -E 's|^REMEDIATE=.*|REMEDIATE="true"|' image.env && rm image.env.bak
-_run env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --dry-run >/dev/null
-_must_contain "Remediate:          true (scripts/remediate/alpine.sh)"
-end_scenario
-
-scenario "remediate-true-unsupported-distro"
-# Bad DISTRO with REMEDIATE=true should fail-fast with a list of supported
-sed -i.bak -E 's|^REMEDIATE=.*|REMEDIATE="true"|' image.env && rm image.env.bak
-sed -i.bak -E 's|^DISTRO=.*|DISTRO="windows"|' image.env && rm image.env.bak
-out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --dry-run 2>&1) ; rc=$?
-echo "${out}" > "${TMP_DIR}/out"
-echo "${out}" | head -10
-[ "${rc}" -ne 0 ] || FAILURES+=("${CURRENT_NAME}: expected non-zero exit on bad distro")
-_must_contain "scripts/remediate/windows.sh does not exist"
-_must_contain "Available distros:"
-end_scenario
-
-scenario "remediate-true-but-distro-default-alpine-script-exists"
-# Even when DISTRO is unset, default kicks in to alpine
-sed -i.bak -E 's|^REMEDIATE=.*|REMEDIATE="true"|' image.env && rm image.env.bak
-sed -i.bak -E '/^DISTRO=/d' image.env && rm image.env.bak
-_run env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --dry-run >/dev/null
-_must_contain "Distro:             alpine"
-_must_contain "Remediate:          true"
-end_scenario
-
-scenario "remediate-FALSE-uppercase"
-# Boolean normalisation: TRUE/True/true/false/0 all accepted
-sed -i.bak -E 's|^REMEDIATE=.*|REMEDIATE="FALSE"|' image.env && rm image.env.bak
-_run env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --dry-run >/dev/null
-_must_contain "Remediate:          false"
+scenario "shell-set-inject-certs-overrides-file"
+# Explicit non-empty INJECT_CERTS in shell beats image.env (correct precedence).
+sed -i.bak -E 's|^INJECT_CERTS=.*|INJECT_CERTS="true"|' image.env && rm image.env.bak
+_run env -i HOME="$HOME" PATH="$PATH" INJECT_CERTS=false ./scripts/build.sh --dry-run >/dev/null
+_must_contain "Inject certs:       false"
 end_scenario
 
 # ════════════════════════════════════════════════════════════════════
@@ -417,21 +378,19 @@ end_scenario
 
 scenario "bamboo-auto-import"
 _run env -i HOME="$HOME" PATH="$PATH" \
-  bamboo_REMEDIATE=true \
   bamboo_INJECT_CERTS=true \
   ./scripts/build.sh --dry-run >/dev/null
 _must_contain "Auto-imported"
-_must_contain "Remediate:          true"
 _must_contain "Inject certs:       true"
 end_scenario
 
 scenario "bamboo-auto-import-shell-wins"
 # Explicit shell export should beat bamboo_* import
 _run env -i HOME="$HOME" PATH="$PATH" \
-  bamboo_REMEDIATE=true \
-  REMEDIATE=false \
+  bamboo_INJECT_CERTS=true \
+  INJECT_CERTS=false \
   ./scripts/build.sh --dry-run >/dev/null
-_must_contain "Remediate:          false"
+_must_contain "Inject certs:       false"
 end_scenario
 
 # ════════════════════════════════════════════════════════════════════

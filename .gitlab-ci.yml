@@ -153,29 +153,8 @@ variables:
   ARTIFACTORY_GRYPE_DB_REPO: ""
   GRYPE_DB_MIRROR_SUBPATH: "grype-db/v6"
 
-  # 3) Alpine package mirror. Replaces dl-cdn.alpinelinux.org in
-  #    /etc/apk/repositories for every `apk add` / `apk upgrade` call
-  #    in the pipeline (both CI-stage tool installs and the build's
-  #    remediate stage). Set to your Artifactory/Nexus raw-proxy URL
-  #    for dl-cdn.alpinelinux.org/alpine. Version paths (v3.20/main,
-  #    v3.20/community, …) are preserved automatically.
-  #      APK_MIRROR: https://nexus.example.com/repository/alpine-proxy
-  APK_MIRROR: ""
-
-  # 4) Debian / Ubuntu apt mirror. Used by the remediate stage inside
-  #    the Dockerfile when DISTRO=debian or DISTRO=ubuntu — rewrites
-  #    /etc/apt/sources.list* before apt-get update. Not needed for
-  #    alpine bases. Example:
-  #      APT_MIRROR: https://nexus.example.com/repository/ubuntu-proxy
-  APT_MIRROR: ""
-
 # ── Shared before_script: install tools used by most jobs ──────────
 .install-tools: &install-tools
-  - |
-    # Apply the APK mirror rewrite before any apk command runs.
-    if [ -n "${APK_MIRROR:-}" ]; then
-      sed -i "s|https\?://dl-cdn.alpinelinux.org/alpine|${APK_MIRROR}|g" /etc/apk/repositories
-    fi
   - apk add --no-cache bash git curl openssl jq python3   # python3 is for scripts/push-backends/artifactory.sh build-info-merge.py + JSON helpers
   - |
     # crane — used by build.sh for base digest + by promote for crane copy.
@@ -522,7 +501,7 @@ xray-sbom-prescan:
 # POSTSCAN — Xray on the BUILT image (IMAGE_DIGEST), audit ingestion
 # ═══════════════════════════════════════════════════════════════════
 # Runs AFTER build. Scans what consumers will actually pull, including
-# remediation / cert injection / scripts/extend/ customisations. The
+# cert injection / Dockerfile fork-edit customisations. The
 # scripts default to scanning IMAGE_DIGEST (from build.env via dotenv
 # artifact import), so no XRAY_SCAN_REF override needed.
 xray-vuln-postscan:
