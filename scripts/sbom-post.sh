@@ -12,9 +12,12 @@
 # beats file. In CI these are typically masked group/project variables;
 # locally they sit in image.env. See image.env.example for descriptions
 # (template only — image.env.example is never read by the build).
-# This script doesn't source anything itself — callers export the
-# relevant vars (or let build.sh's shell-snapshot propagate them) and
-# then invoke `./scripts/sbom-post.sh <cdx.json>`.
+#
+# This script self-loads image.env via scripts/lib/load-image-env.sh —
+# same pattern as build.sh and the scan scripts. So URLs / repos /
+# project names committed to image.env are picked up automatically;
+# masked CI tokens come through via plan vars (auto-imported from
+# `bamboo_FOO` → `FOO`). Callers don't need to relay anything by hand.
 #
 # Supported sinks (set one or more):
 #
@@ -69,12 +72,31 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Resolve SBOM_FILE to an absolute path BEFORE we cd anywhere so a
+# relative arg keeps working from the caller's cwd.
 SBOM_FILE="${1:-sbom.cdx.json}"
+case "${SBOM_FILE}" in
+  /*) ;;
+  *)  SBOM_FILE="$(pwd)/${SBOM_FILE}" ;;
+esac
 
 if [ ! -f "${SBOM_FILE}" ]; then
   echo "ERROR: SBOM file not found: ${SBOM_FILE}" >&2
   exit 1
 fi
+
+cd "${REPO_ROOT}"
+
+# Auto-import bamboo_* plan vars to bare names, then source image.env.
+# Same pattern as build.sh / scan/xray-*.sh — every script that needs
+# behavioural config self-loads it. Without this, sink URLs / project
+# names committed to image.env (SPLUNK_HEC_URL, DEPENDENCY_TRACK_URL,
+# ARTIFACTORY_SBOM_REPO, SBOM_WEBHOOK_URL) would be invisible here and
+# every sink branch would silently skip.
+# shellcheck source=lib/load-image-env.sh
+. "${REPO_ROOT}/scripts/lib/load-image-env.sh"
+import_bamboo_vars
+load_image_env
 
 # Per-run temp directory — avoids /tmp collisions if multiple jobs run
 # in parallel.
@@ -89,6 +111,65 @@ if [ -f build.env ]; then
   # shellcheck disable=SC1091
   . ./build.env
 fi
+
+# ── Sink preflight: log which vars are set/empty for every sink ─────
+# Always on, not gated by BUILD_DEBUG. The "no sinks configured"
+# branch at the bottom is otherwise silent about *why* — this block
+# makes it obvious which var is missing for each sink so a misconfig
+# (URL committed to image.env but token missing as a CI var, or vice
+# versa) shows up immediately in the job log.
+_status() {
+  if [ -n "${!1:-}" ]; then echo "set"; else echo "empty"; fi
+}
+echo "→ Sink preflight (post-image.env, post-bamboo-import):"
+echo "   webhook"
+echo "      SBOM_WEBHOOK_URL=$(_status SBOM_WEBHOOK_URL)"
+echo "      SBOM_WEBHOOK_AUTH_HEADER=$(_status SBOM_WEBHOOK_AUTH_HEADER) (optional)"
+if [ -z "${SBOM_WEBHOOK_URL:-}" ]; then
+  echo "      → skip (SBOM_WEBHOOK_URL empty)"
+else
+  echo "      → fire"
+fi
+echo "   dependency-track"
+echo "      DEPENDENCY_TRACK_URL=$(_status DEPENDENCY_TRACK_URL)"
+echo "      DEPENDENCY_TRACK_API_KEY=$(_status DEPENDENCY_TRACK_API_KEY)"
+echo "      DEPENDENCY_TRACK_PROJECT=$(_status DEPENDENCY_TRACK_PROJECT)"
+if [ -z "${DEPENDENCY_TRACK_URL:-}" ] || [ -z "${DEPENDENCY_TRACK_API_KEY:-}" ]; then
+  echo "      → skip (URL or API_KEY empty)"
+elif [ -z "${DEPENDENCY_TRACK_PROJECT:-}" ]; then
+  echo "      → fire-and-fail (PROJECT empty — branch will warn and bump failures)"
+else
+  echo "      → fire"
+fi
+echo "   artifactory-xray"
+echo "      ARTIFACTORY_URL=$(_status ARTIFACTORY_URL)"
+echo "      ARTIFACTORY_USER=$(_status ARTIFACTORY_USER)"
+if [ -n "${ARTIFACTORY_TOKEN:-}" ]; then
+  echo "      ARTIFACTORY_TOKEN=set (preferred over PASSWORD)"
+elif [ -n "${ARTIFACTORY_PASSWORD:-}" ]; then
+  echo "      ARTIFACTORY_TOKEN=empty  ARTIFACTORY_PASSWORD=set"
+else
+  echo "      ARTIFACTORY_TOKEN=empty  ARTIFACTORY_PASSWORD=empty"
+fi
+echo "      ARTIFACTORY_SBOM_REPO=$(_status ARTIFACTORY_SBOM_REPO)"
+if [ -z "${ARTIFACTORY_URL:-}" ] || [ -z "${ARTIFACTORY_USER:-}" ] || [ -z "${ARTIFACTORY_SBOM_REPO:-}" ]; then
+  echo "      → skip (URL, USER, or SBOM_REPO empty)"
+elif [ -z "${ARTIFACTORY_TOKEN:-}${ARTIFACTORY_PASSWORD:-}" ]; then
+  echo "      → fire-and-fail (no TOKEN or PASSWORD — branch will warn and bump failures)"
+else
+  echo "      → fire"
+fi
+echo "   splunk-hec"
+echo "      SPLUNK_HEC_URL=$(_status SPLUNK_HEC_URL)"
+echo "      SPLUNK_HEC_TOKEN=$(_status SPLUNK_HEC_TOKEN)"
+echo "      SPLUNK_HEC_INDEX=${SPLUNK_HEC_INDEX:-main (default)}"
+echo "      SPLUNK_SBOM_SOURCETYPE=${SPLUNK_SBOM_SOURCETYPE:-cyclonedx:json (default)}"
+if [ -z "${SPLUNK_HEC_URL:-}" ] || [ -z "${SPLUNK_HEC_TOKEN:-}" ]; then
+  echo "      → skip (URL or TOKEN empty — TOKEN must be a masked CI variable, not in image.env)"
+else
+  echo "      → fire"
+fi
+echo ""
 
 did_post=0
 failures=0
