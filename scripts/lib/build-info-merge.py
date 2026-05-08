@@ -213,14 +213,46 @@ def _build_blob(fname, info, config_digest, upstream_digests):
     }
 
 
+def _referenced_digests_from_final(tmpdir):
+    """Return the set of sha256 digests this push's manifest references.
+
+    JFrog never garbage-collects layer blobs in a tag dir. When the same
+    tag is pushed multiple times (e.g. rebuilds at the same git SHA
+    with different timestamps in OCI labels → different config digest),
+    the OLD blobs orphan in the tag dir alongside the new ones. Without
+    a filter, _load_file_entry walks all of them and over-counts
+    artifacts vs Pro's `jf docker push` (which only records what THIS
+    push's manifest references).
+
+    Returns the empty set when final-manifest.json is missing — caller
+    treats that as "no filter" and counts every file (preserves prior
+    behavior for the rare case where the manifest fetch failed).
+    """
+    final = _load_json_file(os.path.join(tmpdir, "final-manifest.json"))
+    if not final:
+        return set()
+    refs = set()
+    cfg = final.get("config", {}).get("digest", "")
+    if cfg:
+        refs.add(cfg)
+    for layer in final.get("layers", []) or []:
+        d = layer.get("digest", "")
+        if d:
+            refs.add(d)
+    return refs
+
+
 def collect_artifacts_and_dependencies(tmpdir, file_count, tag_subpath, repo,
                                        config_digest, upstream_digests):
     """Walk stored files and return (artifacts, dependencies).
 
-    Artifacts: every stored file, tagged with Pro-equivalent type.
+    Artifacts: every stored file referenced by THIS push's manifest,
+    tagged with Pro-equivalent type. Orphan blobs from earlier pushes
+    to the same tag are filtered out (matches Pro's behavior).
     Dependencies: only layer blobs inherited from the upstream base image
     (matched by digest). Config blob is never a dependency.
     """
+    referenced = _referenced_digests_from_final(tmpdir)
     artifacts = []
     dependencies = []
     for i in range(file_count):
@@ -228,6 +260,15 @@ def collect_artifacts_and_dependencies(tmpdir, file_count, tag_subpath, repo,
         if entry is None:
             continue
         fname, info = entry
+        # Filter orphans: skip sha256 blobs not referenced by this
+        # push's manifest. manifest.json itself always passes (no
+        # digest comparison applies). When the referenced set is empty
+        # (manifest fetch failed), preserve legacy "count everything"
+        # behavior to avoid silently dropping data.
+        if referenced and fname.startswith("sha256__"):
+            digest = _filename_to_digest(fname)
+            if digest not in referenced:
+                continue
         artifacts.append(_build_artifact(
             fname, info, tag_subpath, repo, config_digest))
         blob = _build_blob(fname, info, config_digest, upstream_digests)

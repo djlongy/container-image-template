@@ -138,7 +138,22 @@ _artifactory_resolve_templates() {
   _ART_TARGET=$(_artifactory_expand_template "${image_ref_tpl}")
   _ART_MANIFEST_PATH=$(_artifactory_expand_template "${manifest_path_tpl}")
   _ART_BUILD_NAME="${ARTIFACTORY_BUILD_NAME:-${IMAGE_NAME}-build}"
-  _ART_BUILD_NUMBER="${ARTIFACTORY_BUILD_NUMBER:-${CI_JOB_ID:-${CI_PIPELINE_ID:-${BUILD_NUMBER:-${GITHUB_RUN_ID:-$(date -u +"%Y-%m-%dT%H-%M-%SZ")}}}}}"
+  # Build-number resolution chain (highest precedence first):
+  #   ARTIFACTORY_BUILD_NUMBER  explicit override (image.env / CI var)
+  #   CI_JOB_ID                 GitLab job id
+  #   CI_PIPELINE_ID            GitLab pipeline id
+  #   BUILD_NUMBER              Jenkins (and generic CI convention)
+  #   bamboo_buildNumber        Bamboo — what ${bamboo.buildNumber} resolves to
+  #                             in the agent shell. Bare-name `buildNumber`
+  #                             would also exist after import_bamboo_vars,
+  #                             but `bamboo_buildNumber` is what the
+  #                             agent always exports, so reference that
+  #                             directly to stay independent of the
+  #                             import-order in build.sh.
+  #   GITHUB_RUN_ID             GitHub Actions
+  #   <UTC timestamp>           last-resort fallback so a missing CI
+  #                             context never blocks a local push
+  _ART_BUILD_NUMBER="${ARTIFACTORY_BUILD_NUMBER:-${CI_JOB_ID:-${CI_PIPELINE_ID:-${BUILD_NUMBER:-${bamboo_buildNumber:-${GITHUB_RUN_ID:-$(date -u +"%Y-%m-%dT%H-%M-%SZ")}}}}}}"
   _ART_IS_PRO="${ARTIFACTORY_PRO}"
   _ART_PROJECT_KEY="${ARTIFACTORY_PROJECT:-${ARTIFACTORY_TEAM:-}}"
   _ART_PROJECT_FLAG=""
@@ -158,10 +173,126 @@ _artifactory_print_banner() {
   echo "  Build name:      ${_ART_BUILD_NAME}"
   echo "  Build number:    ${_ART_BUILD_NUMBER}"
   if [ "${_ART_IS_PRO}" = "true" ]; then
-    echo "  Tier:            PRO (project=${_ART_PROJECT_KEY})"
+    if [ "${_ART_SKIP_BUILD_SCAN:-0}" = "1" ]; then
+      echo "  Tier:            PRO (downgraded — project '${_ART_PROJECT_KEY}' missing; build-info goes to global namespace, scans skipped)"
+    else
+      echo "  Tier:            PRO (project=${_ART_PROJECT_KEY})"
+    fi
   else
     echo "  Tier:            FREE (baseline — no Pro features)"
   fi
+}
+
+# Pro preflight: confirm the Artifactory Project exists. If it doesn't,
+# graceful-downgrade the run instead of failing — the user's typical
+# observation when this is missing is "first build for a new team
+# pushes the image fine but BP and scan both fail mid-flow." Cleaner
+# behavior:
+#
+#   - image push still proceeds → docker/<team>/<image>:<tag> lands
+#   - build-info still publishes, but to GLOBAL artifactory-build-info
+#     (no --project flag) so it doesn't 404
+#   - jf docker scan / jf build-scan are SKIPPED — running them without
+#     the project flag would evaluate the wrong watch set and produce
+#     misleading "all clear" results, worse than no scan
+#   - the postscan stage's xray-vuln.sh / xray-sbom.sh still cover
+#     vuln visibility (they scan IMAGE_DIGEST, not the build-info)
+#
+# When the admin eventually creates the project (curl snippet printed
+# in the warning), the next run flips back to full Pro flow with no
+# code or env-var change.
+#
+# Sets globals when project is missing:
+#   _ART_PROJECT_FLAG=""       drops --project from all subsequent jf calls
+#   _ART_SKIP_BUILD_SCAN=1     read by _artifactory_pro_xray_postscan
+#   _ART_SKIP_PRESCAN=1        read by _artifactory_pro_xray_prescan
+_artifactory_preflight_project() {
+  _ART_SKIP_BUILD_SCAN=0
+  _ART_SKIP_PRESCAN=0
+
+  # Only relevant on Pro path with a non-empty project key.
+  [ "${_ART_IS_PRO}" = "true" ] || return 0
+  [ -n "${_ART_PROJECT_KEY}" ] || return 0
+
+  # /access/api/v1/* requires Bearer auth (Basic returns 401 even with
+  # the same access token that works against /artifactory/api/*). Fall
+  # back to Basic only when ARTIFACTORY_TOKEN is unset and we're using
+  # ARTIFACTORY_PASSWORD instead — that's basic-auth-only by definition.
+  local url="${ARTIFACTORY_URL%/}/access/api/v1/projects/${_ART_PROJECT_KEY}"
+  local code
+  if [ -n "${ARTIFACTORY_TOKEN:-}" ]; then
+    code=$(curl -sS -o /dev/null -w "%{http_code}" \
+      -H "Authorization: Bearer ${ARTIFACTORY_TOKEN}" \
+      "${url}" 2>/dev/null) || code=000
+  else
+    code=$(curl -sS -o /dev/null -w "%{http_code}" \
+      -u "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD:-}" \
+      "${url}" 2>/dev/null) || code=000
+  fi
+
+  case "${code}" in
+    200)
+      _dbg "project preflight: '${_ART_PROJECT_KEY}' exists (HTTP 200) — full Pro flow"
+      return 0
+      ;;
+    404)
+      cat >&2 <<EOF
+
+──────────────────────────────────────────────────────────────────────
+  WARN: Artifactory project '${_ART_PROJECT_KEY}' does not exist.
+  Continuing with a GRACEFUL DOWNGRADE for this run:
+    ✓ image push proceeds to docker/${ARTIFACTORY_TEAM}/${IMAGE_NAME}
+    ✓ build-info publishes to GLOBAL artifactory-build-info
+    ✗ jf docker scan / jf build-scan are SKIPPED (project-scoped
+      watches don't exist; running scans without scope would
+      evaluate the wrong watch set)
+
+  To enable full Pro flow on the next build, have an admin create
+  the project once via REST:
+
+    curl -H "Authorization: Bearer \$ADMIN_TOKEN" -X POST \\
+      "${ARTIFACTORY_URL%/}/access/api/v1/projects" \\
+      -H "Content-Type: application/json" \\
+      -d '{
+            "project_key":"${_ART_PROJECT_KEY}",
+            "display_name":"${_ART_PROJECT_KEY}",
+            "admin_privileges":{"manage_members":true,"manage_resources":true,"index_resources":true},
+            "storage_quota_bytes":-1
+          }'
+
+  Or via UI: Administration → Platform Configuration → Projects → New.
+
+  Naming note (JFrog Cloud SaaS, may differ on self-hosted Pro): the
+  project_key must be lowercase letters / digits / dashes only. If
+  '${_ART_PROJECT_KEY}' contains uppercase letters, the create call
+  above returns 400 — pick an all-lowercase key and update
+  ARTIFACTORY_PROJECT in image.env (or your CI vars) to match.
+
+  Auth note: /access/api/v1/* endpoints require Bearer auth; Basic auth
+  with the same token returns 401 even for admins.
+──────────────────────────────────────────────────────────────────────
+EOF
+      _ART_PROJECT_FLAG=""
+      _ART_SKIP_BUILD_SCAN=1
+      _ART_SKIP_PRESCAN=1
+      return 0
+      ;;
+    401|403)
+      echo "WARN: project preflight HTTP ${code} for '${_ART_PROJECT_KEY}' — token may lack project read scope." >&2
+      echo "      Continuing as Pro with --project=${_ART_PROJECT_KEY}; if BP fails downstream, check admin rights." >&2
+      return 0
+      ;;
+    000)
+      echo "WARN: project preflight failed (Artifactory unreachable / curl error) for '${_ART_PROJECT_KEY}'." >&2
+      echo "      Continuing as Pro with --project=${_ART_PROJECT_KEY}." >&2
+      return 0
+      ;;
+    *)
+      echo "WARN: project preflight returned HTTP ${code} for '${_ART_PROJECT_KEY}' — unexpected response." >&2
+      echo "      Continuing as Pro with --project=${_ART_PROJECT_KEY}." >&2
+      return 0
+      ;;
+  esac
 }
 
 # Single source of truth for digest resolution after a push. Prefers
@@ -240,6 +371,12 @@ _artifactory_pro_enrich_build_info() {
 # to return exit 3 on violations. Without one the scan is informational
 # only. We pass the project flag we've already computed.
 _artifactory_pro_xray_prescan() {
+  if [ "${_ART_SKIP_PRESCAN:-0}" = "1" ]; then
+    echo ""
+    echo "── Pro: Xray pre-push scan SKIPPED (project '${_ART_PROJECT_KEY}' missing — preflight downgrade) ──"
+    return 0
+  fi
+
   [ "${ARTIFACTORY_XRAY_PRESCAN}" = "true" ] || return 0
 
   if [ -z "${_ART_PROJECT_FLAG}" ]; then
@@ -313,6 +450,11 @@ _artifactory_pro_publish_build_info() {
 # warnings regardless of fail-mode — those are scanner availability
 # blips, not policy decisions.
 _artifactory_pro_xray_postscan() {
+  if [ "${_ART_SKIP_BUILD_SCAN:-0}" = "1" ]; then
+    echo ""
+    echo "── Pro: Xray build scan SKIPPED (project '${_ART_PROJECT_KEY}' missing — preflight downgrade) ──"
+    return 0
+  fi
   if [ "${ARTIFACTORY_XRAY_POSTSCAN}" != "true" ]; then
     echo ""
     echo "── Pro: Xray build scan skipped (ARTIFACTORY_XRAY_POSTSCAN=${ARTIFACTORY_XRAY_POSTSCAN}) ──"
@@ -364,6 +506,8 @@ _artifactory_pro_xray_postscan() {
 
 _artifactory_pro_flow() {
   local built_local_ref="$1"
+  # Preflight is run by push_to_backend before this, so _ART_PROJECT_FLAG
+  # and the skip flags already reflect the project's presence/absence.
   _artifactory_pro_enrich_build_info
 
   docker tag "${built_local_ref}" "${_ART_TARGET}"
@@ -433,10 +577,16 @@ push_to_backend() {
   _artifactory_normalise_bools
   _artifactory_decompose_ref "${built_local_ref}"
   _artifactory_resolve_templates
-  _artifactory_print_banner "${built_local_ref}"
 
   _artifactory_jf_config || return 1
   _artifactory_docker_login "${ARTIFACTORY_PUSH_HOST}" || return 1
+
+  # Preflight needs creds (curl /access/api/v1/projects). Runs BEFORE
+  # the banner so the "Tier:" line correctly reflects whether this run
+  # is full-Pro or downgraded.
+  _artifactory_preflight_project
+
+  _artifactory_print_banner "${built_local_ref}"
 
   if [ "${_ART_IS_PRO}" = "true" ]; then
     _artifactory_pro_flow "${built_local_ref}" || return 1
@@ -826,12 +976,57 @@ _artifactory_curl_blob() {
 _artifactory_fetch_manifests_for_merge() {
   local target="$1" tmpdir="$2"
 
+  # FINAL manifest = our pushed image, in our Artifactory. Basic auth
+  # via the existing curl helper works because we already have
+  # ARTIFACTORY_USER + ARTIFACTORY_TOKEN/PASSWORD in env.
   local final_body
   final_body=$(_artifactory_curl_manifest "${target}")
   [ -n "${final_body}" ] && printf '%s' "${final_body}" > "${tmpdir}/final-manifest.json"
 
   [ -z "${UPSTREAM_REF:-}" ] && return 0
 
+  # UPSTREAM config = whatever public registry the user pulls from
+  # (docker.io / gcr / ghcr / mcr / quay / private mirror). The earlier
+  # curl path failed silently for docker.io because:
+  #
+  #   1. docker.io is not the registry — registry-1.docker.io is
+  #      (docker.io/v2/... returns HTTP 302 redirect to the website)
+  #   2. registry-1.docker.io requires a bearer token from
+  #      auth.docker.io, not basic auth with Artifactory creds
+  #
+  # When the upstream fetch failed, the merger fell into "fallback"
+  # mode — counting ALL non-config sha256 blobs as dependencies, which
+  # over-counts by the number of layers we added on top of upstream.
+  #
+  # Using `crane config <upstream-ref>` skips both problems: it
+  # handles each registry's auth transparently (bearer for docker hub,
+  # static for gcr/ghcr/mcr/quay public, basic from
+  # ~/.docker/config.json for private), AND auto-resolves multi-arch
+  # indices to the local-platform manifest in one call. It returns the
+  # config JSON directly — we extract rootfs.diff_ids from it. Crane
+  # is already on PATH (build.sh installs it for the BASE_DIGEST OCI
+  # label resolution), so no new dependency.
+  #
+  # Falls through to the legacy curl-then-walk path if crane is
+  # somehow missing — that path still works for upstreams hosted in
+  # the same Artifactory as the push target (proxy / remote repo).
+  if command -v crane >/dev/null 2>&1; then
+    if crane config "${UPSTREAM_REF}" 2>/dev/null \
+         | python3 -c "
+import json, sys
+cfg = json.load(sys.stdin)
+json.dump(cfg.get('rootfs', {}).get('diff_ids', []), sys.stdout)" \
+         > "${tmpdir}/upstream-diffids.json" 2>/dev/null \
+       && [ -s "${tmpdir}/upstream-diffids.json" ]; then
+      return 0
+    fi
+    rm -f "${tmpdir}/upstream-diffids.json"
+  fi
+
+  # ── Fallback: legacy curl path ────────────────────────────────────
+  # Works when upstream is on the same Artifactory as the push (proxy
+  # repos with our auth). Doesn't work for direct public docker.io
+  # without bearer-auth handling — that's covered by the crane branch.
   local upstream_body
   upstream_body=$(_artifactory_curl_manifest "${UPSTREAM_REF}")
   [ -z "${upstream_body}" ] && return 0
@@ -874,8 +1069,54 @@ json.dump(cfg.get('rootfs', {}).get('diff_ids', []), sys.stdout)" \
     rm -f "${tmpdir}/upstream-diffids.json"
 }
 
+# Multi-arch builds (any buildx output that produces an OCI image index)
+# store the manifest at <tag>/list.manifest.json, NOT <tag>/manifest.json.
+# Single-arch builds use manifest.json. The ARTIFACTORY_MANIFEST_PATH
+# template can't predict which the user's build produces, so probe the
+# tag directory and return whichever exists. Echoes the resolved path
+# (or the input path on probe failure — caller's set-props will then
+# emit its existing WARN).
+_artifactory_resolve_manifest_filename() {
+  local manifest_path="$1"
+  local tag_dir="${manifest_path%/manifest.json}"
+  local secret="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
+  local _url="${ARTIFACTORY_URL%/}"
+  _url="${_url%/artifactory}"
+
+  local listing
+  listing=$(curl -fsSL -u "${ARTIFACTORY_USER}:${secret}" \
+    "${_url}/artifactory/api/storage/${tag_dir}" 2>/dev/null) || {
+    printf '%s' "${manifest_path}"
+    return 0
+  }
+
+  # Walk children, prefer list.manifest.json (multi-arch index) since
+  # that's what consumers pull by tag. Fall back to manifest.json.
+  local resolved
+  resolved=$(printf '%s' "${listing}" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    files = [c.get('uri','').lstrip('/') for c in d.get('children', [])]
+    for candidate in ('list.manifest.json', 'manifest.json'):
+        if candidate in files:
+            print(candidate); break
+except json.JSONDecodeError:
+    pass
+" 2>/dev/null)
+
+  if [ -n "${resolved}" ]; then
+    printf '%s/%s' "${tag_dir}" "${resolved}"
+  else
+    printf '%s' "${manifest_path}"
+  fi
+}
+
 _artifactory_set_props() {
   local manifest_path="$1" build_name="$2" build_number="$3" env="$4"
+  # Resolve manifest.json → list.manifest.json for multi-arch images.
+  manifest_path=$(_artifactory_resolve_manifest_filename "${manifest_path}")
+
   local props="environment=${env};build.name=${build_name};build.number=${build_number}"
   [ -n "${ARTIFACTORY_TEAM:-}" ] && props="${props};team=${ARTIFACTORY_TEAM}"
   [ -n "${GIT_SHA:-}" ]          && props="${props};git.commit=${GIT_SHA}"
