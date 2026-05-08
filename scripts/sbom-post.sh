@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Post a CycloneDX SBOM to an ingestion endpoint.
+# Post a CycloneDX SBOM to one or more ingestion endpoints.
 #
-# Called from the pipeline after `syft` generates sbom.cdx.json. This
-# script is intentionally scaffolded even when no endpoint is configured
-# — when the business decides which SBOM platform to adopt, add the
-# relevant variables and this script will start shipping. No code
-# change required.
+# Called from the pipeline after `syft` (or `jf docker scan`) generates
+# sbom.cdx.json. This script is intentionally scaffolded even when no
+# endpoint is configured — when the business decides which SBOM
+# platform to adopt, populate the relevant variables and shipping
+# starts. No code change required.
 #
 # ── Where do the sink env vars come from? ────────────────────────────
 # Either shell / CI env or image.env (committed). Precedence: shell
@@ -14,59 +14,64 @@
 # (template only — image.env.example is never read by the build).
 #
 # This script self-loads image.env via scripts/lib/load-image-env.sh —
-# same pattern as build.sh and the scan scripts. So URLs / repos /
+# same pattern as build.sh and the scan scripts. URLs / repos /
 # project names committed to image.env are picked up automatically;
 # masked CI tokens come through via plan vars (auto-imported from
-# `bamboo_FOO` → `FOO`). Callers don't need to relay anything by hand.
+# `bamboo_FOO` → `FOO`). Callers don't relay anything by hand.
 #
-# Supported sinks (set one or more):
+# ── Supported sinks (set one or more) ────────────────────────────────
 #
 #   Generic webhook (raw CycloneDX JSON body):
 #     SBOM_WEBHOOK_URL          full URL accepting a POST
 #     SBOM_WEBHOOK_AUTH_HEADER  optional, e.g. "Authorization: Bearer xxx"
 #
-#   OWASP Dependency-Track (the de-facto standard for SBOM + CVE
-#   correlation; scales to enterprise and produces webhook
-#   notifications on new CVEs matching previously-uploaded BOMs):
+#   OWASP Dependency-Track (de-facto enterprise SBOM platform; correlates
+#   BOMs against its CVE database, fires webhooks on new matches):
 #     DEPENDENCY_TRACK_URL      e.g. https://dtrack.example.com
 #     DEPENDENCY_TRACK_API_KEY  BOM upload API key
-#     DEPENDENCY_TRACK_PROJECT  project name (autoCreate=true will
-#                               create it on first upload)
+#     DEPENDENCY_TRACK_PROJECT  project name (autoCreate=true on first upload)
 #
-#   JFrog Artifactory Pro + Xray (native SBOM ingestion — upload a
-#   CycloneDX file with .cdx.json suffix to an indexed generic repo;
-#   Xray auto-indexes and scans it, results appear in Scans → SBOM
-#   Imports. No extra server-side integration needed. Xray licence
-#   required for the indexing half to do anything useful.):
+#   JFrog Artifactory + Xray (native SBOM ingestion — upload a .cdx.json
+#   to an Xray-indexed generic repo; Xray auto-indexes and scans it.
+#   Requires Pro licence; JCR Free won't index.):
 #     ARTIFACTORY_URL           https://artifactory.example.com
 #     ARTIFACTORY_USER          user with Deploy on the generic repo
 #     ARTIFACTORY_TOKEN         access token (preferred), OR
 #     ARTIFACTORY_PASSWORD      basic-auth password
-#     ARTIFACTORY_SBOM_REPO     generic repo name (must be Xray-
-#                               indexed), e.g. "sboms-local"
+#     ARTIFACTORY_SBOM_REPO     generic repo name (must be Xray-indexed)
 #
-#   Splunk HEC (audit-trail ingestion; the SBOM goes inside the HEC
-#   `event` field, sourcetype defaults to "cyclonedx:json" — vendor-
-#   neutral so the same sourcetype handles Syft-, Xray-, and Trivy-
-#   generated SBOMs):
-#     SPLUNK_HEC_URL            HEC base URL (we append /services/collector
-#                               if missing). e.g. https://splunk.example.com:8088
-#     SPLUNK_HEC_TOKEN          HEC token. Sent as `Authorization: Splunk <token>`.
+#   Splunk HEC (audit-trail ingestion; SBOM goes inside the HEC `event`
+#   field, sourcetype defaults to "cyclonedx:json" — vendor-neutral):
+#     SPLUNK_HEC_URL            HEC base URL (we append /services/collector)
+#     SPLUNK_HEC_TOKEN          HEC token (Authorization: Splunk <token>)
 #     SPLUNK_HEC_INDEX          target index. Default: main
 #     SPLUNK_SBOM_SOURCETYPE    sourcetype tag. Default: cyclonedx:json
-#                               (separate from SPLUNK_HEC_SOURCETYPE which
-#                               xray-scan-post.sh uses for vuln events)
 #     SPLUNK_HEC_INSECURE       "true" → curl -k. Default: false
 #
-# Extending:
-#   To add another sink (Snyk, GitLab Security Dashboard, Kafka, etc.)
-#   drop a new block below following the same pattern — guard on the
-#   sink's env var being set, post, report success. No sink should
-#   fail the pipeline if it's unconfigured.
+# ── How each sink block is structured ────────────────────────────────
+# Every block reads top-to-bottom in the same shape:
+#
+#   1. SKIP CHECK first — if the sink's required env vars aren't set,
+#      log one "skip" line and move on. NO other work runs (no
+#      checksum compute, no jq pipe, no curl). Skipping unconfigured
+#      sinks first is the efficiency win.
+#
+#   2. Otherwise log a "POST"/"PUT" line, then run the upload inside
+#      a `( ... ) || rc=$?` SUBSHELL. set -e is on, so any aux-command
+#      failure (jq missing, base64 bad input, shasum unavailable)
+#      exits the subshell with non-zero — but only the subshell, not
+#      the whole script. The next sink still runs. This is what
+#      stops "one failure blocks everything after it."
+#
+#   3. Tally: if the subshell exited 0 we count a posted sink; if
+#      non-zero we log the failure and bump the failure counter.
+#
+# Adding a sink? Copy any block, change the comment header, the env
+# var names, and the curl invocation. The shape stays identical.
 #
 # Exit codes:
 #   0  success (including "no sinks configured — nothing to do")
-#   1  a configured sink returned an error
+#   1  one or more configured sinks returned an error
 
 set -euo pipefail
 
@@ -79,280 +84,241 @@ case "${SBOM_FILE}" in
   /*) ;;
   *)  SBOM_FILE="$(pwd)/${SBOM_FILE}" ;;
 esac
-
-if [ ! -f "${SBOM_FILE}" ]; then
-  echo "ERROR: SBOM file not found: ${SBOM_FILE}" >&2
-  exit 1
-fi
+[ -f "${SBOM_FILE}" ] || { echo "ERROR: SBOM file not found: ${SBOM_FILE}" >&2; exit 1; }
 
 cd "${REPO_ROOT}"
 
 # Auto-import bamboo_* plan vars to bare names, then source image.env.
-# Same pattern as build.sh / scan/xray-*.sh — every script that needs
-# behavioural config self-loads it. Without this, sink URLs / project
-# names committed to image.env (SPLUNK_HEC_URL, DEPENDENCY_TRACK_URL,
-# ARTIFACTORY_SBOM_REPO, SBOM_WEBHOOK_URL) would be invisible here and
-# every sink branch would silently skip.
+# Without this, sink URLs / project names committed to image.env would
+# be invisible here and every sink branch would silently skip.
 # shellcheck source=lib/load-image-env.sh
 . "${REPO_ROOT}/scripts/lib/load-image-env.sh"
 import_bamboo_vars
 load_image_env
 
-# Per-run temp directory — avoids /tmp collisions if multiple jobs run
-# in parallel.
-_SBOM_TMPDIR=$(mktemp -d)
-trap 'rm -rf "${_SBOM_TMPDIR}"' EXIT
+# Pull build.env if the build job exported one — gives sinks IMAGE_REF,
+# IMAGE_DIGEST, IMAGE_TAG, IMAGE_NAME, GIT_SHA for richer metadata.
+[ -f build.env ] && . ./build.env
 
-SBOM_SIZE=$(wc -c < "${SBOM_FILE}")
-echo "→ SBOM: ${SBOM_FILE} (${SBOM_SIZE} bytes)"
+_TMP=$(mktemp -d)
+trap 'rm -rf "${_TMP}"' EXIT
 
-# Load build context if present so sink metadata matches the pipeline.
-if [ -f build.env ]; then
-  # shellcheck disable=SC1091
-  . ./build.env
-fi
-
-# ── Sink preflight: log which vars are set/empty for every sink ─────
-# Always on, not gated by BUILD_DEBUG. The "no sinks configured"
-# branch at the bottom is otherwise silent about *why* — this block
-# makes it obvious which var is missing for each sink so a misconfig
-# (URL committed to image.env but token missing as a CI var, or vice
-# versa) shows up immediately in the job log.
-_status() {
-  if [ -n "${!1:-}" ]; then echo "set"; else echo "empty"; fi
-}
-echo "→ Sink preflight (post-image.env, post-bamboo-import):"
-echo "   webhook"
-echo "      SBOM_WEBHOOK_URL=$(_status SBOM_WEBHOOK_URL)"
-echo "      SBOM_WEBHOOK_AUTH_HEADER=$(_status SBOM_WEBHOOK_AUTH_HEADER) (optional)"
-if [ -z "${SBOM_WEBHOOK_URL:-}" ]; then
-  echo "      → skip (SBOM_WEBHOOK_URL empty)"
-else
-  echo "      → fire"
-fi
-echo "   dependency-track"
-echo "      DEPENDENCY_TRACK_URL=$(_status DEPENDENCY_TRACK_URL)"
-echo "      DEPENDENCY_TRACK_API_KEY=$(_status DEPENDENCY_TRACK_API_KEY)"
-echo "      DEPENDENCY_TRACK_PROJECT=$(_status DEPENDENCY_TRACK_PROJECT)"
-if [ -z "${DEPENDENCY_TRACK_URL:-}" ] || [ -z "${DEPENDENCY_TRACK_API_KEY:-}" ]; then
-  echo "      → skip (URL or API_KEY empty)"
-elif [ -z "${DEPENDENCY_TRACK_PROJECT:-}" ]; then
-  echo "      → fire-and-fail (PROJECT empty — branch will warn and bump failures)"
-else
-  echo "      → fire"
-fi
-echo "   artifactory-xray"
-echo "      ARTIFACTORY_URL=$(_status ARTIFACTORY_URL)"
-echo "      ARTIFACTORY_USER=$(_status ARTIFACTORY_USER)"
-if [ -n "${ARTIFACTORY_TOKEN:-}" ]; then
-  echo "      ARTIFACTORY_TOKEN=set (preferred over PASSWORD)"
-elif [ -n "${ARTIFACTORY_PASSWORD:-}" ]; then
-  echo "      ARTIFACTORY_TOKEN=empty  ARTIFACTORY_PASSWORD=set"
-else
-  echo "      ARTIFACTORY_TOKEN=empty  ARTIFACTORY_PASSWORD=empty"
-fi
-echo "      ARTIFACTORY_SBOM_REPO=$(_status ARTIFACTORY_SBOM_REPO)"
-if [ -z "${ARTIFACTORY_URL:-}" ] || [ -z "${ARTIFACTORY_USER:-}" ] || [ -z "${ARTIFACTORY_SBOM_REPO:-}" ]; then
-  echo "      → skip (URL, USER, or SBOM_REPO empty)"
-elif [ -z "${ARTIFACTORY_TOKEN:-}${ARTIFACTORY_PASSWORD:-}" ]; then
-  echo "      → fire-and-fail (no TOKEN or PASSWORD — branch will warn and bump failures)"
-else
-  echo "      → fire"
-fi
-echo "   splunk-hec"
-echo "      SPLUNK_HEC_URL=$(_status SPLUNK_HEC_URL)"
-echo "      SPLUNK_HEC_TOKEN=$(_status SPLUNK_HEC_TOKEN)"
-echo "      SPLUNK_HEC_INDEX=${SPLUNK_HEC_INDEX:-main (default)}"
-echo "      SPLUNK_SBOM_SOURCETYPE=${SPLUNK_SBOM_SOURCETYPE:-cyclonedx:json (default)}"
-if [ -z "${SPLUNK_HEC_URL:-}" ] || [ -z "${SPLUNK_HEC_TOKEN:-}" ]; then
-  echo "      → skip (URL or TOKEN empty — TOKEN must be a masked CI variable, not in image.env)"
-else
-  echo "      → fire"
-fi
+echo "→ SBOM: ${SBOM_FILE} ($(wc -c < "${SBOM_FILE}") bytes)"
 echo ""
 
-did_post=0
-failures=0
+# ── Helpers ─────────────────────────────────────────────────────────
+# Portable SHA wrappers — Mac uses shasum, Linux uses sha1sum/sha256sum.
+# Used by the Artifactory PUT below for the X-Checksum-* headers.
+compute_sha1()   { shasum -a 1   "$1" 2>/dev/null | awk '{print $1}' || sha1sum   "$1" | awk '{print $1}'; }
+compute_sha256() { shasum -a 256 "$1" 2>/dev/null | awk '{print $1}' || sha256sum "$1" | awk '{print $1}'; }
 
-# ── Generic webhook ─────────────────────────────────────────────────
-if [ -n "${SBOM_WEBHOOK_URL:-}" ]; then
-  echo "→ POST SBOM to generic webhook: ${SBOM_WEBHOOK_URL}"
-  HEADERS=(-H "Content-Type: application/vnd.cyclonedx+json")
-  if [ -n "${SBOM_WEBHOOK_AUTH_HEADER:-}" ]; then
-    HEADERS+=(-H "${SBOM_WEBHOOK_AUTH_HEADER}")
+# After a successful Artifactory upload, find the docker manifest in
+# the same Artifactory and stamp it with sbom.path so consumers can
+# cross-reference manifest → SBOM in the Artifactory UI. Best-effort —
+# failures here log a WARN but don't fail the SBOM upload itself.
+# Hoisted out of the Artifactory block because the embedded Python
+# was the longest visual chunk in the file.
+artifactory_tag_manifest_with_sbom_path() {
+  local sbom_path="$1"
+  [ -n "${IMAGE_TAG:-}" ] || return 0
+  command -v python3 >/dev/null 2>&1 || { echo "    WARN: python3 missing — skipping sbom.path tag" >&2; return 0; }
+
+  local art_base="${ARTIFACTORY_URL%/}/artifactory"
+  local secret="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
+  local manifest_path
+  manifest_path=$(curl -sS -u "${ARTIFACTORY_USER}:${secret}" \
+    "${art_base}/api/search/prop?docker.manifest=${IMAGE_TAG}" 2>/dev/null \
+    | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for r in d.get('results', []):
+    uri = r.get('uri', '')
+    if 'manifest.json' in uri:
+        parts = uri.split('/api/storage/')
+        if len(parts) == 2:
+            print(parts[1])
+            break
+" 2>/dev/null) || return 0
+
+  [ -n "${manifest_path}" ] || return 0
+  local code
+  code=$(curl -sS -o /dev/null -w "%{http_code}" \
+    -u "${ARTIFACTORY_USER}:${secret}" \
+    -X PUT "${art_base}/api/storage/${manifest_path}?properties=sbom.path=${sbom_path}" 2>/dev/null)
+  if [ "${code}" = "204" ]; then
+    echo "    sbom.path property set on ${manifest_path}"
+  else
+    echo "    WARN: could not set sbom.path (HTTP ${code})" >&2
   fi
-  if [ -n "${IMAGE_DIGEST:-}" ]; then
-    HEADERS+=(-H "X-Image-Digest: ${IMAGE_DIGEST}")
-  fi
-  if [ -n "${UPSTREAM_TAG:-}" ]; then
-    HEADERS+=(-H "X-Image-Version: ${UPSTREAM_TAG}")
-  fi
-  if curl -fsSL -X POST "${HEADERS[@]}" --data-binary "@${SBOM_FILE}" "${SBOM_WEBHOOK_URL}" -o ${_SBOM_TMPDIR}/webhook-response.txt 2>&1; then
-    echo "  ✓ posted ($(wc -c < ${_SBOM_TMPDIR}/webhook-response.txt) bytes response)"
-    did_post=$((did_post + 1))
+}
+
+posted=0
+failed=0
+
+# ════════════════════════════════════════════════════════════════════
+# SINK 1: Generic CycloneDX webhook
+# ════════════════════════════════════════════════════════════════════
+# Posts the raw .cdx.json body to any URL that accepts a POST. Use
+# for ad-hoc collectors / serverless functions / internal Slack bots /
+# whatever consumes the BOM. Optional Authorization header pass-through.
+if [ -z "${SBOM_WEBHOOK_URL:-}" ]; then
+  echo "→ webhook              skip (SBOM_WEBHOOK_URL empty)"
+else
+  echo "→ webhook              POST ${SBOM_WEBHOOK_URL}"
+  rc=0
+  (
+    headers=(-H "Content-Type: application/vnd.cyclonedx+json")
+    [ -n "${SBOM_WEBHOOK_AUTH_HEADER:-}" ] && headers+=(-H "${SBOM_WEBHOOK_AUTH_HEADER}")
+    [ -n "${IMAGE_DIGEST:-}" ]             && headers+=(-H "X-Image-Digest: ${IMAGE_DIGEST}")
+    [ -n "${UPSTREAM_TAG:-}" ]             && headers+=(-H "X-Image-Version: ${UPSTREAM_TAG}")
+    curl -fsSL -X POST "${headers[@]}" --data-binary "@${SBOM_FILE}" \
+      "${SBOM_WEBHOOK_URL}" -o "${_TMP}/webhook.out"
+    echo "  ✓ posted ($(wc -c < "${_TMP}/webhook.out") bytes response)"
+  ) || rc=$?
+  if [ "${rc}" -eq 0 ]; then
+    posted=$((posted + 1))
   else
     echo "  ✗ webhook POST failed" >&2
-    failures=$((failures + 1))
+    failed=$((failed + 1))
   fi
 fi
 
-# ── OWASP Dependency-Track ──────────────────────────────────────────
-if [ -n "${DEPENDENCY_TRACK_URL:-}" ] && [ -n "${DEPENDENCY_TRACK_API_KEY:-}" ]; then
-  echo "→ Upload SBOM to Dependency-Track: ${DEPENDENCY_TRACK_URL}"
-
-  if [ -z "${DEPENDENCY_TRACK_PROJECT:-}" ]; then
-    echo "  ✗ DEPENDENCY_TRACK_PROJECT not set — skipping" >&2
-    failures=$((failures + 1))
-  else
-    DT_VERSION="${UPSTREAM_TAG:-latest}"
-    # DT /api/v1/bom expects a JSON body with base64-encoded bom.
-    # `jq -Rs .` handles the escaping for us reliably.
+# ════════════════════════════════════════════════════════════════════
+# SINK 2: OWASP Dependency-Track
+# ════════════════════════════════════════════════════════════════════
+# Uploads to /api/v1/bom with a JSON body containing the base64-encoded
+# CycloneDX. autoCreate=true creates the project on first upload, then
+# subsequent uploads correlate against the same project/version so DT
+# can show diff-style "new vulns since last build" notifications.
+if [ -z "${DEPENDENCY_TRACK_URL:-}" ] || [ -z "${DEPENDENCY_TRACK_API_KEY:-}" ]; then
+  echo "→ dependency-track     skip (URL or API_KEY empty)"
+elif [ -z "${DEPENDENCY_TRACK_PROJECT:-}" ]; then
+  echo "→ dependency-track     misconfigured (URL+KEY set but PROJECT empty)" >&2
+  failed=$((failed + 1))
+else
+  echo "→ dependency-track     POST ${DEPENDENCY_TRACK_URL}"
+  rc=0
+  (
+    ver="${UPSTREAM_TAG:-latest}"
+    bom_b64=$(base64 < "${SBOM_FILE}" | tr -d '\n')
     if command -v jq >/dev/null 2>&1; then
-      BOM_B64=$(base64 < "${SBOM_FILE}" | tr -d '\n')
-      PAYLOAD=$(jq -nc \
+      payload=$(jq -nc \
         --arg name "${DEPENDENCY_TRACK_PROJECT}" \
-        --arg ver "${DT_VERSION}" \
-        --arg bom "${BOM_B64}" \
-        '{projectName:$name,projectVersion:$ver,autoCreate:true,bom:$bom}')
+        --arg ver  "${ver}" \
+        --arg bom  "${bom_b64}" \
+        '{projectName:$name, projectVersion:$ver, autoCreate:true, bom:$bom}')
     else
-      BOM_B64=$(base64 < "${SBOM_FILE}" | tr -d '\n')
-      PAYLOAD="{\"projectName\":\"${DEPENDENCY_TRACK_PROJECT}\",\"projectVersion\":\"${DT_VERSION}\",\"autoCreate\":true,\"bom\":\"${BOM_B64}\"}"
+      payload="{\"projectName\":\"${DEPENDENCY_TRACK_PROJECT}\",\"projectVersion\":\"${ver}\",\"autoCreate\":true,\"bom\":\"${bom_b64}\"}"
     fi
-
-    if curl -fsSL -X POST \
-         -H "X-Api-Key: ${DEPENDENCY_TRACK_API_KEY}" \
-         -H "Content-Type: application/json" \
-         --data "${PAYLOAD}" \
-         "${DEPENDENCY_TRACK_URL%/}/api/v1/bom" -o ${_SBOM_TMPDIR}/dt-response.txt; then
-      echo "  ✓ uploaded to project '${DEPENDENCY_TRACK_PROJECT}' v${DT_VERSION}"
-      echo "    response: $(cat ${_SBOM_TMPDIR}/dt-response.txt)"
-      did_post=$((did_post + 1))
-    else
-      echo "  ✗ Dependency-Track upload failed" >&2
-      failures=$((failures + 1))
-    fi
-  fi
-fi
-
-# ── JFrog Artifactory Pro + Xray (native SBOM indexing) ─────────────
-# Xray picks up any .cdx.json uploaded to an indexed generic repo and
-# runs its scanner against the bill of materials. We PUT the file at
-# a predictable path so it's easy to find in the Artifactory UI:
-#   <repo>/<image-name>/<version>/sbom.cdx.json
-# Xray catalogs it under Scans → SBOM Imports on first upload, and
-# correlates repeat uploads against the same project/version.
-if [ -n "${ARTIFACTORY_URL:-}" ] && [ -n "${ARTIFACTORY_USER:-}" ] \
-   && [ -n "${ARTIFACTORY_SBOM_REPO:-}" ]; then
-  ART_SECRET="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
-  if [ -z "${ART_SECRET}" ]; then
-    echo "  ✗ Artifactory SBOM sink: no ARTIFACTORY_TOKEN or ARTIFACTORY_PASSWORD" >&2
-    failures=$((failures + 1))
+    curl -fsSL -X POST \
+      -H "X-Api-Key: ${DEPENDENCY_TRACK_API_KEY}" \
+      -H "Content-Type: application/json" \
+      --data "${payload}" \
+      "${DEPENDENCY_TRACK_URL%/}/api/v1/bom" -o "${_TMP}/dt.out"
+    echo "  ✓ uploaded to project '${DEPENDENCY_TRACK_PROJECT}' v${ver}"
+    [ -s "${_TMP}/dt.out" ] && echo "    response: $(cat "${_TMP}/dt.out")"
+  ) || rc=$?
+  if [ "${rc}" -eq 0 ]; then
+    posted=$((posted + 1))
   else
-    # IMAGE_NAME from build.env may include the full registry path
-    # (e.g. registry.example.com/project/nginx). Extract the short name.
-    IMG="${IMAGE_NAME:-image}"
-    IMG="${IMG##*/}"
-    # Use IMAGE_TAG (includes git hash, e.g. 1.29.8-alpine-5d3ea65) for
-    # 1:1 mapping between SBOM and pushed image. Falls back to upstream
-    # tag if IMAGE_TAG isn't set.
-    VER="${IMAGE_TAG:-${UPSTREAM_TAG:-latest}}"
-    DEPLOY_PATH="${ARTIFACTORY_SBOM_REPO}/${IMG}/${VER}/sbom.cdx.json"
-    DEPLOY_URL="${ARTIFACTORY_URL%/}/artifactory/${DEPLOY_PATH}"
-    echo "→ Upload SBOM to Artifactory Xray: ${DEPLOY_PATH}"
-
-    # Compute SHA-1 + SHA-256 checksums for the X-Checksum headers.
-    # Artifactory will reject the PUT if the body doesn't match.
-    SHA1=$(shasum -a 1 "${SBOM_FILE}" 2>/dev/null | awk '{print $1}')
-    SHA256=$(shasum -a 256 "${SBOM_FILE}" 2>/dev/null | awk '{print $1}')
-    # Fallback to sha1sum/sha256sum on Linux runners
-    [ -z "${SHA1}" ] && SHA1=$(sha1sum "${SBOM_FILE}" | awk '{print $1}')
-    [ -z "${SHA256}" ] && SHA256=$(sha256sum "${SBOM_FILE}" | awk '{print $1}')
-
-    if curl -fsSL -X PUT \
-         -u "${ARTIFACTORY_USER}:${ART_SECRET}" \
-         -H "Content-Type: application/vnd.cyclonedx+json" \
-         -H "X-Checksum-Sha1: ${SHA1}" \
-         -H "X-Checksum-Sha256: ${SHA256}" \
-         --data-binary "@${SBOM_FILE}" \
-         "${DEPLOY_URL}" -o ${_SBOM_TMPDIR}/art-response.txt; then
-      echo "  ✓ deployed — Xray will auto-index"
-      if command -v jq >/dev/null 2>&1 && [ -s ${_SBOM_TMPDIR}/art-response.txt ]; then
-        URI=$(jq -r '.uri // empty' ${_SBOM_TMPDIR}/art-response.txt 2>/dev/null || echo "")
-        [ -n "${URI}" ] && echo "    uri: ${URI}"
-      fi
-      # Tag the Docker manifest with sbom.path for cross-reference.
-      # Uses Artifactory property search API to find the manifest, then
-      # sets sbom.path via REST. Does not depend on jf config state.
-      if [ -n "${IMAGE_TAG:-}" ]; then
-        _art_base="${ARTIFACTORY_URL%/}/artifactory"
-        _manifest_path=$(curl -sS -u "${ARTIFACTORY_USER}:${ART_SECRET}" \
-          "${_art_base}/api/search/prop?docker.manifest=${IMAGE_TAG}" 2>/dev/null \
-          | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-for r in d.get('results',[]):
-    uri=r.get('uri','')
-    if 'manifest.json' in uri:
-        parts=uri.split('/api/storage/')
-        if len(parts)==2: print(parts[1]); break
-" 2>/dev/null || echo "")
-        if [ -n "${_manifest_path}" ]; then
-          _prop_code=$(curl -sS -o /dev/null -w "%{http_code}" \
-            -u "${ARTIFACTORY_USER}:${ART_SECRET}" \
-            -X PUT "${_art_base}/api/storage/${_manifest_path}?properties=sbom.path=${DEPLOY_PATH}" 2>/dev/null)
-          if [ "${_prop_code}" = "204" ]; then
-            echo "    sbom.path property set on ${_manifest_path}"
-          else
-            echo "    WARN: could not set sbom.path (HTTP ${_prop_code})" >&2
-          fi
-        fi
-      fi
-      did_post=$((did_post + 1))
-    else
-      echo "  ✗ Artifactory SBOM upload failed" >&2
-      cat ${_SBOM_TMPDIR}/art-response.txt >&2 2>/dev/null || true
-      failures=$((failures + 1))
-    fi
+    echo "  ✗ Dependency-Track upload failed" >&2
+    failed=$((failed + 1))
   fi
 fi
 
-# ── Splunk HEC (via shared lib) ─────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+# SINK 3: JFrog Artifactory + Xray (native SBOM import)
+# ════════════════════════════════════════════════════════════════════
+# Xray picks up any .cdx.json uploaded to an indexed generic repo and
+# scans the bill of materials. We PUT the file at a predictable path
+# so it's discoverable in the Artifactory UI:
+#   <repo>/<image-name>/<version>/sbom.cdx.json
+# After the upload succeeds, we also stamp the docker manifest with a
+# sbom.path property for cross-reference (best-effort, see helper).
+if [ -z "${ARTIFACTORY_URL:-}" ] || [ -z "${ARTIFACTORY_USER:-}" ] || [ -z "${ARTIFACTORY_SBOM_REPO:-}" ]; then
+  echo "→ artifactory-xray     skip (URL, USER, or SBOM_REPO empty)"
+elif [ -z "${ARTIFACTORY_TOKEN:-}${ARTIFACTORY_PASSWORD:-}" ]; then
+  echo "→ artifactory-xray     misconfigured (no TOKEN or PASSWORD)" >&2
+  failed=$((failed + 1))
+else
+  # IMAGE_NAME from build.env may be a full registry path — keep just the leaf.
+  art_image="${IMAGE_NAME:-image}"; art_image="${art_image##*/}"
+  art_version="${IMAGE_TAG:-${UPSTREAM_TAG:-latest}}"
+  art_sbom_path="${ARTIFACTORY_SBOM_REPO}/${art_image}/${art_version}/sbom.cdx.json"
+  art_deploy_url="${ARTIFACTORY_URL%/}/artifactory/${art_sbom_path}"
+  echo "→ artifactory-xray     PUT ${art_sbom_path}"
+
+  rc=0
+  (
+    secret="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
+    sha1=$(compute_sha1   "${SBOM_FILE}")
+    sha256=$(compute_sha256 "${SBOM_FILE}")
+    curl -fsSL -X PUT \
+      -u "${ARTIFACTORY_USER}:${secret}" \
+      -H "Content-Type: application/vnd.cyclonedx+json" \
+      -H "X-Checksum-Sha1: ${sha1}" \
+      -H "X-Checksum-Sha256: ${sha256}" \
+      --data-binary "@${SBOM_FILE}" \
+      "${art_deploy_url}" -o "${_TMP}/art.out"
+    echo "  ✓ deployed — Xray will auto-index"
+    if command -v jq >/dev/null 2>&1 && [ -s "${_TMP}/art.out" ]; then
+      uri=$(jq -r '.uri // empty' "${_TMP}/art.out" 2>/dev/null || echo "")
+      [ -n "${uri}" ] && echo "    uri: ${uri}"
+    fi
+    artifactory_tag_manifest_with_sbom_path "${art_sbom_path}"
+  ) || rc=$?
+  if [ "${rc}" -eq 0 ]; then
+    posted=$((posted + 1))
+  else
+    echo "  ✗ Artifactory SBOM upload failed" >&2
+    cat "${_TMP}/art.out" >&2 2>/dev/null || true
+    failed=$((failed + 1))
+  fi
+fi
+
+# ════════════════════════════════════════════════════════════════════
+# SINK 4: Splunk HEC (audit ingestion)
+# ════════════════════════════════════════════════════════════════════
 # Vendor-agnostic: same sourcetype handles Syft-, Xray-, or Trivy-made
-# SBOMs. Build the event content (sbom_file + image + git_commit +
-# the BOM nested under .cyclonedx) and hand to the shared poster.
-if [ -n "${SPLUNK_HEC_URL:-}" ] && [ -n "${SPLUNK_HEC_TOKEN:-}" ]; then
-  if command -v jq >/dev/null 2>&1; then
-    IMAGE_REF_HEC="${IMAGE_REF:-${UPSTREAM_REGISTRY:-}/${UPSTREAM_IMAGE:-}:${UPSTREAM_TAG:-}}"
-    GIT_SHA_HEC="${GIT_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
+# SBOMs. Build the event content (sbom_file + image + git_commit + the
+# BOM nested under .cyclonedx) and hand to the shared HEC poster.
+if [ -z "${SPLUNK_HEC_URL:-}" ] || [ -z "${SPLUNK_HEC_TOKEN:-}" ]; then
+  echo "→ splunk-hec           skip (URL or TOKEN empty)"
+elif ! command -v jq >/dev/null 2>&1; then
+  echo "→ splunk-hec           misconfigured (jq required for HEC envelope construction)" >&2
+  failed=$((failed + 1))
+else
+  echo "→ splunk-hec           POST ${SPLUNK_HEC_URL}"
+  rc=0
+  (
+    image_ref="${IMAGE_REF:-${UPSTREAM_REGISTRY:-}/${UPSTREAM_IMAGE:-}:${UPSTREAM_TAG:-}}"
+    git_sha="${GIT_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
     jq -nc \
       --arg sbom_file "${SBOM_FILE##*/}" \
-      --arg image     "${IMAGE_REF_HEC}" \
-      --arg gitsha    "${GIT_SHA_HEC}" \
+      --arg image     "${image_ref}" \
+      --arg gitsha    "${git_sha}" \
       --slurpfile bom "${SBOM_FILE}" \
-      '{
-         sbom_file:     $sbom_file,
-         scanned_image: $image,
-         git_commit:    $gitsha,
-         cyclonedx:     $bom[0]
-       }' > "${_SBOM_TMPDIR}/hec-event.json"
+      '{sbom_file:$sbom_file, scanned_image:$image, git_commit:$gitsha, cyclonedx:$bom[0]}' \
+      > "${_TMP}/hec.json"
 
     # shellcheck source=lib/splunk-hec.sh
     . "${REPO_ROOT}/scripts/lib/splunk-hec.sh"
-    if splunk_hec_post "${_SBOM_TMPDIR}/hec-event.json" \
-         "${SPLUNK_SBOM_SOURCETYPE:-cyclonedx:json}"; then
-      did_post=$((did_post + 1))
-    fi
-    # POST failure stays a warning (already logged by splunk_hec_post);
-    # we don't bump `failures` so other sinks can still succeed.
+    splunk_hec_post "${_TMP}/hec.json" "${SPLUNK_SBOM_SOURCETYPE:-cyclonedx:json}"
+  ) || rc=$?
+  if [ "${rc}" -eq 0 ]; then
+    posted=$((posted + 1))
   else
-    echo "  ✗ jq required for Splunk HEC envelope construction" >&2
-    failures=$((failures + 1))
+    # splunk_hec_post already logs the curl error
+    failed=$((failed + 1))
   fi
 fi
 
-# ── Summary ─────────────────────────────────────────────────────────
-if [ ${did_post} -eq 0 ] && [ ${failures} -eq 0 ]; then
-  echo ""
+echo ""
+
+# ════════════════════════════════════════════════════════════════════
+# Summary
+# ════════════════════════════════════════════════════════════════════
+if [ ${posted} -eq 0 ] && [ ${failed} -eq 0 ]; then
   echo "SBOM post-processing: no sinks configured."
   echo "  To enable ingestion, set one of:"
   echo "    - SBOM_WEBHOOK_URL (+ optional SBOM_WEBHOOK_AUTH_HEADER)"
@@ -363,11 +329,9 @@ if [ ${did_post} -eq 0 ] && [ ${failures} -eq 0 ]; then
   exit 0
 fi
 
-if [ ${failures} -gt 0 ]; then
-  echo ""
-  echo "ERROR: ${failures} sink(s) failed" >&2
+if [ ${failed} -gt 0 ]; then
+  echo "ERROR: ${failed} sink(s) failed — ${posted} succeeded" >&2
   exit 1
 fi
 
-echo ""
-echo "SBOM post-processing: ${did_post} sink(s) succeeded"
+echo "SBOM post-processing: ${posted} sink(s) succeeded"
