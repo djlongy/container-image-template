@@ -524,6 +524,9 @@ _artifactory_pro_flow() {
   push_digest=$(_artifactory_resolve_push_digest "${_ART_TARGET}")
   _artifactory_write_build_env "${_ART_TARGET}" "${push_digest}"
 
+  # Clean up the buildx _uploads orphan (see helper for why).
+  _artifactory_cleanup_uploads_orphan "${push_digest}"
+
   # Custom properties on the manifest. jf docker push already set
   # build.name + build.number on all layers — we only add our custom
   # metadata on the manifest file itself.
@@ -546,6 +549,9 @@ _artifactory_free_flow() {
   local push_digest
   push_digest=$(_artifactory_resolve_push_digest "${_ART_TARGET}" "${push_output}")
   _artifactory_write_build_env "${_ART_TARGET}" "${push_digest}"
+
+  # Clean up the buildx _uploads orphan (see helper for why).
+  _artifactory_cleanup_uploads_orphan "${push_digest}"
 
   # Build info WITH module linkage — constructs artifacts[] and
   # dependencies[] from storage-API checksums + side-loaded manifests.
@@ -1110,6 +1116,51 @@ except json.JSONDecodeError:
   else
     printf '%s' "${manifest_path}"
   fi
+}
+
+# After every push from buildx (including --provenance=false single-arch
+# builds), JFrog stores the manifest in TWO places:
+#
+#   1. <repo>/<image>/<tag>/manifest.json    (the tagged version)
+#   2. <repo>/<image>/_uploads/manifest-sha256__<digest>.json
+#      (a leftover from buildx's two-step push: PUT-by-digest, then tag)
+#
+# Both have the docker.manifest property set, so JFrog's Packages view
+# shows the same image as TWO "versions" — one as the proper tag, one
+# as the bare digest hash. Classic dockerd (Linux runners) doesn't do
+# the two-step push, so it leaves no _uploads file and shows only the
+# tagged version.
+#
+# Delete the _uploads copy. It's a duplicate of the tag's manifest
+# content, NOT the canonical manifest blob (JFrog stores that in its
+# own digest-indexed blob storage). Verified: pull-by-digest and
+# pull-by-tag both still work after the DELETE — only the Packages-view
+# duplicate disappears.
+#
+# Best-effort: never fail the push if cleanup fails (e.g. permissions).
+_artifactory_cleanup_uploads_orphan() {
+  local digest="$1"
+  [ -z "${digest}" ] && return 0
+  case "${digest}" in
+    sha256:*) ;;
+    *) return 0 ;;
+  esac
+  local digest_hex="${digest#sha256:}"
+  local secret="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
+  local _url="${ARTIFACTORY_URL%/}"
+  _url="${_url%/artifactory}"
+  local repo="${_ART_MANIFEST_PATH%%/*}"
+  local image="${IMAGE_NAME##*/}"
+  local orphan_path="${repo}/${image}/_uploads/manifest-sha256__${digest_hex}.json"
+  local code
+  code=$(curl -sS -o /dev/null -w "%{http_code}" \
+    -u "${ARTIFACTORY_USER}:${secret}" -X DELETE \
+    "${_url}/artifactory/${orphan_path}" 2>/dev/null)
+  case "${code}" in
+    204) _dbg "cleanup: removed _uploads orphan (HTTP 204)" ;;
+    404) _dbg "cleanup: no _uploads orphan to remove (classic dockerd push?)" ;;
+    *)   _dbg "cleanup: _uploads DELETE returned HTTP ${code} — ignoring" ;;
+  esac
 }
 
 _artifactory_set_props() {
