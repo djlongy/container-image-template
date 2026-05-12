@@ -271,66 +271,28 @@ _build_materialise_certs() {
 }
 
 # ════════════════════════════════════════════════════════════════════
-# PHASE 4 — Push target derivation
+# PHASE 4 — Push target derivation (backend-agnostic)
 # ════════════════════════════════════════════════════════════════════
-# When REGISTRY_KIND=artifactory, HARBOR_REGISTRY/HARBOR_PROJECT are only
-# used for the intermediate local tag (the backend retags via its own
-# layout template). Auto-derive from Artifactory vars so users don't
-# set redundant values. Also parses --push and computes FULL_IMAGE +
-# UPSTREAM_REF.
+# build.sh stays out of every backend's namespace. Each push-backend
+# (scripts/push-backends/<kind>.sh) is wholly responsible for:
+#   - reading its OWN required env (HARBOR_* for harbor.sh,
+#     ARTIFACTORY_* for artifactory.sh, etc.)
+#   - validating those vars when --push is requested
+#   - retagging the local image to its push URL before docker push
+#
+# That means HARBOR_* and ARTIFACTORY_* are fully independent — you
+# only need to set the namespace that matches your REGISTRY_KIND, and
+# neither cross-derives from the other. Symmetric, no surprises.
+#
+# Build.sh just composes a SIMPLE local tag for docker build to use:
+#   <IMAGE_NAME>:<FULL_TAG>          e.g. nginx:1.25.3-alpine-a1b2c3d
+# Backends retag from this to their target URL during push_to_backend.
 
 _build_resolve_push_target() {
-  REGISTRY_KIND_LC="$(echo "${REGISTRY_KIND:-}" | tr '[:upper:]' '[:lower:]')"
-  _dbg "REGISTRY_KIND=${REGISTRY_KIND:-<unset>} → backend=${REGISTRY_KIND_LC:-default-harbor-style}"
+  REGISTRY_KIND_LC="$(echo "${REGISTRY_KIND:-harbor}" | tr '[:upper:]' '[:lower:]')"
+  _dbg "REGISTRY_KIND=${REGISTRY_KIND:-<unset>} → backend=${REGISTRY_KIND_LC}"
 
-  if [ "${REGISTRY_KIND_LC}" = "artifactory" ]; then
-    if [ -z "${HARBOR_REGISTRY:-}" ] && [ -n "${ARTIFACTORY_PUSH_HOST:-}" ]; then
-      HARBOR_REGISTRY="${ARTIFACTORY_PUSH_HOST}"
-      _dbg "HARBOR_REGISTRY auto-derived from ARTIFACTORY_PUSH_HOST=${HARBOR_REGISTRY}"
-    elif [ -z "${HARBOR_REGISTRY:-}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
-      HARBOR_REGISTRY="${ARTIFACTORY_URL#https://}"
-      HARBOR_REGISTRY="${HARBOR_REGISTRY#http://}"
-      HARBOR_REGISTRY="${HARBOR_REGISTRY%%/*}"
-      _dbg "HARBOR_REGISTRY auto-derived from ARTIFACTORY_URL=${HARBOR_REGISTRY}"
-    fi
-    # Reverse derivation: if only HARBOR_REGISTRY is set (homelab /
-    # single-host on-prem case where the same FQDN serves both Docker
-    # registry and REST API), populate ARTIFACTORY_URL from it so the
-    # backend's API calls have a target.
-    #
-    # NOT safe on JFrog Cloud SaaS — Cloud splits the hosts (REST at
-    # mycorp.jfrog.io, docker at mycorp-docker.jfrog.io). On Cloud,
-    # set ARTIFACTORY_URL explicitly in image.env so this branch is
-    # skipped.
-    if [ -z "${ARTIFACTORY_URL:-}" ] && [ -n "${HARBOR_REGISTRY:-}" ]; then
-      ARTIFACTORY_URL="https://${HARBOR_REGISTRY}"
-      _dbg "ARTIFACTORY_URL auto-derived from HARBOR_REGISTRY=${ARTIFACTORY_URL} (homelab/single-host pattern; set explicitly on JFrog Cloud)"
-    fi
-    if [ -z "${HARBOR_PROJECT:-}" ] && [ -n "${ARTIFACTORY_TEAM:-}" ]; then
-      HARBOR_PROJECT="${ARTIFACTORY_TEAM}"
-      _dbg "HARBOR_PROJECT auto-derived from ARTIFACTORY_TEAM=${HARBOR_PROJECT}"
-    fi
-  fi
-
-  # WANT_PUSH was set by _build_parse_args; validate push target only
-  # when push is actually requested.
-  if [ "${WANT_PUSH}" -eq 1 ]; then
-    if [ -z "${HARBOR_REGISTRY:-}" ] || [ -z "${HARBOR_PROJECT:-}" ]; then
-      echo "ERROR: HARBOR_REGISTRY and HARBOR_PROJECT must be set for --push" >&2
-      if [ "${REGISTRY_KIND_LC}" = "artifactory" ]; then
-        echo "       (tip: set ARTIFACTORY_PUSH_HOST + ARTIFACTORY_TEAM and they'll" >&2
-        echo "        auto-derive HARBOR_REGISTRY + HARBOR_PROJECT for the local tag)" >&2
-      fi
-      return 1
-    fi
-  fi
-
-  if [ -n "${HARBOR_REGISTRY:-}" ] && [ -n "${HARBOR_PROJECT:-}" ]; then
-    FULL_IMAGE="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${FULL_TAG}"
-  else
-    FULL_IMAGE="${IMAGE_NAME}:${FULL_TAG}"
-  fi
-
+  FULL_IMAGE="${IMAGE_NAME}:${FULL_TAG}"
   UPSTREAM_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
 }
 

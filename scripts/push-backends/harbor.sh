@@ -3,37 +3,46 @@
 #
 # Sourced by scripts/build.sh when REGISTRY_KIND is unset OR set to
 # "harbor". Exposes a single entry point — push_to_backend() — that
-# handles docker login, docker push, digest extraction, and build.env
-# emission.
+# handles env validation, retag from the simple local build tag,
+# docker login, docker push, digest extraction, and build.env emission.
 #
 # Mirrors the contract of scripts/push-backends/artifactory.sh so a
 # fork can swap backends by changing REGISTRY_KIND alone, without
 # touching build.sh.
 #
+# ── HARBOR vars are fully independent of ARTIFACTORY_* ──────────────
+# This backend reads ONLY HARBOR_* env. It never falls back to or
+# auto-derives anything from ARTIFACTORY_*. Same independence holds
+# the other way — artifactory.sh ignores HARBOR_*. Pick the namespace
+# that matches your REGISTRY_KIND; the other one is irrelevant.
+#
 # ── Variables this backend reads (set in image.env / shell env) ─────
 #
 # Required (when --push):
-#   HARBOR_REGISTRY              destination registry host (e.g. harbor.example.com)
-#   HARBOR_PROJECT               project / path prefix under HARBOR_REGISTRY
+#   HARBOR_REGISTRY    destination registry host (e.g. harbor.example.com)
+#   HARBOR_PROJECT     project / path prefix under HARBOR_REGISTRY
+#                      (composes the push URL as
+#                       <HARBOR_REGISTRY>/<HARBOR_PROJECT>/<IMAGE_NAME>:<FULL_TAG>)
 #
-# Required at runtime for authenticated registries:
+# Required for authenticated registries:
 #   HARBOR_USER
-#   HARBOR_PASSWORD     password or token (CI-masked, never committed)
+#   HARBOR_PASSWORD    password or token (CI-masked, never committed)
 #
 # Inputs from build.sh (already exported):
-#   FULL_IMAGE                 fully-qualified ref to push (the local tag)
-#   FULL_TAG                   computed tag (UPSTREAM_TAG[-gitShort])
-#   IMAGE_NAME                 image short name
-#   UPSTREAM_TAG, UPSTREAM_REF, BASE_DIGEST, GIT_SHA, CREATED
+#   FULL_IMAGE         simple local docker tag, e.g. nginx:1.25.3-alpine-abc
+#                      → this backend retags it to the Harbor target URL
+#                        before pushing
+#   FULL_TAG           computed tag (UPSTREAM_TAG[-gitShort])
+#   IMAGE_NAME, UPSTREAM_TAG, UPSTREAM_REF, BASE_DIGEST, GIT_SHA, CREATED
 #
 # ── Outputs ─────────────────────────────────────────────────────────
 #
 # Emits the canonical artifact contract shared with the Artifactory
 # backend so downstream stages don't care which backend ran:
 #
-#   build.env                  IMAGE_REF, IMAGE_TAG, IMAGE_DIGEST,
-#                              IMAGE_NAME, UPSTREAM_TAG, UPSTREAM_REF,
-#                              BASE_DIGEST, GIT_SHA, CREATED
+#   build.env          IMAGE_REF, IMAGE_TAG, IMAGE_DIGEST, IMAGE_NAME,
+#                      UPSTREAM_TAG, UPSTREAM_REF, BASE_DIGEST, GIT_SHA,
+#                      CREATED, SBOM_FILE, VULN_SCAN_FILE
 
 set -uo pipefail
 
@@ -41,13 +50,20 @@ set -uo pipefail
 # Internals
 # ════════════════════════════════════════════════════════════════════
 
+_harbor_require_env() {
+  local missing=0 var
+  for var in HARBOR_REGISTRY HARBOR_PROJECT; do
+    if [ -z "${!var:-}" ]; then
+      echo "ERROR: ${var} is required for the Harbor backend (--push)" >&2
+      missing=1
+    fi
+  done
+  return "${missing}"
+}
+
 _harbor_docker_login() {
   if ! command -v docker >/dev/null 2>&1; then
     echo "ERROR: 'docker' CLI not found on PATH" >&2
-    return 1
-  fi
-  if [ -z "${HARBOR_REGISTRY:-}" ]; then
-    echo "ERROR: HARBOR_REGISTRY is required for the Harbor backend" >&2
     return 1
   fi
   if [ -z "${HARBOR_USER:-}" ] || [ -z "${HARBOR_PASSWORD:-}" ]; then
@@ -60,11 +76,19 @@ _harbor_docker_login() {
     -u "${HARBOR_USER}" --password-stdin
 }
 
+# Compose the Harbor push URL from HARBOR_* vars + the build-time
+# IMAGE_NAME/FULL_TAG. Decoupled from build.sh so the backend owns
+# its target shape.
+_harbor_compose_target() {
+  printf '%s/%s/%s:%s' \
+    "${HARBOR_REGISTRY}" "${HARBOR_PROJECT}" "${IMAGE_NAME}" "${FULL_TAG}"
+}
+
 _harbor_print_banner() {
-  local target="$1"
+  local source_ref="$1" target="$2"
   echo ""
   echo "=== Harbor push ==="
-  echo "  Source (local):  ${target}"
+  echo "  Source (local):  ${source_ref}"
   echo "  Target:          ${target}"
   echo "  Push host:       ${HARBOR_REGISTRY}"
   echo "  Project path:    ${HARBOR_PROJECT}"
@@ -99,10 +123,20 @@ EOF
 # ════════════════════════════════════════════════════════════════════
 
 push_to_backend() {
-  local target="$1"
+  local source_ref="$1"   # simple local tag from build.sh, e.g. nginx:1.25.3-alpine-abc
 
+  _harbor_require_env  || return 1
   _harbor_docker_login || return 1
-  _harbor_print_banner "${target}"
+
+  local target
+  target="$(_harbor_compose_target)"
+  _harbor_print_banner "${source_ref}" "${target}"
+
+  # Retag the local image to the Harbor target URL before push.
+  docker tag "${source_ref}" "${target}" || {
+    echo "ERROR: docker tag ${source_ref} → ${target} failed" >&2
+    return 1
+  }
 
   echo ""
   echo "→ docker push ${target}"

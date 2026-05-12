@@ -220,16 +220,17 @@ echo "${out}" | head -5
 _must_contain "UPSTREAM_IMAGE must be set"
 end_scenario
 
-scenario "push-without-push-registry-fails"
-# Strip HARBOR_REGISTRY/PROJECT (and ARTIFACTORY_PUSH_HOST in case
-# auto-derive would kick in) from image.env so the test starts from
-# the unconfigured state regardless of what's currently committed.
-sed -i.bak -E '/^(HARBOR_REGISTRY|HARBOR_PROJECT|ARTIFACTORY_URL|ARTIFACTORY_PUSH_HOST)=/d' image.env && rm image.env.bak
+scenario "harbor-push-without-required-vars-fails"
+# REGISTRY_KIND defaults to harbor. With HARBOR_* unset, harbor.sh's
+# own _harbor_require_env should fail loudly. build.sh itself no
+# longer validates backend-specific vars — each backend owns that.
+sed -i.bak -E '/^(HARBOR_REGISTRY|HARBOR_PROJECT|REGISTRY_KIND)=/d' image.env && rm image.env.bak
 out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --push 2>&1) ; rc=$?
 echo "${out}" > "${TMP_DIR}/out"
-echo "${out}" | head -10
-[ "${rc}" -ne 0 ] || FAILURES+=("${CURRENT_NAME}: expected non-zero exit on --push without HARBOR_REGISTRY")
-_must_contain "HARBOR_REGISTRY and HARBOR_PROJECT must be set"
+echo "${out}" | tail -10
+[ "${rc}" -ne 0 ] || FAILURES+=("${CURRENT_NAME}: expected non-zero exit on --push without HARBOR_*")
+_must_contain "HARBOR_REGISTRY is required for the Harbor backend"
+_must_contain "HARBOR_PROJECT is required for the Harbor backend"
 end_scenario
 
 scenario "argv-extra-args-rejected"
@@ -260,29 +261,49 @@ end_scenario
 # ════════════════════════════════════════════════════════════════════
 
 scenario "registry-kind-artifactory-needs-creds-on-push"
-# Strip BOTH push-side and Artifactory derivation sources from
-# image.env so the test starts from an unconfigured state. With
-# REGISTRY_KIND=artifactory but no derivation source, --push must fail.
-sed -i.bak -E '/^(HARBOR_REGISTRY|HARBOR_PROJECT|ARTIFACTORY_URL|ARTIFACTORY_PUSH_HOST|ARTIFACTORY_TEAM|REGISTRY_KIND)=/d' image.env && rm image.env.bak
+# With REGISTRY_KIND=artifactory and no ARTIFACTORY_* config,
+# artifactory.sh's _artifactory_require_env should fail loudly.
+# build.sh no longer cross-derives Harbor vars, so the error must
+# be Artifactory-specific.
+sed -i.bak -E '/^(HARBOR_REGISTRY|HARBOR_PROJECT|ARTIFACTORY_URL|ARTIFACTORY_USER|ARTIFACTORY_PUSH_HOST|ARTIFACTORY_TEAM|REGISTRY_KIND)=/d' image.env && rm image.env.bak
 echo 'REGISTRY_KIND="artifactory"' >> image.env
 out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --push 2>&1) ; rc=$?
 echo "${out}" > "${TMP_DIR}/out"
-echo "${out}" | head -10
+echo "${out}" | tail -10
 [ "${rc}" -ne 0 ] || FAILURES+=("${CURRENT_NAME}: expected non-zero exit")
-_must_contain "HARBOR_REGISTRY and HARBOR_PROJECT must be set"
-_must_contain "ARTIFACTORY_PUSH_HOST"  # tip pointing at the right vars
+# Artifactory backend's own require_env names ARTIFACTORY_* vars (NOT HARBOR_*)
+_must_contain "ARTIFACTORY_URL is required"
+_must_contain "ARTIFACTORY_USER is required"
+_must_contain "ARTIFACTORY_TEAM is required"
+# Confirm there's no leakage of HARBOR_* error text — backends are independent
+_must_not_contain "HARBOR_REGISTRY"
 end_scenario
 
-scenario "registry-kind-artifactory-derives-from-push-host"
-# Strip image.env push config first, then provide ARTIFACTORY_PUSH_HOST
-# via shell to test the auto-derive path.
-sed -i.bak -E '/^(HARBOR_REGISTRY|HARBOR_PROJECT|ARTIFACTORY_URL|ARTIFACTORY_PUSH_HOST|ARTIFACTORY_TEAM|REGISTRY_KIND)=/d' image.env && rm image.env.bak
-echo 'REGISTRY_KIND="artifactory"' >> image.env
+scenario "build-uses-simple-local-tag"
+# build.sh should produce a registry-less local tag like
+#   nginx:1.25.3-alpine-<sha>
+# regardless of which backend is selected. Each backend retags to its
+# own URL during push. Verifies build.sh no longer composes
+# backend-specific tags.
+_run env -i HOME="$HOME" PATH="$PATH" REGISTRY_KIND=artifactory ./scripts/build.sh --dry-run >/dev/null
+_must_contain "Image:              nginx:1.25.3-alpine-"
+_must_not_contain "Image:              harbor"      # no Harbor host prefix leakage
+_must_not_contain "Image:              artifactory" # no Artifactory host prefix leakage
+end_scenario
+
+scenario "harbor-and-artifactory-vars-independent"
+# Setting HARBOR_* with REGISTRY_KIND=artifactory must NOT influence
+# Artifactory behaviour, and vice-versa. build.sh must not blend the
+# two namespaces.
 _run env -i HOME="$HOME" PATH="$PATH" \
-  ARTIFACTORY_PUSH_HOST="example.jfrog.io" \
-  ARTIFACTORY_TEAM="test" \
-  ./scripts/build.sh --push 2>/dev/null || true
-_must_contain "Image:              example.jfrog.io/test/nginx:"
+  REGISTRY_KIND=artifactory \
+  HARBOR_REGISTRY="should-not-leak.example.com" \
+  HARBOR_PROJECT="should-not-leak" \
+  ./scripts/build.sh --dry-run >/dev/null
+# FULL_IMAGE must remain the simple local tag — HARBOR_* MUST NOT
+# appear in build.sh's resolved-config block.
+_must_contain "Image:              nginx:1.25.3-alpine-"
+_must_not_contain "should-not-leak"
 end_scenario
 
 # ════════════════════════════════════════════════════════════════════
