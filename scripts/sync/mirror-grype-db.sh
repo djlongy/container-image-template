@@ -8,7 +8,7 @@
 #   CAN reach. Grype then pulls the DB from there on every scan.
 #
 # Run this:
-#   - Manually when you want a fresh DB: `./scripts/mirror-grype-db.sh`
+#   - Manually when you want a fresh DB: `./scripts/sync/mirror-grype-db.sh`
 #   - As a CI stage before grype scan runs (see .gitlab-ci.yml)
 #   - On a cron schedule (GitLab scheduled pipeline) for daily freshness
 #

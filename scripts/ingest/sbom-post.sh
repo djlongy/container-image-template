@@ -75,9 +75,9 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-# shellcheck source=lib/artifact-names.sh
+# shellcheck source=../lib/artifact-names.sh
 . "${REPO_ROOT}/scripts/lib/artifact-names.sh"
 
 # SBOM_FILE resolution (highest precedence first):
@@ -97,7 +97,7 @@ cd "${REPO_ROOT}"
 # Auto-import bamboo_* plan vars to bare names, then source image.env.
 # Without this, sink URLs / project names committed to image.env would
 # be invisible here and every sink branch would silently skip.
-# shellcheck source=lib/load-image-env.sh
+# shellcheck source=../lib/load-image-env.sh
 . "${REPO_ROOT}/scripts/lib/load-image-env.sh"
 import_bamboo_vars
 load_image_env
@@ -358,7 +358,7 @@ else
       '{sbom_file:$sbom_file, scanned_image:$image, git_commit:$gitsha, cyclonedx:$bom[0]}' \
       > "${_TMP}/hec.json"
 
-    # shellcheck source=lib/splunk-hec.sh
+    # shellcheck source=../lib/splunk-hec.sh
     . "${REPO_ROOT}/scripts/lib/splunk-hec.sh"
     splunk_hec_post "${_TMP}/hec.json" "${SPLUNK_SBOM_SOURCETYPE:-cyclonedx:json}"
   ) || rc=$?

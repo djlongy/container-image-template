@@ -203,7 +203,7 @@ at internal Artifactory / Nexus mirrors:
 | `JF_BINARY_URL` / `JF_DEB_URL` / `JF_RPM_URL` | none — set ONE of these |
 
 For Grype's CVE database, mirror it once via
-`./scripts/mirror-grype-db.sh` (set `ARTIFACTORY_GRYPE_DB_REPO` first)
+`./scripts/sync/mirror-grype-db.sh` (set `ARTIFACTORY_GRYPE_DB_REPO` first)
 and the `grype-vuln` job will pull from your mirror automatically.
 
 ## Repository structure

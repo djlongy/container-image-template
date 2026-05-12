@@ -337,7 +337,7 @@ grype-db-sync:
   before_script:
     - *install-tools
   script:
-    - ./scripts/mirror-grype-db.sh
+    - ./scripts/sync/mirror-grype-db.sh
 
 # ═══════════════════════════════════════════════════════════════════
 # POSTSCAN — Grype vulnerability scan (consumes Syft SBOM)
@@ -703,7 +703,7 @@ xray-sbom-postscan:
 # ═══════════════════════════════════════════════════════════════════
 # INGEST — post SBOM to configured sinks
 # ═══════════════════════════════════════════════════════════════════
-# Runs scripts/sbom-post.sh which ships the CycloneDX JSON to whatever
+# Runs scripts/ingest/sbom-post.sh which ships the CycloneDX JSON to whatever
 # sink is configured (generic webhook or OWASP Dependency-Track).
 # No-op if no sink env vars are set — safe to leave enabled even
 # before the business picks an SBOM platform.
@@ -723,7 +723,7 @@ sbom-ingest:
     - *install-tools     # also sources image.env so sbom-post sees ARTIFACTORY_*, etc.
   script:
     - . ./build.env
-    - bash ./scripts/sbom-post.sh "${SBOM_FILE}"
+    - bash ./scripts/ingest/sbom-post.sh "${SBOM_FILE}"
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_COMMIT_TAG'

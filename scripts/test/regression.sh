@@ -392,7 +392,7 @@ echo "${out}" > "${TMP_DIR}/out"
 end_scenario
 
 scenario "sbom-post-no-sinks-and-no-file"
-out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/sbom-post.sh /nonexistent.cdx.json 2>&1) ; rc=$?
+out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/ingest/sbom-post.sh /nonexistent.cdx.json 2>&1) ; rc=$?
 echo "${out}" > "${TMP_DIR}/out"
 [ "${rc}" -ne 0 ] || FAILURES+=("${CURRENT_NAME}: expected non-zero on missing input file")
 _must_contain "SBOM file not found"
@@ -400,7 +400,7 @@ end_scenario
 
 scenario "sbom-post-no-sinks-with-valid-file"
 echo '{"bomFormat":"CycloneDX","specVersion":"1.6","components":[]}' > "${TMP_DIR}/test.cdx.json"
-out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/sbom-post.sh "${TMP_DIR}/test.cdx.json" 2>&1) ; rc=$?
+out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/ingest/sbom-post.sh "${TMP_DIR}/test.cdx.json" 2>&1) ; rc=$?
 echo "${out}" > "${TMP_DIR}/out"
 [ "${rc}" -eq 0 ] || FAILURES+=("${CURRENT_NAME}: expected zero exit when no sinks configured, got ${rc}")
 _must_contain "no sinks configured"
@@ -413,7 +413,7 @@ end_scenario
 scenario "sbom-post-archive-sink-graceful-skip"
 # SINK 4 must skip cleanly when ARTIFACTORY_SBOM_ARCHIVE_REPO unset.
 echo '{"bomFormat":"CycloneDX","specVersion":"1.6","components":[]}' > "${TMP_DIR}/test.cdx.json"
-out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/sbom-post.sh "${TMP_DIR}/test.cdx.json" 2>&1) ; rc=$?
+out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/ingest/sbom-post.sh "${TMP_DIR}/test.cdx.json" 2>&1) ; rc=$?
 echo "${out}" > "${TMP_DIR}/out"
 _must_contain "artifactory-archive  skip"
 end_scenario

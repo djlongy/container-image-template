@@ -3,7 +3,7 @@
 #
 # Single responsibility: run `syft <target> -o cyclonedx-json=...`
 # and produce the canonical sbom.cdx.json. Hands off to
-# scripts/sbom-post.sh for vendor-neutral sink shipping (Splunk,
+# scripts/ingest/sbom-post.sh for vendor-neutral sink shipping (Splunk,
 # Dependency-Track, Artifactory, webhook).
 #
 # Output filename is the SAME as scripts/scan/xray-sbom.sh — both
@@ -136,10 +136,10 @@ else
 fi
 
 # ── Hand off to sbom-post.sh (no-op when no sinks configured) ──────
-if [ -x "${REPO_ROOT}/scripts/sbom-post.sh" ] || [ -f "${REPO_ROOT}/scripts/sbom-post.sh" ]; then
+if [ -x "${REPO_ROOT}/scripts/ingest/sbom-post.sh" ] || [ -f "${REPO_ROOT}/scripts/ingest/sbom-post.sh" ]; then
   echo ""
-  echo "→ Handing off to scripts/sbom-post.sh"
-  bash "${REPO_ROOT}/scripts/sbom-post.sh" "${SBOM_FILE_OUT}" || {
+  echo "→ Handing off to scripts/ingest/sbom-post.sh"
+  bash "${REPO_ROOT}/scripts/ingest/sbom-post.sh" "${SBOM_FILE_OUT}" || {
     echo "  WARN: sbom-post.sh exited non-zero — SBOM artifact still written" >&2
   }
 fi

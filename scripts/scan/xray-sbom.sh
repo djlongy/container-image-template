@@ -3,7 +3,7 @@
 #
 # Single responsibility: run `jf docker scan --format=cyclonedx --sbom`
 # against the upstream image and produce the canonical sbom.cdx.json.
-# Hands off to scripts/sbom-post.sh for vendor-neutral sink shipping
+# Hands off to scripts/ingest/sbom-post.sh for vendor-neutral sink shipping
 # (Splunk, Dependency-Track, Artifactory, webhook).
 #
 # Output filename is the SAME as scripts/scan/syft-sbom.sh — both
@@ -217,12 +217,12 @@ fi
 # sbom-post.sh is vendor-agnostic — same downstream sinks (Splunk
 # HEC, Dependency-Track, Artifactory, webhook) handle the Xray SBOM
 # and the Syft SBOM identically. Failures stay non-fatal.
-if [ -x "${REPO_ROOT}/scripts/sbom-post.sh" ]; then
+if [ -x "${REPO_ROOT}/scripts/ingest/sbom-post.sh" ]; then
   echo ""
   echo "→ Handoff to sbom-post.sh for sink shipping"
-  bash "${REPO_ROOT}/scripts/sbom-post.sh" "${SBOM_FILE_OUT}" || {
+  bash "${REPO_ROOT}/scripts/ingest/sbom-post.sh" "${SBOM_FILE_OUT}" || {
     echo "WARN: sbom-post.sh returned non-zero — Xray SBOM still saved as artifact" >&2
   }
 else
-  echo "WARN: scripts/sbom-post.sh not executable — SBOM saved as artifact only" >&2
+  echo "WARN: scripts/ingest/sbom-post.sh not executable — SBOM saved as artifact only" >&2
 fi

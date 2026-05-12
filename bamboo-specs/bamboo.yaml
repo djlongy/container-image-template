@@ -701,7 +701,7 @@ SBOM Ingest:
             export DEPENDENCY_TRACK_API_KEY="${bamboo_svc_dependency_track_api_key:-${bamboo_DEPENDENCY_TRACK_API_KEY:-}}"
             export SBOM_WEBHOOK_AUTH_HEADER="${bamboo_svc_sbom_webhook_auth_header:-${bamboo_SBOM_WEBHOOK_AUTH_HEADER:-}}"
 
-            bash ./scripts/sbom-post.sh "${SBOM_FILE}"
+            bash ./scripts/ingest/sbom-post.sh "${SBOM_FILE}"
   requirements:
     - system.docker.executable
 
