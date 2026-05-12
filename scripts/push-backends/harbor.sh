@@ -60,6 +60,9 @@ _harbor_require_env() {
   done
   return "${missing}"
 }
+# Public alias — build.sh's _build_validate_backend looks up
+# `${kind}_require_env` so each backend exports a predictable name.
+harbor_require_env() { _harbor_require_env "$@"; }
 
 _harbor_docker_login() {
   if ! command -v docker >/dev/null 2>&1; then

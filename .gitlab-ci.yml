@@ -372,6 +372,41 @@ grype-vuln:
   rules: *build-rules
 
 # ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Runtime smoke test (actually start the container)
+# ═══════════════════════════════════════════════════════════════════
+# Scans + pushes prove the manifest is valid; they don't prove the
+# image RUNS. This job pulls the pushed digest, `docker run -d`s it,
+# waits a few seconds, and verifies State.Status:
+#   running                          → ✓ daemon-style image
+#   exited + ExitCode 0              → ✓ one-shot tool image
+#   exited + non-zero / dead         → ✗ build corrupted the image
+#
+# Catches the class of bug where the cert sidecar / editable region
+# silently breaks the entrypoint binary, image library paths, etc.
+runtime-smoke:
+  stage: postscan
+  image: ${DOCKER_CLI_IMAGE}
+  services:
+    - name: ${DOCKER_DIND_IMAGE}
+      alias: docker
+  needs:
+    - job: build
+      artifacts: true
+  before_script:
+    - *install-tools
+    # docker login so the script can pull the pushed digest. Multi-
+    # registry helper handles both Harbor + Artifactory targets.
+    - . ./scripts/lib/docker-login.sh && docker_login_for_xray_scan || true
+  script:
+    - . ./build.env
+    - bash ./scripts/scan/runtime-smoke.sh
+  rules: *build-rules
+  # Smoke is best-effort by default — flip to false when you want it
+  # to block promote/deploy. Tune RUNTIME_SMOKE_HEALTHCHECK +
+  # RUNTIME_HEALTH_TIMEOUT in image.env for stricter gating.
+  allow_failure: true
+
+# ═══════════════════════════════════════════════════════════════════
 # PRESCAN — Xray on UPSTREAM_REF, gated, BEFORE build runs
 # ═══════════════════════════════════════════════════════════════════
 # Two paired jobs that scan the upstream image we're about to rebuild.

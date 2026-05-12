@@ -295,6 +295,44 @@ _build_resolve_push_target() {
   UPSTREAM_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
 }
 
+# Pre-flight: source the selected push backend and run its require_env
+# so a missing config (HARBOR_REGISTRY / ARTIFACTORY_URL / etc.) fails
+# fast BEFORE we waste time on docker build + crane probes. Only runs
+# when --push was requested. Fail-fast for an unknown REGISTRY_KIND
+# happens here too — same error as the dispatch in PHASE 8 but earlier.
+#
+# Convention: each push-backends/<kind>.sh exposes a `${kind}_require_env`
+# function (no leading underscore — it's part of the public contract).
+# build.sh sources the backend AND `_${kind}_require_env` (legacy name)
+# also works for backward compat.
+_build_validate_backend() {
+  [ "${WANT_PUSH}" -eq 1 ] || return 0
+
+  local kind="${REGISTRY_KIND_LC:-harbor}"
+  local backend="${REPO_ROOT}/scripts/push-backends/${kind}.sh"
+  if [ ! -f "${backend}" ]; then
+    echo "ERROR: REGISTRY_KIND='${kind}' but ${backend} not found" >&2
+    echo "       Available backends:" >&2
+    ls "${REPO_ROOT}/scripts/push-backends/" 2>/dev/null | sed 's/\.sh$//' | sed 's/^/         /' >&2
+    return 1
+  fi
+
+  # shellcheck disable=SC1090
+  . "${backend}"
+
+  # Try public name first (kind_require_env), then legacy private
+  # name (_kind_require_env), then no-op if neither exists.
+  local fn
+  for fn in "${kind}_require_env" "_${kind}_require_env"; do
+    if declare -f "${fn}" >/dev/null 2>&1; then
+      _dbg "early backend validation: calling ${fn}"
+      "${fn}" || return 1
+      return 0
+    fi
+  done
+  _dbg "backend ${kind} has no require_env hook — skipping pre-flight"
+}
+
 # ════════════════════════════════════════════════════════════════════
 # PHASE 5 — Report resolved config
 # ════════════════════════════════════════════════════════════════════
@@ -613,6 +651,7 @@ _build_compute_tag
 _build_resolve_source_url
 _build_materialise_certs
 _build_resolve_push_target
+_build_validate_backend          # fail-fast on missing HARBOR_*/ARTIFACTORY_*
 
 _build_print_config_report
 _build_resolve_base_digest

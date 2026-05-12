@@ -161,6 +161,7 @@ stages:
         - Xray SBOM Postscan
         - Xray Vuln Postscan
         - Grype Vuln
+        - Runtime Smoke
         # - Trivy Vuln Postscan   # DORMANT — same caveat as Prescan
         # - Trivy SBOM Postscan   #   variants above.
   # - Sign:           # COMMENTED OUT — no cosign infra at work yet.
@@ -340,6 +341,40 @@ Grype Vuln:
       location: .
       pattern: vuln-scan.json
       shared: true
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Runtime smoke test (actually start the container)
+# ═══════════════════════════════════════════════════════════════════
+# Scans + pushes prove the manifest is valid; they don't prove the
+# image RUNS. Pulls the pushed digest, `docker run -d`s it, waits a
+# few seconds, and verifies State.Status. Catches the class of bug
+# where the cert sidecar / editable region silently breaks the
+# entrypoint binary or image library paths.
+Runtime Smoke:
+  tasks:
+    - artifact-download:
+        artifacts:
+          - name: build-env
+            destination: .
+    - script:
+        interpreter: BASH
+        scripts:
+          - |-
+            set -euo pipefail
+            . ./build.env
+            [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+
+            # Relay creds for the multi-registry pull. Smoke needs to
+            # pull the pushed digest; multi-registry login lib reads
+            # whatever creds are in scope.
+            export HARBOR_USER="${bamboo_svc_harbor_user:-${bamboo_HARBOR_USER:-}}"
+            export HARBOR_PASSWORD="${bamboo_svc_harbor_password:-${bamboo_HARBOR_PASSWORD:-}}"
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+
+            bash ./scripts/scan/runtime-smoke.sh
   requirements:
     - system.docker.executable
 

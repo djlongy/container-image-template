@@ -59,15 +59,28 @@ FROM ${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG} AS base
 FROM ${CERT_BUILDER_IMAGE} AS certs-source
 USER root
 
-# Ensure ca-certificates is installed in the builder regardless of
-# the underlying distro. apk first (alpine default), fall back to
-# dnf / apt-get for non-alpine builders. Best-effort — if none of
-# these work the next RUN will surface the failure clearly.
-RUN apk add --no-cache ca-certificates 2>/dev/null \
-    || (command -v dnf      >/dev/null && dnf install -y ca-certificates) \
-    || (command -v apt-get  >/dev/null && apt-get update -qq && apt-get install -y ca-certificates) \
-    || (command -v microdnf >/dev/null && microdnf install -y ca-certificates && microdnf clean all) \
-    || (echo "WARN: builder has no ca-certificates package — using whatever is bundled" >&2; true)
+# Best-effort install of ca-certificates IF the rebuild tools aren't
+# already present. Skip the install entirely when update-ca-certificates
+# or update-ca-trust already exists — that's the airgap-safe path and
+# avoids a network attempt the build doesn't actually need.
+#
+# Cat-append (in the next RUN) is the runtime trust mechanism and
+# works without any package install or rebuild. The rebuild tool is
+# only nice-to-have for re-deriving the bundle from the drop-in dir.
+#
+# For TRUE air-gap: bake your corp CA into a custom builder image
+# upfront and point CERT_BUILDER_IMAGE at it (e.g.
+# artifactory.<domain>/library/alpine-with-corp-ca:3.20). That
+# eliminates the install attempt entirely + ensures the builder
+# trusts your internal Artifactory's TLS.
+RUN if ! command -v update-ca-certificates >/dev/null 2>&1 \
+    && ! command -v update-ca-trust       >/dev/null 2>&1; then \
+      apk add --no-cache ca-certificates 2>/dev/null \
+      || (command -v dnf      >/dev/null && dnf install -y ca-certificates 2>/dev/null) \
+      || (command -v apt-get  >/dev/null && apt-get update -qq 2>/dev/null && apt-get install -y ca-certificates 2>/dev/null) \
+      || (command -v microdnf >/dev/null && microdnf install -y ca-certificates 2>/dev/null && microdnf clean all 2>/dev/null) \
+      || true; \
+    fi
 
 COPY certs/ /tmp/certs/
 RUN set -eux; \

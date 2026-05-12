@@ -640,6 +640,9 @@ _artifactory_require_env() {
   fi
   return "${missing}"
 }
+# Public alias — build.sh's _build_validate_backend looks up
+# `${kind}_require_env` so each backend exports a predictable name.
+artifactory_require_env() { _artifactory_require_env "$@"; }
 
 _artifactory_require_tools() {
   local missing=0
