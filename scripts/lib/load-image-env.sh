@@ -49,6 +49,28 @@ _dbg() {
 }
 
 # ════════════════════════════════════════════════════════════════════
+# _redact_value — censor secret values in load-time logging
+# ════════════════════════════════════════════════════════════════════
+# Vars whose name matches secret-ish patterns (TOKEN/PASSWORD/SECRET/
+# AUTH/KEY/CA_CERT) print as "[redacted, N chars]" so the log shows
+# WHETHER a secret was loaded without leaking its contents. Everything
+# else prints in full so the operator can verify URLs, hostnames,
+# tags, project paths, etc. landed correctly.
+_redact_value() {
+  local __name="$1" __value="$2"
+  case "${__name}" in
+    *TOKEN*|*PASSWORD*|*SECRET*|*AUTH*|*_KEY|*_KEY_*|CA_CERT|COSIGN_KEY)
+      if [ -z "${__value}" ]; then
+        printf '<empty>'
+      else
+        printf '[redacted, %d chars]' "${#__value}"
+      fi
+      ;;
+    *) printf '%s' "${__value}" ;;
+  esac
+}
+
+# ════════════════════════════════════════════════════════════════════
 # import_bamboo_vars — sourced from scripts/lib/bamboo-import.sh
 # ════════════════════════════════════════════════════════════════════
 # The actual Bamboo auto-import logic lives in a SEPARATE file
@@ -146,11 +168,31 @@ load_image_env() {
   # shellcheck disable=SC1091
   . ./image.env
 
+  # Track which keys were overridden from the shell vs. taken straight
+  # from image.env so the per-var log can annotate the source. The set
+  # is built from __SHELL_OVERRIDES (one line per override).
+  local __overridden=""
   if [ -n "${__SHELL_OVERRIDES}" ]; then
     _dbg "re-applying shell-set overrides on top of image.env"
     while IFS= read -r __line; do
       [ -z "${__line}" ] && continue
       eval "export ${__line}"
+      __overridden="${__overridden} ${__line%%=*}"
     done <<< "${__SHELL_OVERRIDES}"
   fi
+
+  # ── Visibility: enumerate every loaded var ──────────────────────
+  # Always printed (not _dbg-gated) because operators need to verify
+  # config landed correctly when a job fails — having to re-run with
+  # BUILD_DEBUG=true is too slow. Secrets are redacted by _redact_value
+  # so logs are safe to share. Values shown for everything else so
+  # hostname / project / tag mismatches surface immediately.
+  echo "→ Loaded config (image.env + shell-overrides):"
+  for __v in ${__known}; do
+    if [ -n "${!__v-}" ]; then
+      local __source="image.env"
+      case " ${__overridden} " in *" ${__v} "*) __source="shell-override" ;; esac
+      echo "    ${__v}=$(_redact_value "${__v}" "${!__v}")  [${__source}]"
+    fi
+  done
 }
