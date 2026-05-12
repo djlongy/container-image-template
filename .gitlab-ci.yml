@@ -259,6 +259,12 @@ build:
     # build.sh's artifactory backend sources on demand.
     - bash ./scripts/build.sh --push
   artifacts:
+    # Downstream postscan / ingest jobs both `. ./build.env` (so
+    # SBOM_FILE / VULN_SCAN_FILE / IMAGE_DIGEST are in scope) AND
+    # consume the dotenv-imported env vars. Expose build.env as a
+    # file artifact AND a dotenv report so both patterns work.
+    paths:
+      - build.env
     reports:
       dotenv: build.env
     expire_in: 1 week
