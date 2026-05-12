@@ -139,10 +139,13 @@ variables:
   #    here if your network also blocks GitHub and you've mirrored
   #    the binaries to an Artifactory generic repo.
   CRANE_URL: "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz"
+  # Tool versions: empty = script's built-in default applies (one
+  # source of truth lives in the script). Override per-pipeline by
+  # setting the var as a project/group CI variable.
   SYFT_INSTALLER_URL: "https://raw.githubusercontent.com/anchore/syft/main/install.sh"
-  SYFT_VERSION: "v1.14.0"
+  SYFT_VERSION: ""           # default in scripts/scan/syft-sbom.sh
   GRYPE_INSTALLER_URL: "https://raw.githubusercontent.com/anchore/grype/main/install.sh"
-  GRYPE_VERSION: "v0.82.0"
+  GRYPE_VERSION: ""          # default in scripts/scan/grype-vuln.sh
   COSIGN_URL: "https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64"
   # JFrog CLI install — sudoless. Set ONE of the three URLs below to
   # point at a file in your local Artifactory. The public installer
