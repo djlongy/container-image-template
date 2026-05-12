@@ -39,9 +39,11 @@ sbom*.xml
 grype-report.json
 trivy-report.json
 vulnerabilities.json
-vuln-scan.json       # canonical name (scripts/lib/artifact-names.sh)
-xray-scan.json       # legacy — renamed to vuln-scan.json
-xray-sbom.cdx.json   # legacy — now writes sbom.cdx.json (also matched by *.cdx.json)
+# Canonical name (scripts/lib/artifact-names.sh):
+vuln-scan.json
+# Legacy names (renamed to vuln-scan.json / sbom.cdx.json):
+xray-scan.json
+xray-sbom.cdx.json
 
 # Auto-installed tool binaries (crane, syft) when not on PATH —
 # scripts/build.sh drops them here rather than /usr/local/bin so it
