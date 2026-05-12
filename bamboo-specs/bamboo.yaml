@@ -25,50 +25,94 @@
 # Keep secrets in plan vars (encrypted), keep behavioural toggles in
 # image.env (committed, in repo). Don't commit secrets to image.env.
 #
-# Required plan or global variables:
+# ── REQUIRED / OPTIONAL plan or global variables ─────────────────────
 #
-#   # Push backend (Harbor baseline — the default)
-#   HARBOR_REGISTRY            destination registry host
-#   HARBOR_PROJECT             destination project / path
-#   HARBOR_USER       registry push username
-#   HARBOR_PASSWORD   registry push password (masked)
+# Push backend selector (drives which scripts/push-backends/<kind>.sh runs):
+#   REGISTRY_KIND           "harbor" (default) | "artifactory"
 #
-#   # Optional: shared service-account global vars (mapped via shim)
-#   svc_artifactory_token    → exported as ARTIFACTORY_TOKEN
-#   svc_artifactory_user     → exported as ARTIFACTORY_USER
-#   svc_splunk_hec_token     → exported as SPLUNK_HEC_TOKEN
+# When REGISTRY_KIND="harbor" — set ONLY HARBOR_* (ARTIFACTORY_* ignored):
+#   HARBOR_REGISTRY         destination registry host
+#   HARBOR_PROJECT          destination project / path prefix
+#   HARBOR_USER             registry push username
+#   HARBOR_PASSWORD         registry push password (masked)
 #
-#   # Optional: cosign signing (DORMANT — restore Cosign Sign job to use)
-#   COSIGN_KEY               private key path or env: reference
+# When REGISTRY_KIND="artifactory" — set ONLY ARTIFACTORY_* (HARBOR_* ignored):
+#   ARTIFACTORY_URL         REST URL (https:// scheme required)
+#   ARTIFACTORY_USER        service-account username (NOT email — see image.env)
+#   ARTIFACTORY_TOKEN       OR ARTIFACTORY_PASSWORD (token preferred, masked)
+#   ARTIFACTORY_TEAM        team key for layout templates
+#   ARTIFACTORY_PRO         "true" to enable Pro-tier features (default false)
+#   ARTIFACTORY_PROJECT     project key (defaults to ARTIFACTORY_TEAM)
+#   ARTIFACTORY_ENVIRONMENT "dev" | "prod"
+#   ARTIFACTORY_PUSH_HOST   override host for subdomain layouts
+#   ARTIFACTORY_IMAGE_REF   layout template for docker push URL
+#   ARTIFACTORY_MANIFEST_PATH  layout template for REST storage path
 #
-#   # Optional: corp CA (auto-flips INJECT_CERTS=true inside build.sh)
+# Severity gates (opt-in — exit 2 on matching CVEs, blocking the job):
+#   XRAY_FAIL_ON_SEVERITY      e.g. "critical" | "critical,high"
+#   GRYPE_FAIL_ON_SEVERITY     e.g. "Critical" | "Critical,High"
+#   TRIVY_FAIL_ON_SEVERITY     e.g. "CRITICAL" | "CRITICAL,HIGH"  (DORMANT)
+#   ARTIFACTORY_BUILD_XRAY_PRESCAN   "true" → in-build Xray pre-push scan
+#   ARTIFACTORY_BUILD_XRAY_POSTSCAN  "true" → in-build Xray post-push scan
+#   ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS  "true" → fail-on policy violation
+#
+# Scan-side Artifactory override (when push-side and scan-side differ —
+# e.g. push to JCR Free, scan via separate Pro/Cloud trial):
+#   XRAY_ARTIFACTORY_URL    REST URL of the Xray-licensed instance
+#   XRAY_ARTIFACTORY_USER
+#   XRAY_ARTIFACTORY_TOKEN  OR XRAY_ARTIFACTORY_PASSWORD
+#
+# Canonical artifact filenames (defaults from scripts/lib/artifact-names.sh
+# — almost never need to override):
+#   SBOM_FILE               default "sbom.cdx.json"
+#   VULN_SCAN_FILE          default "vuln-scan.json"
+#
+# SBOM sinks (sbom-post.sh — set whichever sinks apply, all opt-in):
+#   SBOM_WEBHOOK_URL              generic CycloneDX webhook endpoint
+#   SBOM_WEBHOOK_AUTH_HEADER      auth header for the webhook (masked)
+#   DEPENDENCY_TRACK_URL          OWASP Dependency-Track base URL
+#   DEPENDENCY_TRACK_API_KEY      DT BOM-upload API key (masked)
+#   DEPENDENCY_TRACK_PROJECT      DT project name
+#   ARTIFACTORY_SBOM_REPO         Xray-indexed generic repo (auto-scans on upload)
+#   ARTIFACTORY_SBOM_ARCHIVE_REPO plain generic repo (long-term archive)
+#   SPLUNK_HEC_URL                Splunk HEC endpoint
+#   SPLUNK_HEC_TOKEN              HEC token (masked, preferably via svc_* shim)
+#   SPLUNK_HEC_INDEX              default "main"
+#   SPLUNK_HEC_SOURCETYPE         default "jfrog:xray:scan"
+#   SPLUNK_HEC_INSECURE           "true" → curl -k for self-signed Splunk
+#   SPLUNK_SOURCE                 envelope source prefix (default "pipeline")
+#
+# Cosign signing (DORMANT — restore the Cosign Sign job to enable):
+#   COSIGN_KEY               private key path or env: reference (file: type)
+#   COSIGN_URL               cosign binary URL (air-gap mirror)
+#
+# Corp CA (auto-flips INJECT_CERTS=true inside build.sh):
 #   CA_CERT                  PEM content of a corp CA
 #
-#   # Optional: closed-network tool mirrors. Defaults reach public
-#   # GitHub releases — override only when the agent has no outbound
-#   # internet.
+# Closed-network tool mirrors (defaults reach public GitHub releases —
+# override when the agent has no outbound internet):
 #   CRANE_URL                go-containerregistry tarball URL
 #   SYFT_INSTALLER_URL       Syft install.sh URL
 #   GRYPE_INSTALLER_URL      Grype install.sh URL
-#   COSIGN_URL               cosign-linux-amd64 binary URL
+#   TRIVY_INSTALLER_URL      Trivy install.sh URL  (DORMANT)
+#   TRIVY_BINARY_URL         direct trivy tarball URL (DORMANT)
 #   JF_BINARY_URL            direct jf binary URL (preferred)
 #   JF_DEB_URL               .deb pkg URL (extracted, no dpkg -i)
 #   JF_RPM_URL               .rpm pkg URL (extracted, no rpm -i)
 #
-#   # Optional: SBOM ingestion
-#   SBOM_WEBHOOK_URL         generic CycloneDX webhook endpoint
-#   SBOM_WEBHOOK_AUTH_HEADER auth header for the webhook
-#   DEPENDENCY_TRACK_URL     OWASP Dependency-Track base URL
-#   DEPENDENCY_TRACK_API_KEY DT BOM-upload API key
-#   DEPENDENCY_TRACK_PROJECT DT project name
+# Shared service-account globals (renamed via shim because the script
+# expects a different name — see Build / scan job preludes):
+#   svc_artifactory_token    → exported as ARTIFACTORY_TOKEN
+#   svc_artifactory_user     → exported as ARTIFACTORY_USER
+#   svc_harbor_user          → exported as HARBOR_USER
+#   svc_harbor_password      → exported as HARBOR_PASSWORD
+#   svc_splunk_hec_token     → exported as SPLUNK_HEC_TOKEN
+#   svc_dependency_track_api_key → exported as DEPENDENCY_TRACK_API_KEY
+#   svc_sbom_webhook_auth_header → exported as SBOM_WEBHOOK_AUTH_HEADER
 #
-#   # Optional: Xray scan → Splunk audit
-#   SPLUNK_HEC_URL           Splunk HEC endpoint
-#   SPLUNK_HEC_TOKEN         HEC token (preferably via shim from svc_*)
-#
-#   # Production promotion is INTENTIONALLY not in this pipeline —
-#   # human ritual via Artifactory's native copy UI. See README
-#   # "Promoting to production".
+# Production promotion is INTENTIONALLY not in this pipeline — human
+# ritual via Artifactory's native copy UI. See README "Promoting to
+# production" for the manual command.
 #
 # image.env (committed) is the single source of truth for build
 # behaviour (INJECT_CERTS, REGISTRY_KIND, UPSTREAM_*, Artifactory
@@ -277,9 +321,19 @@ Grype Vuln:
             . ./build.env
             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
 
+            # Optional Grype DB mirror auth. When ARTIFACTORY_GRYPE_DB_REPO
+            # is set in image.env, grype-vuln.sh fetches the CVE DB from
+            # an Artifactory mirror instead of grype.anchore.io — needs
+            # ARTIFACTORY_USER + ARTIFACTORY_TOKEN/PASSWORD for that.
+            # Harmless when the mirror isn't configured.
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+
             # Standalone Grype script — install, DB-mirror redirect,
             # scan against ${SBOM_FILE}, severity gate. Default output
-            # is ${VULN_SCAN_FILE} (canonical: vuln-scan.json).
+            # is ${VULN_SCAN_FILE} (canonical: vuln-scan.json). Set
+            # GRYPE_FAIL_ON_SEVERITY="Critical" (or "Critical,High")
+            # in image.env / plan vars to make this a hard gate.
             bash ./scripts/scan/grype-vuln.sh
   artifacts:
     - name: vuln-scan-grype
@@ -290,26 +344,27 @@ Grype Vuln:
     - system.docker.executable
 
 # ═══════════════════════════════════════════════════════════════════
-# SCAN — Xray vuln + Xray SBOM (paired, run in parallel)
+# Xray scans — paired vuln + SBOM, split across Prescan / Postscan
 # ═══════════════════════════════════════════════════════════════════
-# Two paired Xray jobs — both run in parallel under the Scan stage.
-# Each is single-responsibility:
-#   Xray Vuln  → jf docker scan --format=simple-json → vuln-scan.json
-#                + Splunk HEC POST (sourcetype=jfrog:xray:scan)
-#   Xray SBOM  → jf docker scan --format=cyclonedx --sbom → sbom.cdx.json
-#                + sbom-post.sh (Splunk + DT + Artifactory + webhook)
+# Four jobs total — each single-responsibility, runs in parallel
+# within its stage:
+#   Xray Vuln Prescan  → scan UPSTREAM_REF, output vuln-scan.json
+#   Xray SBOM Prescan  → scan UPSTREAM_REF, output sbom.cdx.json
+#   Xray Vuln Postscan → scan IMAGE_DIGEST,  output vuln-scan.json
+#   Xray SBOM Postscan → scan IMAGE_DIGEST,  output sbom.cdx.json
 #
-# Both scripts source scripts/lib/load-image-env.sh which auto-imports
-# every bamboo_* env var → bare name. The shim block in each task
-# only re-exports vars whose Bamboo global-var name DIFFERS from what
+# All four scripts source scripts/lib/load-image-env.sh which auto-
+# imports every bamboo_* env var → bare name. The shim blocks below
+# only re-export vars whose Bamboo global-var name DIFFERS from what
 # the script expects (svc_* prefixed service-account creds).
-# ── PRESCAN: scan UPSTREAM_REF before build runs ─────────────────
-# Scan target = UPSTREAM_REGISTRY/UPSTREAM_IMAGE:UPSTREAM_TAG (passed
-# explicitly via XRAY_SCAN_REF so the script's resolution chain
-# doesn't fall back to IMAGE_DIGEST — build hasn't run yet).
 #
-# Set XRAY_FAIL_ON_SEVERITY in your bamboo.yaml plan vars (or in
-# image.env) to enforce a real gate. Otherwise this is audit-only.
+# Prescan jobs pass XRAY_SCAN_REF=UPSTREAM_REGISTRY/UPSTREAM_IMAGE:
+# UPSTREAM_TAG explicitly so the script's resolution chain doesn't
+# fall back to IMAGE_DIGEST (build hasn't run yet). Postscan jobs
+# inherit IMAGE_DIGEST from build.env.
+#
+# Set XRAY_FAIL_ON_SEVERITY (in image.env or plan vars) to enforce a
+# real gate. Otherwise this is audit-only.
 Xray Vuln Prescan:
   tasks:
     - script:
@@ -368,7 +423,8 @@ Xray SBOM Prescan:
 # ── POSTSCAN: scan the BUILT image (IMAGE_DIGEST from build.env) ──
 # Default scan target is the rebuilt image — that's what consumers
 # pull and what should be audited. Includes any remediation, cert
-# injection, or Dockerfile fork-edit customisations applied during build.
+# injection, or Dockerfile editable-region customisations applied
+# during build.
 Xray Vuln Postscan:
   tasks:
     - artifact-download:
