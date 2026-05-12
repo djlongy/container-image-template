@@ -182,17 +182,38 @@ load_image_env() {
   fi
 
   # ── Visibility: enumerate every loaded var ──────────────────────
-  # Always printed (not _dbg-gated) because operators need to verify
-  # config landed correctly when a job fails — having to re-run with
-  # BUILD_DEBUG=true is too slow. Secrets are redacted by _redact_value
-  # so logs are safe to share. Values shown for everything else so
-  # hostname / project / tag mismatches surface immediately.
-  echo "→ Loaded config (image.env + shell-overrides):"
-  for __v in ${__known}; do
-    if [ -n "${!__v-}" ]; then
-      local __source="image.env"
-      case " ${__overridden} " in *" ${__v} "*) __source="shell-override" ;; esac
-      echo "    ${__v}=$(_redact_value "${__v}" "${!__v}")  [${__source}]"
-    fi
-  done
+  # Printed by default (LOAD_ENV_LOG unset or "true") so operators
+  # can verify config landed correctly without re-running the job
+  # under BUILD_DEBUG=true. Secrets are redacted by _redact_value so
+  # logs are safe to share.
+  #
+  # Three modes (set LOAD_ENV_LOG in env, image.env, or CI variable):
+  #   true (default)  per-var listing with [source] annotation
+  #   summary         one-line count (loaded X / overridden Y)
+  #   false           silent — for very chatty CI runs where the listing
+  #                   would dominate the log
+  case "${LOAD_ENV_LOG:-true}" in
+    false|False|FALSE|0|off|Off|OFF|no|No|NO)
+      ;;
+    summary|Summary|SUMMARY|count|Count|COUNT)
+      local __loaded_count=0 __override_count=0
+      for __v in ${__known}; do
+        [ -n "${!__v-}" ] && __loaded_count=$((__loaded_count+1))
+      done
+      for __o in ${__overridden}; do
+        __override_count=$((__override_count+1))
+      done
+      echo "→ Loaded ${__loaded_count} config vars (${__override_count} shell-overridden). Set LOAD_ENV_LOG=true for per-var listing."
+      ;;
+    *)
+      echo "→ Loaded config (image.env + shell-overrides):"
+      for __v in ${__known}; do
+        if [ -n "${!__v-}" ]; then
+          local __source="image.env"
+          case " ${__overridden} " in *" ${__v} "*) __source="shell-override" ;; esac
+          echo "    ${__v}=$(_redact_value "${__v}" "${!__v}")  [${__source}]"
+        fi
+      done
+      ;;
+  esac
 }
