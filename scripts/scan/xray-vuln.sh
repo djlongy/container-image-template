@@ -27,10 +27,10 @@
 #   6. UPSTREAM_REGISTRY/UPSTREAM_IMAGE:UPSTREAM_TAG (assembled if all set)
 #
 # Default targets the BUILT image because that's what consumers actually
-# pull — scanning only the upstream would leave a gap (remediation,
-# cert injection, scripts/extend/ customisations all change the image
-# contents). Use the positional arg or XRAY_SCAN_REF=upstream pattern
-# in a separate prescan job if you want to fail-fast on a bad upstream
+# pull — scanning only the upstream would leave a gap (cert injection
+# and Dockerfile editable-region edits all change the image contents).
+# Use the positional arg or XRAY_SCAN_REF=upstream pattern in a
+# separate prescan job if you want to fail-fast on a bad upstream
 # BEFORE the build runs.
 #
 # Required env (Phase 1 preconditions — no-op when unset):

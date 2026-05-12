@@ -40,9 +40,9 @@
 #                       Set to "artifactory" to delegate the push step
 #                       to scripts/push-backends/artifactory.sh, which
 #                       handles layout-template resolution, jf rt bp
-#                       build info, and property tagging. Same pattern
-#                       as the monorepo — the image is built locally,
-#                       then the backend retags and pushes.
+#                       build info, and property tagging. The image
+#                       is built locally with a simple tag, then the
+#                       backend retags and pushes.
 #
 # Everything else is derived: GIT_SHA from git, CREATED from
 # `date -u`, BASE_DIGEST from `crane digest` on the upstream reference.
@@ -185,7 +185,7 @@ _build_apply_defaults_and_normalise() {
   # unless explicitly turned on. The bare-minimum build path is
   # "pull → retag → push" with no cert injection, no Xray, no SBOM.
   # Anything bespoke (package upgrades, extra installs, file drops)
-  # goes directly in the Dockerfile's fork-edit region — never sneaks
+  # goes directly in the Dockerfile's editable region — never sneaks
   # into the upstream template path via env-var toggles.
   [ -z "${IMAGE_NAME:-}" ] && _dbg "default applied: IMAGE_NAME=${UPSTREAM_IMAGE} (was unset)"
   [ -z "${VENDOR:-}"     ] && _dbg "default applied: VENDOR=example.com (was unset)"
@@ -200,7 +200,7 @@ _build_apply_defaults_and_normalise() {
 # ════════════════════════════════════════════════════════════════════
 # PHASE 2 — Tag computation + source URL
 # ════════════════════════════════════════════════════════════════════
-# Tag format matches the container-images monorepo:
+# Tag format:
 #   <UPSTREAM_TAG>-<gitShort>
 # The upstream tag IS the semver; the git SHA differentiates builds
 # of the same upstream version. No internal version axis.

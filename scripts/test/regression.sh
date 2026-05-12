@@ -119,15 +119,14 @@ end_scenario
 # ════════════════════════════════════════════════════════════════════
 # Cert sidecar behaviour
 # ════════════════════════════════════════════════════════════════════
-# INJECT_CERTS toggle was removed — the cert sidecar stage in the
-# Dockerfile always runs, but is a no-op when certs/ is empty (the
-# trust-store rebuild produces unchanged files; final's COPY --from
-# pulls them back unchanged). USER root from the sidecar never
-# escapes because final re-bases FROM base.
+# Cert sidecar in the Dockerfile always runs; it's a no-op when
+# certs/ is empty (trust-store rebuild produces unchanged files;
+# final's COPY --from pulls them back unchanged). USER root from
+# the sidecar never escapes because final re-bases FROM base.
 
 scenario "ca-cert-env-materialises-to-certs-dir"
 # Setting CA_CERT in env writes certs/ci-injected.crt so the sidecar
-# stage picks it up. No INJECT_CERTS toggle needed anymore.
+# stage picks it up at build time.
 CA_PEM="$(printf -- '-----BEGIN CERTIFICATE-----\nMIITest\n-----END CERTIFICATE-----\n')"
 _run env -i HOME="$HOME" PATH="$PATH" CA_CERT="${CA_PEM}" ./scripts/build.sh --dry-run >/dev/null
 [ -f certs/ci-injected.crt ] || FAILURES+=("${CURRENT_NAME}: certs/ci-injected.crt was NOT written")

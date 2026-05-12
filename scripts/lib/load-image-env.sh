@@ -24,13 +24,9 @@
 #                           fallback — it's a template only. Snapshot/
 #                           restore semantics: shell-set non-empty vars
 #                           override image.env values; empty-set shell
-#                           vars don't (so a stray `INJECT_CERTS=` in
-#                           the agent env can't clobber the file value).
+#                           vars don't (so a stray `VAR=` in the agent
+#                           env can't clobber the file value).
 #
-# Why a shared library: the old build.sh had this logic inline as
-# `_build_load_image_env` and `_build_import_bamboo_vars`, and other
-# scripts (xray-scan-post.sh etc.) had to either inline a copy or
-# rely on the calling shell to have already exported what they needed.
 # Centralising means each script self-loads its config — same precedence
 # everywhere, same debug logs everywhere, same "fail with clear hint"
 # message when image.env is missing.
@@ -74,15 +70,15 @@ unset _bamboo_lib
 # Three-step:
 #   1. Snapshot all known config vars that are SET AND NON-EMPTY in
 #      the caller's shell. (Empty-set is intentionally excluded —
-#      a stray `INJECT_CERTS=` exported by the runner shouldn't override
-#      the file's INJECT_CERTS=true.)
+#      a stray `VAR=` exported by the runner shouldn't override
+#      the file's VAR=<real-value>.)
 #   2. Source image.env from the caller's CWD. Fail if missing.
 #   3. Re-export the snapshot so shell values win over file values.
 #
 # Pre-fail behaviour: the caller's shell may have run import_bamboo_vars
-# already, which means `bamboo_INJECT_CERTS=true` becomes a bare
-# `INJECT_CERTS=true` BEFORE this function snapshots. So plan-var values
-# survive the snapshot/restore round-trip and override the file.
+# already, which means `bamboo_VENDOR=foo` becomes a bare `VENDOR=foo`
+# BEFORE this function snapshots. So plan-var values survive the
+# snapshot/restore round-trip and override the file.
 load_image_env() {
   if [ ! -f image.env ]; then
     echo "ERROR: image.env not found at $(pwd)/image.env" >&2
@@ -94,7 +90,7 @@ load_image_env() {
     echo "" >&2
     echo "  To fix:" >&2
     echo "    cp image.env.example image.env" >&2
-    echo "    \$EDITOR image.env       # adjust UPSTREAM_TAG, INJECT_CERTS, etc." >&2
+    echo "    \$EDITOR image.env       # adjust UPSTREAM_TAG, REGISTRY_KIND, etc." >&2
     echo "    git add image.env && git commit -m 'add image.env'" >&2
     echo "" >&2
     echo "  image.env is committed (intentionally — it's the per-fork config)." >&2

@@ -8,27 +8,15 @@
 #
 # ── WHERE DO THE ARTIFACTORY_* ENV VARS COME FROM? ───────────────────
 #
-# Any of these three paths work — build.sh resolves them in this
-# precedence order before it sources this backend:
+# build.sh resolves config in this precedence (later wins):
 #
-#   1. image.env.example  (tracked, canonical defaults)
-#   2. image.env          (gitignored, local dev override)
-#   3. Shell / CI env     (always wins — GitLab/Bamboo pipeline vars,
-#                          `export ARTIFACTORY_URL=… ./scripts/build.sh`,
-#                          etc.)
+#   1. image.env       (committed canonical config — required)
+#   2. Shell / CI env  (GitLab/Bamboo pipeline vars, or explicit
+#                       `export ARTIFACTORY_URL=… ./scripts/build.sh`)
 #
-# Nothing here REQUIRES image.env specifically; CI pipelines typically
-# never touch image.env and set everything as masked group/project
-# variables. Local dev typically uses image.env to avoid re-exporting
-# on every shell. Either pattern (or mixing them) is supported.
-#
-# → See image.env.example for the authoritative list of every variable,
-#   what it does, its default, and copy-and-uncomment templates.
-#
-# The sections below re-list the variables that affect THIS backend's
-# behavior for quick on-file reference, but image.env.example is the
-# source of truth. If you're adding a new variable, document it there
-# first, then add a one-line summary here.
+# image.env.example is a TEMPLATE only — never sourced. Copy it to
+# image.env on first checkout. See image.env.example for the
+# authoritative list of every variable and its purpose.
 #
 # ── FREE vs PRO ──────────────────────────────────────────────────────
 #

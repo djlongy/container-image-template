@@ -14,7 +14,7 @@
 # script tasks as env vars with a `bamboo_` prefix (dots in the var
 # name become underscores). build.sh now auto-imports every `bamboo_*`
 # env var as the bare name BEFORE sourcing image.env, so a plan var
-# named `INJECT_CERTS` automatically becomes `INJECT_CERTS` for the script.
+# named `VENDOR` automatically becomes `VENDOR` for the script.
 #
 # That auto-import only handles exact-name matches. For globally
 # shared service-account vars whose Bamboo names DON'T match what
@@ -86,7 +86,7 @@
 #   COSIGN_KEY               private key path or env: reference (file: type)
 #   COSIGN_URL               cosign binary URL (air-gap mirror)
 #
-# Corp CA (auto-flips INJECT_CERTS=true inside build.sh):
+# Corp CA (build.sh materialises it into certs/ for the sidecar):
 #   CA_CERT                  PEM content of a corp CA
 #
 # Closed-network tool mirrors (defaults reach public GitHub releases —
@@ -115,7 +115,7 @@
 # production" for the manual command.
 #
 # image.env (committed) is the single source of truth for build
-# behaviour (INJECT_CERTS, REGISTRY_KIND, UPSTREAM_*, Artifactory
+# behaviour (REGISTRY_KIND, UPSTREAM_*, Artifactory
 # layout templates, etc.). Plan vars only carry secrets and
 # per-environment overrides.
 #
@@ -211,7 +211,7 @@ Build:
             # build.sh auto-imports every bamboo_* env var as the
             # bare name. The exports below cover ONLY the cases where
             # the shared global has a different name (svc_*) than
-            # build.sh expects. Everything else (INJECT_CERTS,
+            # build.sh expects. Everything else (REGISTRY_KIND,
             # UPSTREAM_*, REGISTRY_KIND, ARTIFACTORY_URL, etc.) flows
             # through automatically — no per-var export here.
             export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
