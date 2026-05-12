@@ -178,11 +178,26 @@ variables:
 
 # ── Shared before_script: install tools used by most jobs ──────────
 .install-tools: &install-tools
-  - apk add --no-cache bash git curl openssl jq python3   # python3 is for scripts/push-backends/artifactory.sh build-info-merge.py + JSON helpers
+  - |
+    # Skip apk-add when every tool is already on PATH — the airgap path.
+    # Set ALPINE_IMAGE to a pre-baked image (see airgap/alpine-cit-tools/)
+    # and this becomes a no-op, avoiding any dl-cdn.alpinelinux.org fetch.
+    # python3 is for scripts/push-backends/artifactory.sh build-info-merge.py
+    # + the JSON helpers in lib/.
+    if command -v bash >/dev/null 2>&1 \
+       && command -v git >/dev/null 2>&1 \
+       && command -v curl >/dev/null 2>&1 \
+       && command -v openssl >/dev/null 2>&1 \
+       && command -v jq >/dev/null 2>&1 \
+       && command -v python3 >/dev/null 2>&1; then
+      echo "→ tools already on PATH — skipping apk add (pre-baked image)"
+    else
+      apk add --no-cache bash git curl openssl jq python3
+    fi
   - |
     # crane — used by build.sh for base digest + by promote for crane copy.
-    # Install into $HOME/.local/bin (sudoless). PATH is exported here so
-    # subsequent script: lines see it.
+    # Pre-baked airgap image ships crane at /usr/local/bin (already on PATH).
+    # Otherwise sudoless install into $HOME/.local/bin.
     mkdir -p "${HOME}/.local/bin"
     export PATH="${HOME}/.local/bin:${PATH}"
     if ! command -v crane >/dev/null 2>&1; then

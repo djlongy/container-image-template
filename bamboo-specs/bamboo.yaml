@@ -123,6 +123,13 @@
 # Add a plan variable named `BUILD_DEBUG` with value `true` to get
 # verbose "why did this decision happen?" logging from build.sh in
 # the Bamboo log. Auto-imported by build.sh — no shim needed.
+#
+# ── TONING DOWN load_image_env's per-var dump ─────────────────────────
+# By default, every job's log starts with `→ Loaded config (...)` and a
+# per-var listing of every config value (secrets redacted). To shorten
+# this to a one-line count, set plan variable LOAD_ENV_LOG=summary.
+# To silence entirely, LOAD_ENV_LOG=false. Default is the full listing
+# for troubleshooting visibility.
 
 ---
 version: 2
@@ -161,6 +168,9 @@ stages:
         - Xray SBOM Postscan
         - Xray Vuln Postscan
         - Grype Vuln
+        - Grype DB Sync     # opt-in air-gap mirror (no-op without
+                            # ARTIFACTORY_GRYPE_DB_REPO). Mirrors
+                            # GitLab's grype-db-sync job.
         - Runtime Smoke
         # - Trivy Vuln Postscan   # DORMANT — same caveat as Prescan
         # - Trivy SBOM Postscan   #   variants above.
@@ -383,7 +393,42 @@ Runtime Smoke:
             export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
             export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
 
-            bash ./scripts/scan/runtime-smoke.sh
+            # `|| true` mirrors GitLab's `allow_failure: true` on
+            # runtime-smoke. The smoke test is best-effort — if the
+            # container won't start because of a deliberately broken
+            # entrypoint (rare upstream bug), don't block the whole
+            # plan. Set RUNTIME_SMOKE_HEALTHCHECK / RUNTIME_HEALTH_TIMEOUT
+            # in image.env if you want stricter behaviour, and remove
+            # the `|| true` to make it a hard gate.
+            bash ./scripts/scan/runtime-smoke.sh || true
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Grype DB mirror (air-gap support, opt-in)
+# ═══════════════════════════════════════════════════════════════════
+# Mirrors the Anchore Grype CVE database into an Artifactory generic
+# repo so the Grype scan can fetch the DB from inside the firewall.
+# Self-gating: the script exits 0 when ARTIFACTORY_GRYPE_DB_REPO is
+# unset — safe to leave in the stage even in non-airgap environments.
+# Mirrors GitLab's `grype-db-sync` job (rules: ARTIFACTORY_GRYPE_DB_REPO != "").
+Grype DB Sync:
+  tasks:
+    - script:
+        interpreter: BASH
+        scripts:
+          - |-
+            set -euo pipefail
+
+            # Renamed shared globals → script-expected names. mirror-grype-db.sh
+            # needs ARTIFACTORY_* to authenticate uploads.
+            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
+            export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
+
+            # The script no-ops when ARTIFACTORY_GRYPE_DB_REPO is unset;
+            # `|| true` mirrors GitLab's optional-job semantics. If you
+            # want the missing-mirror case to fail loudly, drop the suffix.
+            bash ./scripts/sync/mirror-grype-db.sh || true
   requirements:
     - system.docker.executable
 
@@ -719,7 +764,12 @@ SBOM Ingest:
             export DEPENDENCY_TRACK_API_KEY="${bamboo_svc_dependency_track_api_key:-${bamboo_DEPENDENCY_TRACK_API_KEY:-}}"
             export SBOM_WEBHOOK_AUTH_HEADER="${bamboo_svc_sbom_webhook_auth_header:-${bamboo_SBOM_WEBHOOK_AUTH_HEADER:-}}"
 
-            bash ./scripts/ingest/sbom-post.sh "${SBOM_FILE}"
+            # `|| true` mirrors GitLab's `allow_failure: true` on
+            # sbom-ingest. SBOM sinks are best-effort — a Splunk HEC
+            # timeout or Dependency-Track outage shouldn't break the
+            # pipeline. The script no-ops on missing sink config so
+            # this is also safe to leave running with no sinks set.
+            bash ./scripts/ingest/sbom-post.sh "${SBOM_FILE}" || true
   requirements:
     - system.docker.executable
 
