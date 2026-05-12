@@ -40,7 +40,7 @@
 # else is in image.env, see README "Required CI variables — only
 # secrets" for the rationale):
 #
-#   PUSH_REGISTRY_PASSWORD       — push secret for default backend
+#   HARBOR_PASSWORD       — push secret for default backend
 #   ARTIFACTORY_PASSWORD/TOKEN   — when REGISTRY_KIND=artifactory
 #   XRAY_ARTIFACTORY_TOKEN       — when scan-side Artifactory differs
 #   SPLUNK_HEC_TOKEN             — when shipping to Splunk
@@ -187,7 +187,7 @@ variables:
     fi
   - |
     # Source image.env via the SHARED LOADER (lib/load-image-env.sh)
-    # so subsequent script: lines see PUSH_REGISTRY, ARTIFACTORY_*,
+    # so subsequent script: lines see HARBOR_REGISTRY, ARTIFACTORY_*,
     # VENDOR, etc. with the SAME precedence semantics build.sh uses:
     #   shell / pipeline-trigger / CI vars   WIN
     #   image.env values                     LOSE if shell already set
@@ -403,12 +403,13 @@ grype-vuln:
   before_script:
     - *install-tools
   rules: *build-rules
-  # JFrog Cloud trial / shared-instance Xray hates concurrent scans
-  # (we hung at 10+ minutes when two ran in parallel against the
-  # trial). resource_group serialises ALL xray jobs across ALL
-  # pipelines on this project. Drop it when you've moved to a Pro /
-  # self-hosted Xray with real concurrency.
-  resource_group: xray-scan
+  # NOTE on concurrency: if your Xray instance is a shared trial /
+  # under-provisioned and can't handle parallel scans, add
+  #   resource_group: xray-scan
+  # back to this anchor — that serialises every xray-* job across all
+  # pipelines on this project. On a properly-provisioned Pro / self-
+  # hosted Xray, concurrent scans are fine and the parallelism cuts
+  # pipeline wall time by ~50%.
   # POLICY-GATE NOTE: when XRAY_FAIL_ON_SEVERITY is set in image.env
   # the script exits 2 on violation. To make THAT a real gate (not a
   # warning), set allow_failure: false on xray-vuln-prescan only —
@@ -613,9 +614,9 @@ xray-sbom-postscan:
 #       # to a separate auth entry.
 #       mkdir -p ~/.docker
 #       AUTHS=""
-#       if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ]; then
-#         A=$(printf '%s' "${PUSH_REGISTRY_USER}:${PUSH_REGISTRY_PASSWORD}" | base64 -w0)
-#         AUTHS="${AUTHS}\"${PUSH_REGISTRY}\":{\"auth\":\"${A}\"},"
+#       if [ -n "${HARBOR_USER:-}" ] && [ -n "${HARBOR_PASSWORD:-}" ]; then
+#         A=$(printf '%s' "${HARBOR_USER}:${HARBOR_PASSWORD}" | base64 -w0)
+#         AUTHS="${AUTHS}\"${HARBOR_REGISTRY}\":{\"auth\":\"${A}\"},"
 #       fi
 #       if [ "${REGISTRY_KIND:-}" = "artifactory" ] && [ -n "${ARTIFACTORY_USER:-}" ]; then
 #         ART_SECRET="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"

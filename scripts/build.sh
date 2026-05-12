@@ -8,11 +8,11 @@
 #
 # Usage:
 #   ./scripts/build.sh            # build only, load into local daemon
-#   ./scripts/build.sh --push     # build + push to PUSH_REGISTRY
+#   ./scripts/build.sh --push     # build + push to HARBOR_REGISTRY
 #
 # Required env (fail fast if any are missing on --push):
-#   PUSH_REGISTRY       destination registry host
-#   PUSH_PROJECT        destination project / path prefix
+#   HARBOR_REGISTRY       destination registry host
+#   HARBOR_PROJECT        destination project / path prefix
 #
 # Optional env (with defaults):
 #   UPSTREAM_REGISTRY   default: docker.io/library
@@ -33,7 +33,7 @@
 #                       override to point at an internal mirror for
 #                       air-gapped runners.
 #   REGISTRY_KIND       when unset (default), --push does a plain
-#                       `docker push` to PUSH_REGISTRY (Harbor baseline).
+#                       `docker push` to HARBOR_REGISTRY (Harbor baseline).
 #                       Set to "artifactory" to delegate the push step
 #                       to scripts/push-backends/artifactory.sh, which
 #                       handles layout-template resolution, jf rt bp
@@ -89,7 +89,7 @@ _build_print_usage() {
 Usage: ./scripts/build.sh [--push | --dry-run | --help]
 
   (no args)    Build locally, load into Docker daemon, don't push.
-  --push       Build, then push to PUSH_REGISTRY/PUSH_PROJECT (or via
+  --push       Build, then push to HARBOR_REGISTRY/HARBOR_PROJECT (or via
                the Artifactory backend when REGISTRY_KIND=artifactory).
   --dry-run    Resolve config + base digest, print the report block,
                stop before docker build. No image produced. Useful for
@@ -273,7 +273,7 @@ _build_materialise_certs() {
 # ════════════════════════════════════════════════════════════════════
 # PHASE 4 — Push target derivation
 # ════════════════════════════════════════════════════════════════════
-# When REGISTRY_KIND=artifactory, PUSH_REGISTRY/PUSH_PROJECT are only
+# When REGISTRY_KIND=artifactory, HARBOR_REGISTRY/HARBOR_PROJECT are only
 # used for the intermediate local tag (the backend retags via its own
 # layout template). Auto-derive from Artifactory vars so users don't
 # set redundant values. Also parses --push and computes FULL_IMAGE +
@@ -284,16 +284,16 @@ _build_resolve_push_target() {
   _dbg "REGISTRY_KIND=${REGISTRY_KIND:-<unset>} → backend=${REGISTRY_KIND_LC:-default-harbor-style}"
 
   if [ "${REGISTRY_KIND_LC}" = "artifactory" ]; then
-    if [ -z "${PUSH_REGISTRY:-}" ] && [ -n "${ARTIFACTORY_PUSH_HOST:-}" ]; then
-      PUSH_REGISTRY="${ARTIFACTORY_PUSH_HOST}"
-      _dbg "PUSH_REGISTRY auto-derived from ARTIFACTORY_PUSH_HOST=${PUSH_REGISTRY}"
-    elif [ -z "${PUSH_REGISTRY:-}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
-      PUSH_REGISTRY="${ARTIFACTORY_URL#https://}"
-      PUSH_REGISTRY="${PUSH_REGISTRY#http://}"
-      PUSH_REGISTRY="${PUSH_REGISTRY%%/*}"
-      _dbg "PUSH_REGISTRY auto-derived from ARTIFACTORY_URL=${PUSH_REGISTRY}"
+    if [ -z "${HARBOR_REGISTRY:-}" ] && [ -n "${ARTIFACTORY_PUSH_HOST:-}" ]; then
+      HARBOR_REGISTRY="${ARTIFACTORY_PUSH_HOST}"
+      _dbg "HARBOR_REGISTRY auto-derived from ARTIFACTORY_PUSH_HOST=${HARBOR_REGISTRY}"
+    elif [ -z "${HARBOR_REGISTRY:-}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
+      HARBOR_REGISTRY="${ARTIFACTORY_URL#https://}"
+      HARBOR_REGISTRY="${HARBOR_REGISTRY#http://}"
+      HARBOR_REGISTRY="${HARBOR_REGISTRY%%/*}"
+      _dbg "HARBOR_REGISTRY auto-derived from ARTIFACTORY_URL=${HARBOR_REGISTRY}"
     fi
-    # Reverse derivation: if only PUSH_REGISTRY is set (homelab /
+    # Reverse derivation: if only HARBOR_REGISTRY is set (homelab /
     # single-host on-prem case where the same FQDN serves both Docker
     # registry and REST API), populate ARTIFACTORY_URL from it so the
     # backend's API calls have a target.
@@ -302,31 +302,31 @@ _build_resolve_push_target() {
     # mycorp.jfrog.io, docker at mycorp-docker.jfrog.io). On Cloud,
     # set ARTIFACTORY_URL explicitly in image.env so this branch is
     # skipped.
-    if [ -z "${ARTIFACTORY_URL:-}" ] && [ -n "${PUSH_REGISTRY:-}" ]; then
-      ARTIFACTORY_URL="https://${PUSH_REGISTRY}"
-      _dbg "ARTIFACTORY_URL auto-derived from PUSH_REGISTRY=${ARTIFACTORY_URL} (homelab/single-host pattern; set explicitly on JFrog Cloud)"
+    if [ -z "${ARTIFACTORY_URL:-}" ] && [ -n "${HARBOR_REGISTRY:-}" ]; then
+      ARTIFACTORY_URL="https://${HARBOR_REGISTRY}"
+      _dbg "ARTIFACTORY_URL auto-derived from HARBOR_REGISTRY=${ARTIFACTORY_URL} (homelab/single-host pattern; set explicitly on JFrog Cloud)"
     fi
-    if [ -z "${PUSH_PROJECT:-}" ] && [ -n "${ARTIFACTORY_TEAM:-}" ]; then
-      PUSH_PROJECT="${ARTIFACTORY_TEAM}"
-      _dbg "PUSH_PROJECT auto-derived from ARTIFACTORY_TEAM=${PUSH_PROJECT}"
+    if [ -z "${HARBOR_PROJECT:-}" ] && [ -n "${ARTIFACTORY_TEAM:-}" ]; then
+      HARBOR_PROJECT="${ARTIFACTORY_TEAM}"
+      _dbg "HARBOR_PROJECT auto-derived from ARTIFACTORY_TEAM=${HARBOR_PROJECT}"
     fi
   fi
 
   # WANT_PUSH was set by _build_parse_args; validate push target only
   # when push is actually requested.
   if [ "${WANT_PUSH}" -eq 1 ]; then
-    if [ -z "${PUSH_REGISTRY:-}" ] || [ -z "${PUSH_PROJECT:-}" ]; then
-      echo "ERROR: PUSH_REGISTRY and PUSH_PROJECT must be set for --push" >&2
+    if [ -z "${HARBOR_REGISTRY:-}" ] || [ -z "${HARBOR_PROJECT:-}" ]; then
+      echo "ERROR: HARBOR_REGISTRY and HARBOR_PROJECT must be set for --push" >&2
       if [ "${REGISTRY_KIND_LC}" = "artifactory" ]; then
         echo "       (tip: set ARTIFACTORY_PUSH_HOST + ARTIFACTORY_TEAM and they'll" >&2
-        echo "        auto-derive PUSH_REGISTRY + PUSH_PROJECT for the local tag)" >&2
+        echo "        auto-derive HARBOR_REGISTRY + HARBOR_PROJECT for the local tag)" >&2
       fi
       return 1
     fi
   fi
 
-  if [ -n "${PUSH_REGISTRY:-}" ] && [ -n "${PUSH_PROJECT:-}" ]; then
-    FULL_IMAGE="${PUSH_REGISTRY}/${PUSH_PROJECT}/${IMAGE_NAME}:${FULL_TAG}"
+  if [ -n "${HARBOR_REGISTRY:-}" ] && [ -n "${HARBOR_PROJECT:-}" ]; then
+    FULL_IMAGE="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${FULL_TAG}"
   else
     FULL_IMAGE="${IMAGE_NAME}:${FULL_TAG}"
   fi

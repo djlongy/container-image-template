@@ -13,12 +13,12 @@
 # ── Variables this backend reads (set in image.env / shell env) ─────
 #
 # Required (when --push):
-#   PUSH_REGISTRY              destination registry host (e.g. harbor.example.com)
-#   PUSH_PROJECT               project / path prefix under PUSH_REGISTRY
+#   HARBOR_REGISTRY              destination registry host (e.g. harbor.example.com)
+#   HARBOR_PROJECT               project / path prefix under HARBOR_REGISTRY
 #
 # Required at runtime for authenticated registries:
-#   PUSH_REGISTRY_USER
-#   PUSH_REGISTRY_PASSWORD     password or token (CI-masked, never committed)
+#   HARBOR_USER
+#   HARBOR_PASSWORD     password or token (CI-masked, never committed)
 #
 # Inputs from build.sh (already exported):
 #   FULL_IMAGE                 fully-qualified ref to push (the local tag)
@@ -46,18 +46,18 @@ _harbor_docker_login() {
     echo "ERROR: 'docker' CLI not found on PATH" >&2
     return 1
   fi
-  if [ -z "${PUSH_REGISTRY:-}" ]; then
-    echo "ERROR: PUSH_REGISTRY is required for the Harbor backend" >&2
+  if [ -z "${HARBOR_REGISTRY:-}" ]; then
+    echo "ERROR: HARBOR_REGISTRY is required for the Harbor backend" >&2
     return 1
   fi
-  if [ -z "${PUSH_REGISTRY_USER:-}" ] || [ -z "${PUSH_REGISTRY_PASSWORD:-}" ]; then
-    _dbg "Harbor creds incomplete (registry=${PUSH_REGISTRY} user=${PUSH_REGISTRY_USER:+set}) — skipping login"
-    echo "  WARN: PUSH_REGISTRY_USER / PUSH_REGISTRY_PASSWORD unset — relying on existing daemon login" >&2
+  if [ -z "${HARBOR_USER:-}" ] || [ -z "${HARBOR_PASSWORD:-}" ]; then
+    _dbg "Harbor creds incomplete (registry=${HARBOR_REGISTRY} user=${HARBOR_USER:+set}) — skipping login"
+    echo "  WARN: HARBOR_USER / HARBOR_PASSWORD unset — relying on existing daemon login" >&2
     return 0
   fi
-  echo "→ docker login ${PUSH_REGISTRY} (Harbor backend)"
-  printf '%s' "${PUSH_REGISTRY_PASSWORD}" | docker login "${PUSH_REGISTRY}" \
-    -u "${PUSH_REGISTRY_USER}" --password-stdin
+  echo "→ docker login ${HARBOR_REGISTRY} (Harbor backend)"
+  printf '%s' "${HARBOR_PASSWORD}" | docker login "${HARBOR_REGISTRY}" \
+    -u "${HARBOR_USER}" --password-stdin
 }
 
 _harbor_print_banner() {
@@ -66,8 +66,8 @@ _harbor_print_banner() {
   echo "=== Harbor push ==="
   echo "  Source (local):  ${target}"
   echo "  Target:          ${target}"
-  echo "  Push host:       ${PUSH_REGISTRY}"
-  echo "  Project path:    ${PUSH_PROJECT}"
+  echo "  Push host:       ${HARBOR_REGISTRY}"
+  echo "  Project path:    ${HARBOR_PROJECT}"
 }
 
 _harbor_write_build_env() {

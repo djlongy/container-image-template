@@ -135,13 +135,13 @@ where they came from.
 **Truly secret (must be CI-vars, masked, never committed):**
 
 Pick the row that matches your push backend — they're mutually
-exclusive. The default Harbor path uses `PUSH_REGISTRY_PASSWORD`;
+exclusive. The default Harbor path uses `HARBOR_PASSWORD`;
 `REGISTRY_KIND=artifactory` uses the Artifactory creds and ignores
-`PUSH_REGISTRY_PASSWORD` entirely.
+`HARBOR_PASSWORD` entirely.
 
 | Variable | When required | Purpose |
 |---|---|---|
-| `PUSH_REGISTRY_PASSWORD` | Default (Harbor `docker push` to `PUSH_REGISTRY`) | Push password / token. Not used when `REGISTRY_KIND=artifactory` |
+| `HARBOR_PASSWORD` | Default (Harbor `docker push` to `HARBOR_REGISTRY`) | Push password / token. Not used when `REGISTRY_KIND=artifactory` |
 | `ARTIFACTORY_USER` | When `REGISTRY_KIND=artifactory` | Service-account username (see "JFrog Cloud gotcha" below for the username encoding) |
 | `ARTIFACTORY_TOKEN` *or* `ARTIFACTORY_PASSWORD` | When `REGISTRY_KIND=artifactory` | Token preferred; basic-auth password also works |
 | `XRAY_ARTIFACTORY_TOKEN` | Optional | Only when scan-side Artifactory differs from push-side |
@@ -153,8 +153,8 @@ exclusive. The default Harbor path uses `PUSH_REGISTRY_PASSWORD`;
 **Bare-minimum to push via the Artifactory backend:** export
 `ARTIFACTORY_USER` and `ARTIFACTORY_TOKEN` (or `ARTIFACTORY_PASSWORD`)
 in the shell, set everything else in `image.env`, then run
-`./scripts/build.sh --push`. No `PUSH_REGISTRY_PASSWORD`, no
-`PUSH_REGISTRY_USER`, no separate registry login — the backend
+`./scripts/build.sh --push`. No `HARBOR_PASSWORD`, no
+`HARBOR_USER`, no separate registry login — the backend
 handles its own `docker login` and pushes through `jf docker push`.
 
 **CI-runtime images (must be CI-vars — YAML reads at pipeline-load time):**
@@ -165,8 +165,8 @@ handles its own `docker login` and pushes through `jf docker push`.
 | `DOCKER_CLI_IMAGE` | `docker:27-cli` | Image used by build job (docker CLI) |
 | `DOCKER_DIND_IMAGE` | `docker:27-dind` | Image used by build / xray-* jobs (docker daemon sidecar) |
 
-**Everything else lives in `image.env`** — `PUSH_REGISTRY`, `PUSH_PROJECT`,
-`PUSH_REGISTRY_USER`, `VENDOR`, `ARTIFACTORY_URL/USER/TEAM/ENVIRONMENT/
+**Everything else lives in `image.env`** — `HARBOR_REGISTRY`, `HARBOR_PROJECT`,
+`HARBOR_USER`, `VENDOR`, `ARTIFACTORY_URL/USER/TEAM/ENVIRONMENT/
 PUSH_HOST/IMAGE_REF/MANIFEST_PATH`, `XRAY_ARTIFACTORY_URL/USER`,
 `SPLUNK_HEC_URL/INSECURE/INDEX/SOURCETYPE`, `JF_BINARY_URL/DEB_URL/RPM_URL`,
 `SBOM_WEBHOOK_URL`, `DEPENDENCY_TRACK_URL/PROJECT`, `ARTIFACTORY_SBOM_REPO`,
@@ -248,7 +248,7 @@ vuln scan JSON with sourcetype `jfrog:xray:scan`.
 
 ### Optional: push backend switch (Harbor ↔ Artifactory)
 
-The default path does a plain `docker push` to `PUSH_REGISTRY`
+The default path does a plain `docker push` to `HARBOR_REGISTRY`
 (Harbor baseline, zero extra config). Set `REGISTRY_KIND=artifactory`
 to delegate the push step to `scripts/push-backends/artifactory.sh`,
 which handles layout template resolution, `jf rt bp` build-info
@@ -612,8 +612,8 @@ $EDITOR image.env       # populate UPSTREAM_*, INJECT_CERTS, etc.
 #    image.env + applying any shell overrides). Pick the env block that
 #    matches your push backend:
 #
-#    Default (Harbor) — needs PUSH_REGISTRY_USER + PUSH_REGISTRY_PASSWORD:
-export PUSH_REGISTRY_PASSWORD='...'   # password / token (don't commit)
+#    Default (Harbor) — needs HARBOR_USER + HARBOR_PASSWORD:
+export HARBOR_PASSWORD='...'   # password / token (don't commit)
 #
 #    Artifactory backend (REGISTRY_KIND=artifactory in image.env) —
 #    needs only ARTIFACTORY_USER + ARTIFACTORY_TOKEN/PASSWORD; the

@@ -28,10 +28,10 @@
 # Required plan or global variables:
 #
 #   # Push backend (Harbor baseline — the default)
-#   PUSH_REGISTRY            destination registry host
-#   PUSH_PROJECT             destination project / path
-#   PUSH_REGISTRY_USER       registry push username
-#   PUSH_REGISTRY_PASSWORD   registry push password (masked)
+#   HARBOR_REGISTRY            destination registry host
+#   HARBOR_PROJECT             destination project / path
+#   HARBOR_USER       registry push username
+#   HARBOR_PASSWORD   registry push password (masked)
 #
 #   # Optional: shared service-account global vars (mapped via shim)
 #   svc_artifactory_token    → exported as ARTIFACTORY_TOKEN
@@ -171,8 +171,8 @@ Build:
             # through automatically — no per-var export here.
             export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
             export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
-            export PUSH_REGISTRY_USER="${bamboo_svc_push_registry_user:-${bamboo_PUSH_REGISTRY_USER:-}}"
-            export PUSH_REGISTRY_PASSWORD="${bamboo_svc_push_registry_password:-${bamboo_PUSH_REGISTRY_PASSWORD:-}}"
+            export HARBOR_USER="${bamboo_svc_harbor_user:-${bamboo_HARBOR_USER:-}}"
+            export HARBOR_PASSWORD="${bamboo_svc_harbor_password:-${bamboo_HARBOR_PASSWORD:-}}"
 
             # crane is needed for base.digest resolution in build.sh.
             # Falls back to docker buildx inspect if not present, but
@@ -218,8 +218,8 @@ Syft SBOM Postscan:
             # plan vars arrive as bamboo_*; the script auto-imports them
             # via load-image-env.sh — these explicit shims cover the
             # bamboo_svc_* (renamed) variants.
-            export PUSH_REGISTRY_USER="${bamboo_svc_push_registry_user:-${bamboo_PUSH_REGISTRY_USER:-}}"
-            export PUSH_REGISTRY_PASSWORD="${bamboo_svc_push_registry_password:-${bamboo_PUSH_REGISTRY_PASSWORD:-}}"
+            export HARBOR_USER="${bamboo_svc_harbor_user:-${bamboo_HARBOR_USER:-}}"
+            export HARBOR_PASSWORD="${bamboo_svc_harbor_password:-${bamboo_HARBOR_PASSWORD:-}}"
 
             # Standalone Syft script. SBOM_FILE comes from build.env
             # (canonical name from scripts/lib/artifact-names.sh) so
@@ -544,8 +544,8 @@ Xray SBOM Postscan:
 #             . ./build.env
 #             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
 #
-#             export PUSH_REGISTRY_USER="${bamboo_svc_push_registry_user:-${bamboo_PUSH_REGISTRY_USER:-}}"
-#             export PUSH_REGISTRY_PASSWORD="${bamboo_svc_push_registry_password:-${bamboo_PUSH_REGISTRY_PASSWORD:-}}"
+#             export HARBOR_USER="${bamboo_svc_harbor_user:-${bamboo_HARBOR_USER:-}}"
+#             export HARBOR_PASSWORD="${bamboo_svc_harbor_password:-${bamboo_HARBOR_PASSWORD:-}}"
 #
 #             if [ -z "${bamboo_COSIGN_KEY:-}" ]; then
 #               echo "SKIPPED: COSIGN_KEY plan var not set"
@@ -561,9 +561,9 @@ Xray SBOM Postscan:
 #               export PATH="${HOME}/.local/bin:${PATH}"
 #             fi
 #
-#             if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${bamboo_PUSH_REGISTRY:-}" ]; then
-#               echo "${PUSH_REGISTRY_PASSWORD}" | docker login "${bamboo_PUSH_REGISTRY}" \
-#                 -u "${PUSH_REGISTRY_USER}" --password-stdin
+#             if [ -n "${HARBOR_USER:-}" ] && [ -n "${bamboo_HARBOR_REGISTRY:-}" ]; then
+#               echo "${HARBOR_PASSWORD}" | docker login "${bamboo_HARBOR_REGISTRY}" \
+#                 -u "${HARBOR_USER}" --password-stdin
 #             fi
 #
 #             TARGET="${IMAGE_DIGEST:-${IMAGE_REF}}"

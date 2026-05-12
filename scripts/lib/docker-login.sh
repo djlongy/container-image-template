@@ -11,7 +11,7 @@
 #
 #   docker_login_for_xray_scan
 #     Attempts a non-fatal docker login against three potential hosts:
-#     - PUSH_REGISTRY                (default Harbor backend)
+#     - HARBOR_REGISTRY                (default Harbor backend)
 #     - ARTIFACTORY_PUSH_HOST        (when REGISTRY_KIND=artifactory)
 #     - XRAY_ARTIFACTORY_URL host    (when scan-side ≠ push-side)
 #
@@ -24,7 +24,7 @@
 # Why a separate lib instead of doing this inline:
 #   - build.sh has its own narrower _build_docker_login that targets
 #     ONE host (the push target). This lib targets MULTIPLE hosts
-#     because a postscan job may need to pull from PUSH_REGISTRY
+#     because a postscan job may need to pull from HARBOR_REGISTRY
 #     (built image) AND the upstream registry (cached locally maybe,
 #     or if you're scanning multiple images in one job).
 #   - Reused across xray-vuln + xray-sbom. Keeps the per-script logic
@@ -41,15 +41,15 @@ docker_login_for_xray_scan() {
 
   local _attempts=0 _failures=0
 
-  # ── PUSH_REGISTRY (Harbor / default backend) ───────────────────
-  if [ -n "${PUSH_REGISTRY:-}" ] && [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ]; then
+  # ── HARBOR_REGISTRY (Harbor / default backend) ───────────────────
+  if [ -n "${HARBOR_REGISTRY:-}" ] && [ -n "${HARBOR_USER:-}" ] && [ -n "${HARBOR_PASSWORD:-}" ]; then
     _attempts=$((_attempts + 1))
-    echo "→ docker login ${PUSH_REGISTRY} (PUSH_REGISTRY)"
-    if printf '%s' "${PUSH_REGISTRY_PASSWORD}" \
-         | docker login "${PUSH_REGISTRY}" -u "${PUSH_REGISTRY_USER}" --password-stdin >/dev/null 2>/tmp/docker-login.err; then
+    echo "→ docker login ${HARBOR_REGISTRY} (HARBOR_REGISTRY)"
+    if printf '%s' "${HARBOR_PASSWORD}" \
+         | docker login "${HARBOR_REGISTRY}" -u "${HARBOR_USER}" --password-stdin >/dev/null 2>/tmp/docker-login.err; then
       echo "  ✓ logged in"
     else
-      echo "  WARN: login failed — ${PUSH_REGISTRY} pulls will be unauthenticated" >&2
+      echo "  WARN: login failed — ${HARBOR_REGISTRY} pulls will be unauthenticated" >&2
       sed 's/^/    /' /tmp/docker-login.err >&2 || true
       _failures=$((_failures + 1))
     fi
@@ -79,7 +79,7 @@ docker_login_for_xray_scan() {
   # (the access-token's encoded subject, not the API user/email) and
   # an attempted login with the API creds fails with "Wrong username
   # was used" — noisy and confusing. The actual built image lives at
-  # PUSH_REGISTRY or ARTIFACTORY_PUSH_HOST, both handled above.
+  # HARBOR_REGISTRY or ARTIFACTORY_PUSH_HOST, both handled above.
 
   if [ "${_attempts}" -eq 0 ]; then
     echo "  NOTE: no registry credentials in env — relying on existing daemon auth + public pulls" >&2

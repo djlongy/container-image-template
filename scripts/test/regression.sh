@@ -178,7 +178,7 @@ end_scenario
 scenario "append-git-short-false"
 _run env -i HOME="$HOME" PATH="$PATH" APPEND_GIT_SHORT=false ./scripts/build.sh --dry-run >/dev/null
 # Tag should end at the upstream tag with no SHA suffix, regardless
-# of whether PUSH_REGISTRY / PUSH_PROJECT are set in image.env.
+# of whether HARBOR_REGISTRY / HARBOR_PROJECT are set in image.env.
 _must_contain "1.25.3-alpine"
 _must_not_contain "1.25.3-alpine-"  # no SHA suffix
 end_scenario
@@ -221,15 +221,15 @@ _must_contain "UPSTREAM_IMAGE must be set"
 end_scenario
 
 scenario "push-without-push-registry-fails"
-# Strip PUSH_REGISTRY/PROJECT (and ARTIFACTORY_PUSH_HOST in case
+# Strip HARBOR_REGISTRY/PROJECT (and ARTIFACTORY_PUSH_HOST in case
 # auto-derive would kick in) from image.env so the test starts from
 # the unconfigured state regardless of what's currently committed.
-sed -i.bak -E '/^(PUSH_REGISTRY|PUSH_PROJECT|ARTIFACTORY_URL|ARTIFACTORY_PUSH_HOST)=/d' image.env && rm image.env.bak
+sed -i.bak -E '/^(HARBOR_REGISTRY|HARBOR_PROJECT|ARTIFACTORY_URL|ARTIFACTORY_PUSH_HOST)=/d' image.env && rm image.env.bak
 out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --push 2>&1) ; rc=$?
 echo "${out}" > "${TMP_DIR}/out"
 echo "${out}" | head -10
-[ "${rc}" -ne 0 ] || FAILURES+=("${CURRENT_NAME}: expected non-zero exit on --push without PUSH_REGISTRY")
-_must_contain "PUSH_REGISTRY and PUSH_PROJECT must be set"
+[ "${rc}" -ne 0 ] || FAILURES+=("${CURRENT_NAME}: expected non-zero exit on --push without HARBOR_REGISTRY")
+_must_contain "HARBOR_REGISTRY and HARBOR_PROJECT must be set"
 end_scenario
 
 scenario "argv-extra-args-rejected"
@@ -263,20 +263,20 @@ scenario "registry-kind-artifactory-needs-creds-on-push"
 # Strip BOTH push-side and Artifactory derivation sources from
 # image.env so the test starts from an unconfigured state. With
 # REGISTRY_KIND=artifactory but no derivation source, --push must fail.
-sed -i.bak -E '/^(PUSH_REGISTRY|PUSH_PROJECT|ARTIFACTORY_URL|ARTIFACTORY_PUSH_HOST|ARTIFACTORY_TEAM|REGISTRY_KIND)=/d' image.env && rm image.env.bak
+sed -i.bak -E '/^(HARBOR_REGISTRY|HARBOR_PROJECT|ARTIFACTORY_URL|ARTIFACTORY_PUSH_HOST|ARTIFACTORY_TEAM|REGISTRY_KIND)=/d' image.env && rm image.env.bak
 echo 'REGISTRY_KIND="artifactory"' >> image.env
 out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --push 2>&1) ; rc=$?
 echo "${out}" > "${TMP_DIR}/out"
 echo "${out}" | head -10
 [ "${rc}" -ne 0 ] || FAILURES+=("${CURRENT_NAME}: expected non-zero exit")
-_must_contain "PUSH_REGISTRY and PUSH_PROJECT must be set"
+_must_contain "HARBOR_REGISTRY and HARBOR_PROJECT must be set"
 _must_contain "ARTIFACTORY_PUSH_HOST"  # tip pointing at the right vars
 end_scenario
 
 scenario "registry-kind-artifactory-derives-from-push-host"
 # Strip image.env push config first, then provide ARTIFACTORY_PUSH_HOST
 # via shell to test the auto-derive path.
-sed -i.bak -E '/^(PUSH_REGISTRY|PUSH_PROJECT|ARTIFACTORY_URL|ARTIFACTORY_PUSH_HOST|ARTIFACTORY_TEAM|REGISTRY_KIND)=/d' image.env && rm image.env.bak
+sed -i.bak -E '/^(HARBOR_REGISTRY|HARBOR_PROJECT|ARTIFACTORY_URL|ARTIFACTORY_PUSH_HOST|ARTIFACTORY_TEAM|REGISTRY_KIND)=/d' image.env && rm image.env.bak
 echo 'REGISTRY_KIND="artifactory"' >> image.env
 _run env -i HOME="$HOME" PATH="$PATH" \
   ARTIFACTORY_PUSH_HOST="example.jfrog.io" \
@@ -408,9 +408,9 @@ scenario "registry-kind-default-resolves-to-harbor"
 # When REGISTRY_KIND is unset, dispatch must resolve to harbor.sh.
 # Strip Artifactory-derivation sources so the test exercises the
 # default (Harbor) path. Use --push to actually trigger dispatch.
-sed -i.bak -E '/^(PUSH_REGISTRY|PUSH_PROJECT|ARTIFACTORY_URL|ARTIFACTORY_PUSH_HOST|ARTIFACTORY_TEAM|REGISTRY_KIND)=/d' image.env && rm image.env.bak
-echo 'PUSH_REGISTRY="harbor.example.com"' >> image.env
-echo 'PUSH_PROJECT="apps/test"'           >> image.env
+sed -i.bak -E '/^(HARBOR_REGISTRY|HARBOR_PROJECT|ARTIFACTORY_URL|ARTIFACTORY_PUSH_HOST|ARTIFACTORY_TEAM|REGISTRY_KIND)=/d' image.env && rm image.env.bak
+echo 'HARBOR_REGISTRY="harbor.example.com"' >> image.env
+echo 'HARBOR_PROJECT="apps/test"'           >> image.env
 out=$(env -i HOME="$HOME" PATH="$PATH" BUILD_DEBUG=true ./scripts/build.sh --push 2>&1) ; rc=$?
 echo "${out}" > "${TMP_DIR}/out"
 echo "${out}" | grep -E "(dispatching push|Harbor push|harbor\.sh)" | head -5
@@ -420,9 +420,9 @@ _must_contain "backend=harbor"
 end_scenario
 
 scenario "registry-kind-explicit-harbor"
-sed -i.bak -E '/^(PUSH_REGISTRY|PUSH_PROJECT|REGISTRY_KIND)=/d' image.env && rm image.env.bak
-echo 'PUSH_REGISTRY="harbor.example.com"' >> image.env
-echo 'PUSH_PROJECT="apps/test"'           >> image.env
+sed -i.bak -E '/^(HARBOR_REGISTRY|HARBOR_PROJECT|REGISTRY_KIND)=/d' image.env && rm image.env.bak
+echo 'HARBOR_REGISTRY="harbor.example.com"' >> image.env
+echo 'HARBOR_PROJECT="apps/test"'           >> image.env
 echo 'REGISTRY_KIND="harbor"'             >> image.env
 out=$(env -i HOME="$HOME" PATH="$PATH" BUILD_DEBUG=true ./scripts/build.sh --push 2>&1) ; rc=$?
 echo "${out}" > "${TMP_DIR}/out"
@@ -432,9 +432,9 @@ end_scenario
 scenario "registry-kind-unknown-fails-with-listing"
 # REGISTRY_KIND set to a backend that doesn't exist must fail loudly
 # AND list the available backends so the user sees the typo.
-sed -i.bak -E '/^(PUSH_REGISTRY|PUSH_PROJECT|REGISTRY_KIND)=/d' image.env && rm image.env.bak
-echo 'PUSH_REGISTRY="harbor.example.com"' >> image.env
-echo 'PUSH_PROJECT="apps/test"'           >> image.env
+sed -i.bak -E '/^(HARBOR_REGISTRY|HARBOR_PROJECT|REGISTRY_KIND)=/d' image.env && rm image.env.bak
+echo 'HARBOR_REGISTRY="harbor.example.com"' >> image.env
+echo 'HARBOR_PROJECT="apps/test"'           >> image.env
 echo 'REGISTRY_KIND="nexus"'              >> image.env
 out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --push 2>&1) ; rc=$?
 echo "${out}" > "${TMP_DIR}/out"
