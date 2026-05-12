@@ -50,39 +50,23 @@ _dbg() {
 }
 
 # ════════════════════════════════════════════════════════════════════
-# import_bamboo_vars — Bamboo plan-var auto-import
+# import_bamboo_vars — sourced from scripts/lib/bamboo-import.sh
 # ════════════════════════════════════════════════════════════════════
-# Bamboo exposes plan vars and global vars to script tasks as env
-# vars prefixed `bamboo_` (dots in the var name become underscores).
-# Translate each to its bare name before image.env loading so plan
-# vars Just Work without a hand-written relay block in bamboo.yaml.
-#
-# Doesn't override an already-set bare var — explicit shell export
-# wins over Bamboo plan-var auto-import. Use that to keep a
-# script-local override even when a bamboo_FOO value exists.
-#
-# For renamed vars (e.g. shared global `svc_artifactory_token` →
-# script-expected `ARTIFACTORY_TOKEN`), still write a one-line shim
-# in the bamboo.yaml task — auto-import only handles exact-match.
-import_bamboo_vars() {
-  local __bv __bare __count=0
-  while IFS= read -r __bv; do
-    [ -z "${__bv}" ] && continue
-    __bare="${__bv#bamboo_}"
-    if [ -n "${!__bare-}" ]; then
-      _dbg "bamboo import skip: ${__bare} already set in shell"
-      continue
-    fi
-    eval "export ${__bare}=\"\${${__bv}}\""
-    __count=$((__count+1))
-    _dbg "bamboo import: ${__bv} → ${__bare}"
-  done < <(env | grep -oE '^bamboo_[A-Za-z_][A-Za-z0-9_]*' || true)
-
-  if [ "${__count}" -gt 0 ]; then
-    echo "→ Auto-imported ${__count} bamboo_* env var(s) → bare names"
-    _dbg "(set BUILD_DEBUG=true to see the per-var breakdown)"
-  fi
-}
+# The actual Bamboo auto-import logic lives in a SEPARATE file
+# (scripts/lib/bamboo-import.sh) so the codebase remains modular —
+# Bamboo support can be removed by deleting that one file plus
+# bamboo-specs/bamboo.yaml. The stub below provides a safe no-op
+# function when bamboo-import.sh isn't present, so callers that do
+# `import_bamboo_vars` keep working unchanged.
+_bamboo_lib="$(dirname "${BASH_SOURCE[0]}")/bamboo-import.sh"
+if [ -f "${_bamboo_lib}" ]; then
+  # shellcheck source=./bamboo-import.sh
+  . "${_bamboo_lib}"
+else
+  # Bamboo support removed. Stub keeps the API stable for callers.
+  import_bamboo_vars() { :; }
+fi
+unset _bamboo_lib
 
 # ════════════════════════════════════════════════════════════════════
 # load_image_env — source ./image.env with snapshot/restore semantics
@@ -121,7 +105,7 @@ load_image_env() {
   local __v __line __SHELL_OVERRIDES=""
   for __v in IMAGE_NAME \
              UPSTREAM_REGISTRY UPSTREAM_IMAGE UPSTREAM_TAG UPSTREAM_REF \
-             INJECT_CERTS ORIGINAL_USER \
+             ORIGINAL_USER \
              HARBOR_REGISTRY HARBOR_PROJECT HARBOR_USER HARBOR_PASSWORD \
              VENDOR AUTHORS BUILD_DEBUG \
              CA_CERT \
@@ -140,7 +124,8 @@ load_image_env() {
              XRAY_GENERATE_SBOM XRAY_SCAN_FORMAT \
              XRAY_SCAN_REF SBOM_SCAN_REF XRAY_FAIL_ON_SEVERITY \
              IMAGE_REF IMAGE_DIGEST IMAGE_TAG \
-             CRANE_URL SYFT_INSTALLER_URL SYFT_VERSION \
+             CRANE_URL CERT_BUILDER_IMAGE \
+             SYFT_INSTALLER_URL SYFT_VERSION \
              GRYPE_INSTALLER_URL GRYPE_VERSION \
              GRYPE_FAIL_ON_SEVERITY GRYPE_DB_MIRROR_SUBPATH \
              TRIVY_VERSION TRIVY_INSTALLER_URL TRIVY_BINARY_URL \

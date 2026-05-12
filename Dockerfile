@@ -1,88 +1,74 @@
 #
 # Single-image template Dockerfile.
 #
-# Build shape: upstream base → optional cert injection → fork-owned
-# extension → final user restoration. The cert stage is ARG-gated, and
-# the final stage is selected at build time via `FROM stage-${ARG}` so
-# unused branches never run. BuildKit prunes the unselected graph.
+# Build shape: upstream base → cert sidecar (uses a shell-bearing
+# builder image so it works on shell-less / distroless / chainguard
+# bases too) → final stage that re-bases FROM base so USER stays
+# whatever upstream had → editable region → restore upstream USER.
 #
-# This Dockerfile is intentionally MINIMAL. Bamboo's docker plugin and
-# some older buildx versions don't reliably resolve nested ARG-gated
-# stages, so we keep exactly one toggle here (INJECT_CERTS). All
-# bespoke per-image work — package upgrades, extra installs, file
-# drops, healthchecks, ENV — goes directly into the marked
-# "FORK EDITS GO HERE" region below. Editing the Dockerfile is the
-# expected fork pattern; there is no separate extension surface.
-#
-# Dynamic OCI labels (version, revision, created, base.digest, source,
-# etc.) are intentionally NOT set here with LABEL. They're passed by
-# scripts/build.sh via `docker build --label ...`, which is the
-# DevSecOps-recommended pattern: Dockerfiles hold static provenance
-# (title, vendor, licenses), build invocation holds dynamic provenance
-# (commit SHA, timestamp, base digest). Checking the Dockerfile into
-# source control shouldn't require bumping commit SHAs in LABEL lines.
+# Dynamic OCI labels (version, revision, created, base.digest, source)
+# are set by scripts/build.sh via `docker build --label ...` rather
+# than LABEL lines here; commit SHAs don't need to land in source.
 
-# ── Global ARGs (available to FROM lines of all stages) ──────────────
-#
-# build.sh passes these from image.env via --build-arg. The defaults
-# below only apply when someone runs `docker build .` directly without
-# the script — they exist to suppress BuildKit's InvalidDefaultArgInFrom
-# warning, not as canonical values. The Renovate hint for UPSTREAM_TAG
-# lives in image.env (matched by a customManagers regex in
-# renovate.json), keeping all image-specific values in one place.
+# ── Global ARGs ──────────────────────────────────────────────────────
+# build.sh passes these from image.env via --build-arg. ORIGINAL_USER
+# is auto-detected from the upstream image at build time via
+# `crane config` and passed as a build-arg. CERT_BUILDER_IMAGE is the
+# image used to PREPARE certs (defaults to alpine — overridable for
+# air-gap, where you'd point it at your Artifactory mirror).
+# Defaults below only apply when someone runs `docker build .`
+# directly without the script.
 ARG UPSTREAM_REGISTRY=docker.io/library
 ARG UPSTREAM_IMAGE=nginx
 ARG UPSTREAM_TAG=1.29.8-alpine
-ARG INJECT_CERTS=false
 ARG ORIGINAL_USER=root
+ARG CERT_BUILDER_IMAGE=docker.io/library/alpine:3.20
 
 # ── Upstream base ────────────────────────────────────────────────────
 FROM ${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG} AS base
 
 # ── Label policy: preserve upstream, append ours ─────────────────────
-#
 # We intentionally do NOT set static LABEL lines here. Docker's label
-# inheritance model is "later LABELs override earlier ones by key" —
-# so any LABEL we wrote would silently clobber whatever the upstream
-# image already carried (maintainer strings, upstream title,
-# maintainer-authored annotations, license declarations, etc).
-#
-# Instead, all labels are added via `docker build --label ...`
-# in scripts/build.sh, which ALSO follows override semantics but is
-# a much shorter list of explicitly-chosen keys:
-#
-#   - ours: vendor, authors (team identity — we intentionally override)
-#   - dynamic: version, revision, created, base.name, base.digest,
-#              source, url (never collide with upstream in practice)
-#
-# Upstream labels for title, description, licenses, documentation,
-# maintainer, and any image-specific ones flow through untouched.
-# Forkers can add their own LABEL lines here if they want to override
-# a specific upstream value — but the default is to preserve.
+# inheritance is "later LABELs override earlier by key" — anything we
+# wrote would silently clobber upstream's maintainer / title / license
+# annotations. Dynamic labels come from build.sh's `--label` flags.
 
-# ── Cert injection (optional) ────────────────────────────────────────
-# When INJECT_CERTS=true, copy everything from certs/ into the system
-# trust store. The logic below auto-detects the right drop-in path at
-# build time (no DISTRO arg needed), so the same Dockerfile works
-# across alpine / debian / ubuntu / ubi / distroless:
+# ── Cert sidecar (uses shell-bearing alpine builder) ─────────────────
+# Runs in a SEPARATE image so cert prep works regardless of whether
+# the upstream base has a shell. This is the fix for shell-less
+# bases (chainguard FIPS, distroless static, scratch) where running
+# RUN inside the upstream image would fail with "exec /bin/sh: no
+# such file".
 #
-#   1. /usr/local/share/ca-certificates/  — alpine / debian / ubuntu;
-#      followed by `update-ca-certificates` to rebuild the merged bundle.
-#   2. /etc/pki/ca-trust/source/anchors/  — UBI / RHEL / Fedora;
-#      followed by `update-ca-trust` to rebuild.
-#   3. Direct cat-append to /etc/ssl/certs/ca-certificates.crt and
-#      /etc/ssl/cert.pem — fallback for distroless / scratch / busybox
-#      images that lack both rebuild tools.
+# The builder produces an updated trust store containing alpine's
+# system roots + the corp CAs from certs/. The final stage COPYs
+# those files over the upstream's filesystem.
 #
-# Earlier versions of this stage append-then-rebuilt, which wiped our
-# certs because update-ca-certificates rebuilds the bundle from
-# /usr/local/share/ca-certificates/ — anything appended directly was
-# lost. Putting the cert in the rebuild source first guarantees it
-# survives.
-FROM base AS certs-false
-
-FROM base AS certs-true
+# Trade-off: this REPLACES the upstream's /etc/ssl/certs/ca-certificates.crt
+# and /etc/ssl/cert.pem with alpine's bundle (plus our corp CA).
+# For most images this is fine — alpine's bundle is a superset of the
+# Mozilla CA list. For images that ship a heavily-customised FIPS
+# trust policy and don't want alpine's full set, fork this Dockerfile.
+#
+# When certs/ is empty (most images that don't call out — postgres,
+# redis, etc.), the builder still runs but the trust store is just
+# alpine's defaults. The final-stage COPY brings that bundle over.
+# If your image doesn't need our corp CA, you can leave certs/ empty
+# and accept the bundle replacement — usually invisible since alpine's
+# bundle covers everything most apps need.
+FROM ${CERT_BUILDER_IMAGE} AS certs-source
 USER root
+
+# Ensure ca-certificates is installed in the builder regardless of
+# the underlying distro. apk first (alpine default), fall back to
+# dnf / apt-get for non-alpine builders. Best-effort — if none of
+# these work the next RUN will surface the failure clearly.
+RUN apk add --no-cache ca-certificates 2>/dev/null \
+    || (command -v dnf      >/dev/null && dnf install -y ca-certificates) \
+    || (command -v apt-get  >/dev/null && apt-get update -qq && apt-get install -y ca-certificates) \
+    || (command -v microdnf >/dev/null && microdnf install -y ca-certificates && microdnf clean all) \
+    || (echo "WARN: builder has no ca-certificates package — using whatever is bundled" >&2; true)
+
 COPY certs/ /tmp/certs/
 RUN set -eux; \
     if [ -d /usr/local/share/ca-certificates ]; then \
@@ -92,58 +78,71 @@ RUN set -eux; \
       DROP_DIR=/etc/pki/ca-trust/source/anchors; \
       REBUILD=update-ca-trust; \
     else \
-      DROP_DIR=""; \
+      DROP_DIR=/usr/local/share/ca-certificates; \
+      mkdir -p "${DROP_DIR}"; \
       REBUILD=""; \
     fi; \
     found=0; \
     for f in /tmp/certs/*.crt /tmp/certs/*.pem; do \
       [ -f "$f" ] || continue; \
-      base="$(basename "$f")"; \
-      case "${base}" in \
-        *.crt|*.pem) base="${base%.*}" ;; \
-      esac; \
-      # Append to the bundle directly — this is what most TLS apps actually
-      # read (OPENSSL_DEFAULT_CA_FILE = /etc/ssl/cert.pem on alpine, which
-      # symlinks to /etc/ssl/certs/ca-certificates.crt). Alpine's
-      # update-ca-certificates only manages the per-cert symlinks under
-      # /etc/ssl/certs/*.pem and does NOT regenerate the bundle file from
-      # the package, so direct append is the only reliable way to inject
-      # there. On Debian/Ubuntu/UBI, update-ca-certificates regenerates
-      # the bundle from anchors below, which re-includes our cert via the
-      # drop-in step that follows — the append is redundant but harmless.
+      name="$(basename "$f")"; \
+      case "${name}" in *.crt|*.pem) name="${name%.*}" ;; esac; \
+      # Append to the bundle directly — what most TLS apps actually
+      # read at runtime (alpine's /etc/ssl/cert.pem symlinks to
+      # ca-certificates.crt). Alpine's update-ca-certificates only
+      # manages per-cert symlinks under /etc/ssl/certs/*.pem and
+      # does NOT regenerate the bundle from anchors, so direct
+      # append is the only reliable injection here.
       cat "$f" >> /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true; \
       cat "$f" >> /etc/ssl/cert.pem 2>/dev/null || true; \
-      # Drop into the distro-aware anchors dir so update-ca-certificates /
-      # update-ca-trust create the per-cert symlinks (alpine) or rebuild
-      # the bundle including our cert (debian/ubuntu/ubi). For distroless
-      # / scratch images both DROP_DIR and REBUILD stay empty and only
-      # the bundle append above runs — still works.
-      [ -n "${DROP_DIR}" ] && cp "$f" "${DROP_DIR}/${base}.crt"; \
+      cp "$f" "${DROP_DIR}/${name}.crt"; \
       found=$((found + 1)); \
     done; \
-    echo "Injected ${found} CA cert(s) (drop_dir=${DROP_DIR:-fallback-append-only})"; \
+    echo "Injected ${found} CA cert(s) (drop_dir=${DROP_DIR})"; \
     rm -rf /tmp/certs; \
     if [ -n "${REBUILD}" ] && command -v "${REBUILD}" >/dev/null 2>&1; then \
       "${REBUILD}" 2>/dev/null || true; \
-    fi
+    fi; \
+    # Ensure both drop-in dirs EXIST in the builder image so final's
+    # COPY --from below never fails on a missing source path.
+    mkdir -p /usr/local/share/ca-certificates /etc/pki/ca-trust/source/anchors
 
-ARG INJECT_CERTS
-FROM certs-${INJECT_CERTS} AS final
+# ── Final image ──────────────────────────────────────────────────────
+# Re-bases FROM base — USER stays whatever upstream had. COPY --from
+# pulls the prepared trust files out of the alpine builder. No RUN
+# directives below the cert COPYs (until the editable region), so
+# this works for shell-less bases.
+#
+# IMPORTANT for shell-less bases (chainguard FIPS, distroless, scratch):
+# leave the editable region BELOW empty. RUN commands need a shell;
+# those bases don't have one. The cert COPYs above are pure file
+# operations and work regardless.
+FROM base AS final
+COPY --from=certs-source /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=certs-source /etc/ssl/cert.pem                  /etc/ssl/cert.pem
+COPY --from=certs-source /usr/local/share/ca-certificates   /usr/local/share/ca-certificates
+COPY --from=certs-source /etc/pki/ca-trust/source/anchors   /etc/pki/ca-trust/source/anchors
 
 # ═══════════════════════════════════════════════════════════════════
 # ▼▼▼  FORK EDITS GO HERE  ▼▼▼
 # ═══════════════════════════════════════════════════════════════════
 #
-# This region is the ONLY place forks should add bespoke RUN / COPY /
-# ENV / HEALTHCHECK lines. Everything above is template-owned and
-# updates cleanly when you pull from upstream; everything here is
-# yours. We're already running as root (left over from the certs
-# stage), so apk/apt commands work without an explicit USER root.
+# Bespoke per-image work goes here: package upgrades, extra installs,
+# config drops, healthchecks, ENV.
 #
-# Common patterns:
+# IMPORTANT: RUN commands need a shell in the upstream base. For
+# shell-less bases (chainguard FIPS, distroless static, scratch),
+# leave this region EMPTY — those images ship their own runtime and
+# can't apk/apt anything anyway.
 #
-#   # CVE remediation — package upgrades. Pick the line that matches
-#   # your upstream's distro (alpine / debian / ubi); delete the rest.
+# When you DO add a RUN, prepend `USER root` so apk/apt have write
+# permission, and let the `USER ${ORIGINAL_USER}` directive at the
+# bottom restore the upstream's user automatically.
+#
+# Common patterns (all OPTIONAL — uncomment what you need):
+#
+#   USER root
+#   # CVE remediation — pick the line that matches your upstream distro
 #   RUN apk update && apk upgrade --no-cache
 #   # RUN apt-get update && apt-get -y --only-upgrade upgrade && rm -rf /var/lib/apt/lists/*
 #   # RUN microdnf -y update && microdnf clean all
@@ -165,8 +164,10 @@ FROM certs-${INJECT_CERTS} AS final
 # ▲▲▲  END FORK EDITS  ▲▲▲
 # ═══════════════════════════════════════════════════════════════════
 
-# Restore whatever USER the upstream image ran as. Required for images
-# whose entrypoint expects a specific UID (e.g. nginx's entrypoint
-# chowns paths only if run as root, then drops privs itself).
+# Restore the upstream image's USER. build.sh auto-detects this via
+# `crane config "${UPSTREAM_REF}" | jq -r .config.User` and passes it
+# as --build-arg, so the user almost never sets ORIGINAL_USER manually.
+# Defaults to "root" only as the safety net for direct `docker build`
+# runs without the script.
 ARG ORIGINAL_USER
 USER ${ORIGINAL_USER}

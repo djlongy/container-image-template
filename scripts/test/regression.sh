@@ -14,7 +14,7 @@
 #
 # Run with:
 #   bash scripts/test/regression.sh                  # all scenarios
-#   bash scripts/test/regression.sh inject-certs     # filter by name substring
+#   bash scripts/test/regression.sh registry-kind    # filter by name substring
 #
 # Exit 0 if every scenario passes, non-zero with summary otherwise.
 
@@ -104,65 +104,78 @@ end_scenario
 scenario "default-no-overrides"
 _run env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --dry-run >/dev/null
 _must_contain "→ Sourcing image.env"
-_must_contain "Inject certs:       false"
+_must_contain "Vendor:             example.com"
 _must_not_contain "ERROR"
 end_scenario
 
 scenario "build-debug-flag-on"
 _run env -i HOME="$HOME" PATH="$PATH" BUILD_DEBUG=true ./scripts/build.sh --dry-run >/dev/null
 _must_contain "[debug]"
-# A reliable [debug] line that's always present regardless of image.env contents:
-# the resolved-config summary fires after defaults+normalisation.
-_must_contain "[debug] resolved: INJECT_CERTS="
-end_scenario
-
-scenario "shell-empty-inject-certs-vs-file-true"
-# Sets INJECT_CERTS='' in shell + INJECT_CERTS=true in image.env.
-# This was the empty-string snapshot bug; file value should win.
-sed -i.bak -E 's|^INJECT_CERTS=.*|INJECT_CERTS="true"|' image.env && rm image.env.bak
-_run env -i HOME="$HOME" PATH="$PATH" INJECT_CERTS='' ./scripts/build.sh --dry-run >/dev/null
-_must_contain "Inject certs:       true"
-_must_not_contain "Inject certs:       false"
-end_scenario
-
-scenario "shell-set-inject-certs-overrides-file"
-# Explicit non-empty INJECT_CERTS in shell beats image.env (correct precedence).
-sed -i.bak -E 's|^INJECT_CERTS=.*|INJECT_CERTS="true"|' image.env && rm image.env.bak
-_run env -i HOME="$HOME" PATH="$PATH" INJECT_CERTS=false ./scripts/build.sh --dry-run >/dev/null
-_must_contain "Inject certs:       false"
+# Reliable [debug] line that's always present regardless of image.env:
+# applied-default messages fire during defaults-and-normalise phase.
+_must_contain "[debug] default applied:"
 end_scenario
 
 # ════════════════════════════════════════════════════════════════════
-# INJECT_CERTS flag behaviour
+# Cert sidecar behaviour
 # ════════════════════════════════════════════════════════════════════
+# INJECT_CERTS toggle was removed — the cert sidecar stage in the
+# Dockerfile always runs, but is a no-op when certs/ is empty (the
+# trust-store rebuild produces unchanged files; final's COPY --from
+# pulls them back unchanged). USER root from the sidecar never
+# escapes because final re-bases FROM base.
 
-scenario "inject-certs-true-no-cert-files"
-# INJECT_CERTS=true with empty certs/ dir — Dockerfile certs-true stage
-# would COPY but find nothing; build.sh just reports the flag's value.
-sed -i.bak -E 's|^INJECT_CERTS=.*|INJECT_CERTS="true"|' image.env && rm image.env.bak
-_run env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --dry-run >/dev/null
-_must_contain "Inject certs:       true"
-end_scenario
-
-scenario "inject-certs-true-with-cert-file"
-sed -i.bak -E 's|^INJECT_CERTS=.*|INJECT_CERTS="true"|' image.env && rm image.env.bak
-echo "-----BEGIN CERTIFICATE-----" > certs/_test.crt
-echo "MIICert..." >> certs/_test.crt
-echo "-----END CERTIFICATE-----" >> certs/_test.crt
-_run env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --dry-run >/dev/null
-rm -f certs/_test.crt
-_must_contain "Inject certs:       true"
-end_scenario
-
-scenario "ca-cert-env-auto-flips-inject-certs"
-# Setting CA_CERT in env should write certs/ci-injected.crt AND
-# auto-flip INJECT_CERTS to true even if image.env says false.
-sed -i.bak -E 's|^INJECT_CERTS=.*|INJECT_CERTS="false"|' image.env && rm image.env.bak
+scenario "ca-cert-env-materialises-to-certs-dir"
+# Setting CA_CERT in env writes certs/ci-injected.crt so the sidecar
+# stage picks it up. No INJECT_CERTS toggle needed anymore.
 CA_PEM="$(printf -- '-----BEGIN CERTIFICATE-----\nMIITest\n-----END CERTIFICATE-----\n')"
 _run env -i HOME="$HOME" PATH="$PATH" CA_CERT="${CA_PEM}" ./scripts/build.sh --dry-run >/dev/null
+[ -f certs/ci-injected.crt ] || FAILURES+=("${CURRENT_NAME}: certs/ci-injected.crt was NOT written")
 rm -f certs/ci-injected.crt
 _must_contain "→ Wrote CA_CERT to certs/ci-injected.crt"
-_must_contain "Inject certs:       true"
+end_scenario
+
+scenario "no-ca-cert-empty-certs-dir-is-fine"
+# When neither CA_CERT nor pre-existing certs/*.crt exist, build.sh
+# logs a debug note and continues — the sidecar's RUN does nothing
+# meaningful and final's COPY --from is a no-op.
+_run env -i HOME="$HOME" PATH="$PATH" BUILD_DEBUG=true ./scripts/build.sh --dry-run >/dev/null
+_must_contain "no CA_CERT in env — using certs/ on disk as-is (empty dir = sidecar no-op)"
+end_scenario
+
+scenario "config-report-no-longer-shows-inject-certs-line"
+# After the sidecar redesign, "Inject certs:" + "Original user:" are
+# gone from the config report (no toggle, USER auto-detected later).
+_run env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --dry-run >/dev/null
+_must_not_contain "Inject certs:"
+_must_contain "Upstream USER:"  # replaced with the auto-detect status line
+end_scenario
+
+# ════════════════════════════════════════════════════════════════════
+# ORIGINAL_USER auto-detection
+# ════════════════════════════════════════════════════════════════════
+
+scenario "original-user-auto-detect-from-upstream"
+# build.sh runs `crane config <upstream>` to discover the upstream's
+# USER. nginx upstream has no USER set → defaults to "root".
+out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --dry-run 2>&1) ; rc=$?
+echo "${out}" > "${TMP_DIR}/out"
+[ "${rc}" -eq 0 ] || FAILURES+=("${CURRENT_NAME}: dry-run should succeed, got ${rc}")
+# Either auto-detected (good) or fell back (also valid).
+if grep -q "ORIGINAL_USER auto-detected: " "${TMP_DIR}/out" \
+   || grep -q "ORIGINAL_USER defaults to root" "${TMP_DIR}/out" \
+   || grep -q "upstream has no USER set → ORIGINAL_USER defaults to root" "${TMP_DIR}/out"; then
+  :
+else
+  FAILURES+=("${CURRENT_NAME}: expected an ORIGINAL_USER auto-detect line in output")
+fi
+end_scenario
+
+scenario "original-user-explicit-override-wins-over-autodetect"
+# Setting ORIGINAL_USER in shell env should bypass the crane probe.
+_run env -i HOME="$HOME" PATH="$PATH" ORIGINAL_USER=postgres ./scripts/build.sh --dry-run >/dev/null
+_must_contain "ORIGINAL_USER explicitly set: postgres (skipping auto-detect)"
+_must_not_contain "ORIGINAL_USER auto-detected"
 end_scenario
 
 # ════════════════════════════════════════════════════════════════════
@@ -619,20 +632,23 @@ end_scenario
 # ════════════════════════════════════════════════════════════════════
 
 scenario "bamboo-auto-import"
+# Set a bamboo_VENDOR in env; build.sh's import_bamboo_vars should
+# auto-import it as VENDOR (and the config-report block prints it).
 _run env -i HOME="$HOME" PATH="$PATH" \
-  bamboo_INJECT_CERTS=true \
+  bamboo_VENDOR="bamboo-detected" \
   ./scripts/build.sh --dry-run >/dev/null
 _must_contain "Auto-imported"
-_must_contain "Inject certs:       true"
+_must_contain "Vendor:             bamboo-detected"
 end_scenario
 
 scenario "bamboo-auto-import-shell-wins"
-# Explicit shell export should beat bamboo_* import
+# Explicit shell export of the bare name should beat the bamboo_* import.
 _run env -i HOME="$HOME" PATH="$PATH" \
-  bamboo_INJECT_CERTS=true \
-  INJECT_CERTS=false \
+  bamboo_VENDOR="bamboo-loses" \
+  VENDOR="shell-wins" \
   ./scripts/build.sh --dry-run >/dev/null
-_must_contain "Inject certs:       false"
+_must_contain "Vendor:             shell-wins"
+_must_not_contain "Vendor:             bamboo-loses"
 end_scenario
 
 # ════════════════════════════════════════════════════════════════════

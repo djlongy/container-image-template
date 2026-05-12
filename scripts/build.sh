@@ -19,16 +19,19 @@
 #   UPSTREAM_IMAGE      default: nginx
 #   UPSTREAM_TAG        default: read from Dockerfile's `ARG UPSTREAM_TAG=...`
 #   IMAGE_NAME          default: value of UPSTREAM_IMAGE
-#   INJECT_CERTS        default: false  — set true to run the certs-true stage
-#   ORIGINAL_USER       default: root
+#   ORIGINAL_USER       auto-detected from upstream via `crane config` —
+#                       only set this manually to override what the upstream
+#                       image's USER is. The Dockerfile restores it after
+#                       the editable region. Defaults to "root" when
+#                       crane isn't on PATH or upstream has no USER set.
 #   VENDOR              default: example.com
 #   CA_CERT             PEM content of a CA cert to inject (writes to certs/
-#                       before build, picked up by the COPY in Dockerfile).
-#                       Typical CI source: curl from an Artifactory generic
-#                       repo into a CI variable.
+#                       before build, picked up by the cert sidecar in the
+#                       Dockerfile). Typical CI source: curl from an
+#                       Artifactory generic repo into a CI variable.
 #                       Package upgrades / extra installs / file drops are
 #                       NOT a build.sh concern — add those directly to the
-#                       Dockerfile in the marked fork-edit region.
+#                       Dockerfile in the marked editable region.
 #   CRANE_URL           default: auto-detected for host OS/arch —
 #                       override to point at an internal mirror for
 #                       air-gapped runners.
@@ -107,7 +110,8 @@ full list. Commonly-used flags:
 
   REGISTRY_KIND=artifactory   use scripts/push-backends/artifactory.sh
                               (default "harbor" → push-backends/harbor.sh)
-  INJECT_CERTS=true           bake certs/*.crt into the trust store
+  CA_CERT='<pem>'             inject a corp CA — sidecar materialises it
+                              into certs/ and the Dockerfile picks it up
   ARTIFACTORY_PRO=true        enable Pro-tier push path
   ARTIFACTORY_BUILD_XRAY_PRESCAN=true
                               jf docker scan inside the build job
@@ -170,10 +174,8 @@ _build_parse_args() {
 # by all scripts that read image.env (xray-vuln.sh, xray-sbom.sh,
 # sbom-post.sh, etc.). See that file for the snapshot/restore details.
 
-# Validate required fields + apply defaults + lowercase-normalise
-# booleans so TRUE/True/true all work. Fails fast on missing required.
-# INJECT_CERTS MUST be lowercase for the Dockerfile FROM selector
-# (certs-${INJECT_CERTS}) to match its stage.
+# Validate required fields + apply defaults. Fails fast on missing
+# required fields.
 _build_apply_defaults_and_normalise() {
   : "${UPSTREAM_REGISTRY:?UPSTREAM_REGISTRY must be set in image.env}"
   : "${UPSTREAM_IMAGE:?UPSTREAM_IMAGE must be set in image.env}"
@@ -185,19 +187,14 @@ _build_apply_defaults_and_normalise() {
   # Anything bespoke (package upgrades, extra installs, file drops)
   # goes directly in the Dockerfile's fork-edit region — never sneaks
   # into the upstream template path via env-var toggles.
-  [ -z "${IMAGE_NAME:-}"     ] && _dbg "default applied: IMAGE_NAME=${UPSTREAM_IMAGE} (was unset)"
-  [ -z "${INJECT_CERTS:-}"   ] && _dbg "default applied: INJECT_CERTS=false (was unset/empty)"
-  [ -z "${ORIGINAL_USER:-}"  ] && _dbg "default applied: ORIGINAL_USER=root (was unset)"
-  [ -z "${VENDOR:-}"         ] && _dbg "default applied: VENDOR=example.com (was unset)"
+  [ -z "${IMAGE_NAME:-}" ] && _dbg "default applied: IMAGE_NAME=${UPSTREAM_IMAGE} (was unset)"
+  [ -z "${VENDOR:-}"     ] && _dbg "default applied: VENDOR=example.com (was unset)"
 
   IMAGE_NAME="${IMAGE_NAME:-${UPSTREAM_IMAGE}}"
-  INJECT_CERTS="${INJECT_CERTS:-false}"
-  ORIGINAL_USER="${ORIGINAL_USER:-root}"
   VENDOR="${VENDOR:-example.com}"
-
-  INJECT_CERTS="$(printf '%s' "${INJECT_CERTS}" | tr '[:upper:]' '[:lower:]')"
-
-  _dbg "resolved: INJECT_CERTS=${INJECT_CERTS}"
+  # ORIGINAL_USER is auto-detected from upstream in PHASE 6.5 — only
+  # apply the safety-net default if both auto-detection AND user
+  # override fail downstream.
 }
 
 # ════════════════════════════════════════════════════════════════════
@@ -248,12 +245,16 @@ _build_resolve_source_url() {
 # ════════════════════════════════════════════════════════════════════
 # PHASE 3 — Cert materialisation
 # ════════════════════════════════════════════════════════════════════
-# If CA_CERT is set (CI secret), write it to certs/ so the certs-true
-# Dockerfile stage can COPY it, and flip INJECT_CERTS to "true" so the
-# correct stage is selected. Overwrites are intentional — CI runs
-# should be reproducible. Typical CI source: curl from an Artifactory
-# generic repo into the CA_CERT variable (or set the variable's value
-# to the PEM directly).
+# If CA_CERT is set (CI secret), write it to certs/ so the cert
+# sidecar stage in the Dockerfile picks it up. Overwrites are
+# intentional — CI runs should be reproducible. Typical CI source:
+# curl from an Artifactory generic repo into the CA_CERT variable
+# (or set the variable's value to the PEM directly).
+#
+# When certs/ stays empty, the sidecar stage runs but is effectively
+# a no-op (rebuild produces the same trust store) — no env toggle
+# needed. The Dockerfile's FROM final re-bases FROM base so the
+# sidecar's USER root never propagates into the final image.
 
 _build_materialise_certs() {
   mkdir -p certs
@@ -262,12 +263,10 @@ _build_materialise_certs() {
   if [ -n "${CA_CERT:-}" ]; then
     echo "${CA_CERT}" > certs/ci-injected.crt
     echo "→ Wrote CA_CERT to certs/ci-injected.crt ($(wc -c < certs/ci-injected.crt) bytes)"
-    _dbg "CA_CERT was set in env → flipping INJECT_CERTS to true"
-    INJECT_CERTS=true
     return 0
   fi
 
-  _dbg "no CA_CERT in env — using certs/ on disk as-is (empty dir = no injection)"
+  _dbg "no CA_CERT in env — using certs/ on disk as-is (empty dir = sidecar no-op)"
 }
 
 # ════════════════════════════════════════════════════════════════════
@@ -311,10 +310,9 @@ _build_print_config_report() {
   echo "  Image:              ${FULL_IMAGE}"
   echo "  Upstream:           ${UPSTREAM_REF}"
   echo "  Upstream digest:    <resolving...>"
+  echo "  Upstream USER:      <auto-detecting...>"
   echo "  Git commit:         ${GIT_SHORT} (${GIT_SHA})"
   echo "  Created (UTC):      ${CREATED}"
-  echo "  Inject certs:       ${INJECT_CERTS}"
-  echo "  Original user:      ${ORIGINAL_USER}"
   echo "  Vendor:             ${VENDOR}"
   echo "  Source URL:         ${SOURCE_URL:-<none>}"
   echo "=========================================="
@@ -418,6 +416,68 @@ _build_resolve_base_digest() {
 }
 
 # ════════════════════════════════════════════════════════════════════
+# PHASE 6.5 — Upstream USER auto-detection
+# ════════════════════════════════════════════════════════════════════
+# The Dockerfile's final stage flips to USER root for the editable
+# region (so apk/apt work without auth dance), then restores the
+# upstream USER at the end via `USER ${ORIGINAL_USER}`. Without auto-
+# detection, a fork would have to manually look up the upstream's
+# USER and set ORIGINAL_USER in image.env — easy to forget, ends up
+# silently with a root-running image.
+#
+# Auto-detect from `crane config <upstream>` (the same crane we
+# already installed in PHASE 6 for base.digest). Resolution chain:
+#   1. ORIGINAL_USER explicitly set in image.env / shell env  → wins
+#   2. crane config .config.User                              → use it
+#   3. fallback                                               → "root"
+#
+# Distroless / scratch / busybox images often have no USER set in
+# their config — they default to root, so the fallback is correct.
+
+_build_resolve_upstream_user() {
+  if [ -n "${ORIGINAL_USER:-}" ]; then
+    echo "→ ORIGINAL_USER explicitly set: ${ORIGINAL_USER} (skipping auto-detect)"
+    export ORIGINAL_USER
+    return 0
+  fi
+  if ! command -v crane >/dev/null 2>&1; then
+    ORIGINAL_USER="root"
+    echo "  NOTE: crane not on PATH → ORIGINAL_USER defaults to root" >&2
+    export ORIGINAL_USER
+    return 0
+  fi
+
+  echo "→ Detecting upstream USER: crane config ${UPSTREAM_REF}"
+  local _config _user
+  _config=$(crane config "${UPSTREAM_REF}" 2>/dev/null) || _config=""
+  if [ -z "${_config}" ]; then
+    ORIGINAL_USER="root"
+    echo "  WARN: crane config failed → ORIGINAL_USER defaults to root" >&2
+    export ORIGINAL_USER
+    return 0
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    _user=$(printf '%s' "${_config}" | jq -r '.config.User // ""' 2>/dev/null)
+  else
+    # Fallback parser: grep .config.User from the JSON. Brittle but
+    # works for the common single-line / pretty-printed case.
+    _user=$(printf '%s' "${_config}" | grep -oE '"User"[[:space:]]*:[[:space:]]*"[^"]*"' \
+                                     | head -1 \
+                                     | sed -E 's/.*"User"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')
+  fi
+
+  if [ -n "${_user}" ]; then
+    ORIGINAL_USER="${_user}"
+    echo "  ✓ ORIGINAL_USER auto-detected: ${ORIGINAL_USER}"
+  else
+    ORIGINAL_USER="root"
+    echo "  ✓ upstream has no USER set → ORIGINAL_USER defaults to root"
+  fi
+  export ORIGINAL_USER
+}
+
+# ════════════════════════════════════════════════════════════════════
 # PHASE 7 — docker build
 # ════════════════════════════════════════════════════════════════════
 # Dynamic OCI labels passed via --label. Label policy: preserve
@@ -430,9 +490,14 @@ _build_docker_build() {
     --build-arg "UPSTREAM_REGISTRY=${UPSTREAM_REGISTRY}"
     --build-arg "UPSTREAM_IMAGE=${UPSTREAM_IMAGE}"
     --build-arg "UPSTREAM_TAG=${UPSTREAM_TAG}"
-    --build-arg "INJECT_CERTS=${INJECT_CERTS}"
     --build-arg "ORIGINAL_USER=${ORIGINAL_USER}"
   )
+  # CERT_BUILDER_IMAGE — only pass when set (Dockerfile has a default).
+  # Override via image.env / shell env for air-gap to point at your
+  # internal Artifactory / Nexus mirror.
+  if [ -n "${CERT_BUILDER_IMAGE:-}" ]; then
+    build_args+=(--build-arg "CERT_BUILDER_IMAGE=${CERT_BUILDER_IMAGE}")
+  fi
   local label_args=(
     --label "org.opencontainers.image.vendor=${VENDOR}"
     --label "org.opencontainers.image.authors=${AUTHORS:-Platform Engineering}"
@@ -551,8 +616,9 @@ _build_resolve_push_target
 
 _build_print_config_report
 _build_resolve_base_digest
+_build_resolve_upstream_user
 
-# --dry-run stops here: config resolved, digest fetched, no image built.
+# --dry-run stops here: config resolved, digest fetched, USER probed.
 if [ "${WANT_DRY_RUN}" -eq 1 ]; then
   echo "→ --dry-run: stopping before docker build"
   exit 0

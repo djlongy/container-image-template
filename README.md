@@ -39,7 +39,7 @@ $EDITOR image.env
 #   UPSTREAM_TAG       1.25.3-alpine  (Renovate auto-bumps)
 #   REGISTRY_KIND      harbor (default) | artifactory
 #   HARBOR_*  OR  ARTIFACTORY_*  per the chosen backend
-#   INJECT_CERTS       true / false (default false)
+#   (cert injection is automatic — drop *.crt in certs/ or set CA_CERT)
 
 # 3. (Optional) bespoke work in Dockerfile's marked editable region
 #    Drop in RUN apk upgrade, extra packages, COPY config, HEALTHCHECK
@@ -269,15 +269,15 @@ or `lib/*`:
 
 ```bash
 bash scripts/test/regression.sh                  # full suite
-bash scripts/test/regression.sh inject-certs     # filter by name substring
+bash scripts/test/regression.sh registry-kind    # filter by name substring
 ```
 
-50+ scenarios covering: INJECT_CERTS variants + boolean normalisation,
-shell-vs-file precedence, CA_CERT auto-flip, APPEND_GIT_SHORT toggle,
-required-field validation, argv handling, REGISTRY_KIND backend
-dispatch, HARBOR_* / ARTIFACTORY_* independence, bamboo_* auto-import,
-canonical artifact names propagation, scan-target resolution chain,
-and the silent-fail regression.
+50+ scenarios covering: cert sidecar behaviour + CA_CERT
+materialisation, ORIGINAL_USER auto-detect via crane, APPEND_GIT_SHORT
+toggle, required-field validation, argv handling, REGISTRY_KIND
+backend dispatch, HARBOR_* / ARTIFACTORY_* independence, bamboo_*
+auto-import, canonical artifact names propagation, scan-target
+resolution chain, and the silent-fail regression.
 
 ## License
 
