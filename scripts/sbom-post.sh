@@ -77,9 +77,15 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Resolve SBOM_FILE to an absolute path BEFORE we cd anywhere so a
-# relative arg keeps working from the caller's cwd.
-SBOM_FILE="${1:-sbom.cdx.json}"
+# shellcheck source=lib/artifact-names.sh
+. "${REPO_ROOT}/scripts/lib/artifact-names.sh"
+
+# SBOM_FILE resolution (highest precedence first):
+#   1. positional arg $1 (explicit caller override)
+#   2. SBOM_FILE env (from build.env or scripts/lib/artifact-names.sh)
+# Resolve to an absolute path BEFORE we cd anywhere so a relative arg
+# keeps working from the caller's cwd.
+SBOM_FILE="${1:-${SBOM_FILE}}"
 case "${SBOM_FILE}" in
   /*) ;;
   *)  SBOM_FILE="$(pwd)/${SBOM_FILE}" ;;
@@ -277,7 +283,58 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════════════
-# SINK 4: Splunk HEC (audit ingestion)
+# SINK 4: Artifactory generic archive (no Xray, just storage)
+# ════════════════════════════════════════════════════════════════════
+# Parallel to SINK 3 but targets a plain generic Artifactory repo (no
+# Xray indexing assumed). Same path shape — predictable, human-browsable:
+#   <repo>/<image-name>/<version>/sbom.cdx.json
+# e.g. newen-generic-dev-local/nginx/1.29.8-alpine-5d3ea65/sbom.cdx.json
+#
+# Useful when you want a long-term archive of every SBOM you've ever
+# shipped (cross-team browsability, audit trail) AND a separate
+# Xray-indexed repo (SINK 3) for active scanning. Both can run in the
+# same pipeline — independent ARTIFACTORY_SBOM_REPO / ARTIFACTORY_SBOM_ARCHIVE_REPO.
+if [ -z "${ARTIFACTORY_URL:-}" ] || [ -z "${ARTIFACTORY_USER:-}" ] || [ -z "${ARTIFACTORY_SBOM_ARCHIVE_REPO:-}" ]; then
+  echo "→ artifactory-archive  skip (URL, USER, or SBOM_ARCHIVE_REPO empty)"
+elif [ -z "${ARTIFACTORY_TOKEN:-}${ARTIFACTORY_PASSWORD:-}" ]; then
+  echo "→ artifactory-archive  misconfigured (no TOKEN or PASSWORD)" >&2
+  failed=$((failed + 1))
+else
+  arc_image="${IMAGE_NAME:-image}"; arc_image="${arc_image##*/}"
+  arc_version="${IMAGE_TAG:-${UPSTREAM_TAG:-latest}}"
+  arc_sbom_path="${ARTIFACTORY_SBOM_ARCHIVE_REPO}/${arc_image}/${arc_version}/sbom.cdx.json"
+  arc_deploy_url="${ARTIFACTORY_URL%/}/artifactory/${arc_sbom_path}"
+  echo "→ artifactory-archive  PUT ${arc_sbom_path}"
+
+  rc=0
+  (
+    secret="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
+    sha1=$(compute_sha1   "${SBOM_FILE}")
+    sha256=$(compute_sha256 "${SBOM_FILE}")
+    curl -fsSL -X PUT \
+      -u "${ARTIFACTORY_USER}:${secret}" \
+      -H "Content-Type: application/vnd.cyclonedx+json" \
+      -H "X-Checksum-Sha1: ${sha1}" \
+      -H "X-Checksum-Sha256: ${sha256}" \
+      --data-binary "@${SBOM_FILE}" \
+      "${arc_deploy_url}" -o "${_TMP}/arc.out"
+    echo "  ✓ archived"
+    if command -v jq >/dev/null 2>&1 && [ -s "${_TMP}/arc.out" ]; then
+      uri=$(jq -r '.uri // empty' "${_TMP}/arc.out" 2>/dev/null || echo "")
+      [ -n "${uri}" ] && echo "    uri: ${uri}"
+    fi
+  ) || rc=$?
+  if [ "${rc}" -eq 0 ]; then
+    posted=$((posted + 1))
+  else
+    echo "  ✗ Artifactory archive upload failed" >&2
+    cat "${_TMP}/arc.out" >&2 2>/dev/null || true
+    failed=$((failed + 1))
+  fi
+fi
+
+# ════════════════════════════════════════════════════════════════════
+# SINK 5: Splunk HEC (audit ingestion)
 # ════════════════════════════════════════════════════════════════════
 # Vendor-agnostic: same sourcetype handles Syft-, Xray-, or Trivy-made
 # SBOMs. Build the event content (sbom_file + image + git_commit + the
@@ -324,6 +381,9 @@ if [ ${posted} -eq 0 ] && [ ${failed} -eq 0 ]; then
   echo "    - SBOM_WEBHOOK_URL (+ optional SBOM_WEBHOOK_AUTH_HEADER)"
   echo "    - DEPENDENCY_TRACK_URL + DEPENDENCY_TRACK_API_KEY + DEPENDENCY_TRACK_PROJECT"
   echo "    - ARTIFACTORY_URL + ARTIFACTORY_USER + ARTIFACTORY_TOKEN/PASSWORD + ARTIFACTORY_SBOM_REPO"
+  echo "        (Xray-indexed repo — Xray auto-scans on upload)"
+  echo "    - ARTIFACTORY_URL + ARTIFACTORY_USER + ARTIFACTORY_TOKEN/PASSWORD + ARTIFACTORY_SBOM_ARCHIVE_REPO"
+  echo "        (plain generic repo — long-term human-browsable archive)"
   echo "    - SPLUNK_HEC_URL + SPLUNK_HEC_TOKEN"
   echo "  SBOM was still generated and is available as a pipeline artifact."
   exit 0

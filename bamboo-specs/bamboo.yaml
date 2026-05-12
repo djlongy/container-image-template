@@ -104,16 +104,21 @@ stages:
       jobs:
         - Xray Vuln Prescan
         - Xray SBOM Prescan
+        - Syft SBOM Prescan
+        # - Trivy Vuln Prescan   # DORMANT — Trivy banned for business
+        # - Trivy SBOM Prescan   #   use. Uncomment BOTH entries here
+        #                        #   AND the job blocks further down.
   - Build:
       jobs:
         - Build
   - Postscan:
       jobs:
-        - SBOM
-        - Grype
-        - Xray Vuln Postscan
+        - Syft SBOM Postscan
         - Xray SBOM Postscan
-        # - Trivy   # Disabled: banned for business use.
+        - Xray Vuln Postscan
+        - Grype Vuln
+        # - Trivy Vuln Postscan   # DORMANT — same caveat as Prescan
+        # - Trivy SBOM Postscan   #   variants above.
   # - Sign:           # COMMENTED OUT — no cosign infra at work yet.
   #     jobs:        # Restore by uncommenting both this stage and the
   #       - Cosign Sign  # `Cosign Sign:` job block further down.
@@ -193,9 +198,9 @@ Build:
     - system.docker.executable
 
 # ═══════════════════════════════════════════════════════════════════
-# SCAN — SBOM (Syft → CycloneDX)
+# POSTSCAN — Syft SBOM of the BUILT image
 # ═══════════════════════════════════════════════════════════════════
-SBOM:
+Syft SBOM Postscan:
   tasks:
     - artifact-download:
         artifacts:
@@ -209,41 +214,54 @@ SBOM:
             . ./build.env
             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
 
+            # Relay creds the multi-registry login lib needs. Bamboo
+            # plan vars arrive as bamboo_*; the script auto-imports them
+            # via load-image-env.sh — these explicit shims cover the
+            # bamboo_svc_* (renamed) variants.
             export PUSH_REGISTRY_USER="${bamboo_svc_push_registry_user:-${bamboo_PUSH_REGISTRY_USER:-}}"
             export PUSH_REGISTRY_PASSWORD="${bamboo_svc_push_registry_password:-${bamboo_PUSH_REGISTRY_PASSWORD:-}}"
 
-            if ! command -v syft >/dev/null 2>&1; then
-              SYFT_INSTALLER_URL_EFFECTIVE="${bamboo_SYFT_INSTALLER_URL:-https://raw.githubusercontent.com/anchore/syft/main/install.sh}"
-              mkdir -p "${HOME}/.local/bin"
-              curl -sSfL "${SYFT_INSTALLER_URL_EFFECTIVE}" \
-                | sh -s -- -b "${HOME}/.local/bin" v1.14.0
-              export PATH="${HOME}/.local/bin:${PATH}"
-            fi
-
-            if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${bamboo_PUSH_REGISTRY:-}" ]; then
-              echo "${PUSH_REGISTRY_PASSWORD}" | docker login "${bamboo_PUSH_REGISTRY}" \
-                -u "${PUSH_REGISTRY_USER}" --password-stdin
-            fi
-
-            SCAN_TARGET="${IMAGE_DIGEST:-${IMAGE_REF}}"
-            echo "→ syft ${SCAN_TARGET}"
-            syft "${SCAN_TARGET}" \
-              -o cyclonedx-json=sbom.cdx.json \
-              -o spdx-json=sbom.spdx.json \
-              -o syft-json=sbom.syft.json
-            ls -la sbom.*.json
+            # Standalone Syft script. SBOM_FILE comes from build.env
+            # (canonical name from scripts/lib/artifact-names.sh) so
+            # the artifact pattern below picks up whatever name the
+            # producer wrote.
+            bash ./scripts/scan/syft-sbom.sh
   artifacts:
     - name: sbom
       location: .
-      pattern: 'sbom.*.json'
+      pattern: 'sbom.cdx.json'
       shared: true
   requirements:
     - system.docker.executable
 
 # ═══════════════════════════════════════════════════════════════════
-# SCAN — Grype (SBOM-first vulnerability scan)
+# PRESCAN — Syft SBOM of UPSTREAM_REF (before build runs)
 # ═══════════════════════════════════════════════════════════════════
-Grype:
+# Same script as the postscan variant, different target. Useful for
+# early visibility on the upstream's component graph.
+Syft SBOM Prescan:
+  tasks:
+    - script:
+        interpreter: BASH
+        scripts:
+          - |-
+            set -euo pipefail
+            . ./image.env
+            export SBOM_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+            bash ./scripts/scan/syft-sbom.sh
+  artifacts:
+    - name: sbom-prescan
+      location: .
+      pattern: 'sbom.cdx.json'
+      shared: true
+      required: false
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Grype vulnerability scan (consumes Syft SBOM)
+# ═══════════════════════════════════════════════════════════════════
+Grype Vuln:
   tasks:
     - artifact-download:
         artifacts:
@@ -259,30 +277,14 @@ Grype:
             . ./build.env
             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
 
-            if ! command -v grype >/dev/null 2>&1; then
-              GRYPE_INSTALLER_URL_EFFECTIVE="${bamboo_GRYPE_INSTALLER_URL:-https://raw.githubusercontent.com/anchore/grype/main/install.sh}"
-              mkdir -p "${HOME}/.local/bin"
-              curl -sSfL "${GRYPE_INSTALLER_URL_EFFECTIVE}" \
-                | sh -s -- -b "${HOME}/.local/bin" v0.82.0
-              export PATH="${HOME}/.local/bin:${PATH}"
-            fi
-
-            echo "→ grype sbom:sbom.cdx.json"
-            grype sbom:sbom.cdx.json --output json --file grype-report.json --fail-on "" || true
-            grype sbom:sbom.cdx.json --output table || true
-
-            if command -v jq >/dev/null 2>&1; then
-              echo ""
-              echo "→ Vulnerability summary:"
-              for sev in Critical High Medium Low Negligible Unknown; do
-                count=$(jq "[.matches[] | select(.vulnerability.severity==\"${sev}\")] | length" grype-report.json)
-                echo "    ${sev}: ${count}"
-              done
-            fi
+            # Standalone Grype script — install, DB-mirror redirect,
+            # scan against ${SBOM_FILE}, severity gate. Default output
+            # is ${VULN_SCAN_FILE} (canonical: vuln-scan.json).
+            bash ./scripts/scan/grype-vuln.sh
   artifacts:
-    - name: grype-report
+    - name: vuln-scan-grype
       location: .
-      pattern: grype-report.json
+      pattern: vuln-scan.json
       shared: true
   requirements:
     - system.docker.executable
@@ -292,9 +294,9 @@ Grype:
 # ═══════════════════════════════════════════════════════════════════
 # Two paired Xray jobs — both run in parallel under the Scan stage.
 # Each is single-responsibility:
-#   Xray Vuln  → jf docker scan --format=simple-json → xray-scan.json
+#   Xray Vuln  → jf docker scan --format=simple-json → vuln-scan.json
 #                + Splunk HEC POST (sourcetype=jfrog:xray:scan)
-#   Xray SBOM  → jf docker scan --format=cyclonedx --sbom → xray-sbom.cdx.json
+#   Xray SBOM  → jf docker scan --format=cyclonedx --sbom → sbom.cdx.json
 #                + sbom-post.sh (Splunk + DT + Artifactory + webhook)
 #
 # Both scripts source scripts/lib/load-image-env.sh which auto-imports
@@ -332,7 +334,7 @@ Xray Vuln Prescan:
   artifacts:
     - name: xray-scan-prescan
       location: .
-      pattern: xray-scan.json
+      pattern: vuln-scan.json
       shared: true
       required: false
   requirements:
@@ -357,7 +359,7 @@ Xray SBOM Prescan:
   artifacts:
     - name: xray-sbom-prescan
       location: .
-      pattern: xray-sbom.cdx.json
+      pattern: sbom.cdx.json
       shared: true
       required: false
   requirements:
@@ -391,7 +393,7 @@ Xray Vuln Postscan:
   artifacts:
     - name: xray-scan-postscan
       location: .
-      pattern: xray-scan.json
+      pattern: vuln-scan.json
       shared: true
       required: false
   requirements:
@@ -419,11 +421,102 @@ Xray SBOM Postscan:
   artifacts:
     - name: xray-sbom-postscan
       location: .
-      pattern: xray-sbom.cdx.json
+      pattern: sbom.cdx.json
       shared: true
       required: false
   requirements:
     - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# PRE/POSTSCAN — Trivy vuln + SBOM (DORMANT: banned for business use)
+# ═══════════════════════════════════════════════════════════════════
+# Re-enable by uncommenting any/all four blocks below AND the
+# corresponding entries in the Prescan / Postscan stage lists at the
+# top of the file. Scripts pin Trivy to v0.69.3 (the last safe
+# pre-compromise binary) and refuse v0.69.4–v0.69.6 — see the security
+# note at the top of scripts/scan/trivy-vuln.sh.
+#
+# Trivy Vuln Prescan:
+#   tasks:
+#     - script:
+#         interpreter: BASH
+#         scripts:
+#           - |-
+#             set -euo pipefail
+#             . ./image.env
+#             export TRIVY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+#             bash ./scripts/scan/trivy-vuln.sh
+#   artifacts:
+#     - name: vuln-scan-trivy-prescan
+#       location: .
+#       pattern: vuln-scan.json
+#       shared: true
+#       required: false
+#   requirements:
+#     - system.docker.executable
+#
+# Trivy SBOM Prescan:
+#   tasks:
+#     - script:
+#         interpreter: BASH
+#         scripts:
+#           - |-
+#             set -euo pipefail
+#             . ./image.env
+#             export TRIVY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+#             bash ./scripts/scan/trivy-sbom.sh
+#   artifacts:
+#     - name: sbom-trivy-prescan
+#       location: .
+#       pattern: sbom.cdx.json
+#       shared: true
+#       required: false
+#   requirements:
+#     - system.docker.executable
+#
+# Trivy Vuln Postscan:
+#   tasks:
+#     - artifact-download:
+#         artifacts:
+#           - name: build-env
+#             destination: .
+#     - script:
+#         interpreter: BASH
+#         scripts:
+#           - |-
+#             set -euo pipefail
+#             . ./build.env
+#             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+#             bash ./scripts/scan/trivy-vuln.sh
+#   artifacts:
+#     - name: vuln-scan-trivy-postscan
+#       location: .
+#       pattern: vuln-scan.json
+#       shared: true
+#   requirements:
+#     - system.docker.executable
+#
+# Trivy SBOM Postscan:
+#   tasks:
+#     - artifact-download:
+#         artifacts:
+#           - name: build-env
+#             destination: .
+#     - script:
+#         interpreter: BASH
+#         scripts:
+#           - |-
+#             set -euo pipefail
+#             . ./build.env
+#             [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+#             bash ./scripts/scan/trivy-sbom.sh
+#   artifacts:
+#     - name: sbom-trivy-postscan
+#       location: .
+#       pattern: sbom.cdx.json
+#       shared: true
+#   requirements:
+#     - system.docker.executable
 
 # ═══════════════════════════════════════════════════════════════════
 # SIGN — cosign sign + SBOM/Grype attestations  (DORMANT)
@@ -441,7 +534,7 @@ Xray SBOM Postscan:
 #             destination: .
 #           - name: sbom
 #             destination: .
-#           - name: grype-report
+#           - name: vuln-scan-grype
 #             destination: .
 #     - script:
 #         interpreter: BASH
@@ -480,13 +573,13 @@ Xray SBOM Postscan:
 #               -a "git.commit=${GIT_SHA}" \
 #               "${TARGET}"
 #
-#             if [ -f sbom.cdx.json ]; then
+#             if [ -f "${SBOM_FILE}" ]; then
 #               cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
-#                 --type cyclonedx --predicate sbom.cdx.json "${TARGET}"
+#                 --type cyclonedx --predicate "${SBOM_FILE}" "${TARGET}"
 #             fi
-#             if [ -f grype-report.json ]; then
+#             if [ -f "${VULN_SCAN_FILE}" ]; then
 #               cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
-#                 --type vuln --predicate grype-report.json "${TARGET}"
+#                 --type vuln --predicate "${VULN_SCAN_FILE}" "${TARGET}"
 #             fi
 #   requirements:
 #     - system.docker.executable
@@ -517,7 +610,7 @@ SBOM Ingest:
             export DEPENDENCY_TRACK_API_KEY="${bamboo_svc_dependency_track_api_key:-${bamboo_DEPENDENCY_TRACK_API_KEY:-}}"
             export SBOM_WEBHOOK_AUTH_HEADER="${bamboo_svc_sbom_webhook_auth_header:-${bamboo_SBOM_WEBHOOK_AUTH_HEADER:-}}"
 
-            bash ./scripts/sbom-post.sh sbom.cdx.json
+            bash ./scripts/sbom-post.sh "${SBOM_FILE}"
   requirements:
     - system.docker.executable
 

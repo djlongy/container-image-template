@@ -2,7 +2,7 @@
 # scripts/scan/xray-vuln.sh — JFrog Xray vulnerability scan
 #
 # Single responsibility: run `jf docker scan --format=simple-json`
-# against the upstream image and produce xray-scan.json. Optionally
+# against the upstream image and produce vuln-scan.json. Optionally
 # ships the JSON to Splunk HEC.
 #
 # Pairs with scripts/scan/xray-sbom.sh which produces the CycloneDX
@@ -44,7 +44,11 @@
 #
 # Optional env (scan side):
 #   XRAY_SCAN_REF                      override the resolved target
-#   XRAY_SCAN_FILE                     output path (default xray-scan.json)
+#   VULN_SCAN_FILE                     output path (default vuln-scan.json
+#                                      — the canonical name from
+#                                      scripts/lib/artifact-names.sh, so
+#                                      a future trivy/grype-vuln swap
+#                                      can write to the same filename)
 #   XRAY_SCAN_FORMAT                   simple-json (default) | json
 #   ARTIFACTORY_PROJECT                pass-through to --project=
 #
@@ -73,6 +77,8 @@ cd "${REPO_ROOT}"
 
 # shellcheck source=../lib/load-image-env.sh
 . "${REPO_ROOT}/scripts/lib/load-image-env.sh"
+# shellcheck source=../lib/artifact-names.sh
+. "${REPO_ROOT}/scripts/lib/artifact-names.sh"
 import_bamboo_vars
 load_image_env
 
@@ -173,7 +179,13 @@ fi
 
 # ── Run the scan ────────────────────────────────────────────────────
 SCAN_FORMAT="${XRAY_SCAN_FORMAT:-simple-json}"
-SCAN_FILE="${XRAY_SCAN_FILE:-${REPO_ROOT}/xray-scan.json}"
+# VULN_SCAN_FILE is the canonical vuln-scan filename (default
+# vuln-scan.json from scripts/lib/artifact-names.sh; build.env override
+# wins). Treat bare names as REPO_ROOT-relative.
+case "${VULN_SCAN_FILE}" in
+  /*) SCAN_FILE="${VULN_SCAN_FILE}" ;;
+  *)  SCAN_FILE="${REPO_ROOT}/${VULN_SCAN_FILE}" ;;
+esac
 PROJECT_FLAG=""
 [ -n "${ARTIFACTORY_PROJECT:-}" ] && PROJECT_FLAG="--project=${ARTIFACTORY_PROJECT}"
 

@@ -61,8 +61,14 @@
 #
 # Pro-only (ignored when ARTIFACTORY_PRO is unset/false):
 #   ARTIFACTORY_PRO, ARTIFACTORY_PROJECT,
-#   ARTIFACTORY_XRAY_PRESCAN, ARTIFACTORY_XRAY_POSTSCAN,
+#   ARTIFACTORY_BUILD_XRAY_PRESCAN, ARTIFACTORY_BUILD_XRAY_POSTSCAN,
 #   ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS
+#
+# The BUILD_ prefix on the Xray vars distinguishes these in-build
+# scans (run inline as part of the push backend) from the standalone
+# scripts/scan/xray-{vuln,sbom}.sh stages (separate CI jobs that scan
+# arbitrary refs). Don't confuse the two — same engine, different
+# pipeline placement.
 #
 # Auto-install (air-gap support):
 #   JF_BINARY_URL, JF_DEB_URL, JF_RPM_URL, JF_INSTALL_DIR
@@ -86,8 +92,8 @@ set -uo pipefail
 _artifactory_normalise_bools() {
   ARTIFACTORY_PRO="$(printf '%s' "${ARTIFACTORY_PRO:-false}"                                 | tr '[:upper:]' '[:lower:]')"
   ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS="$(printf '%s' "${ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS:-false}" | tr '[:upper:]' '[:lower:]')"
-  ARTIFACTORY_XRAY_PRESCAN="$(printf '%s' "${ARTIFACTORY_XRAY_PRESCAN:-false}"               | tr '[:upper:]' '[:lower:]')"
-  ARTIFACTORY_XRAY_POSTSCAN="$(printf '%s' "${ARTIFACTORY_XRAY_POSTSCAN:-true}"               | tr '[:upper:]' '[:lower:]')"
+  ARTIFACTORY_BUILD_XRAY_PRESCAN="$(printf '%s' "${ARTIFACTORY_BUILD_XRAY_PRESCAN:-false}"      | tr '[:upper:]' '[:lower:]')"
+  ARTIFACTORY_BUILD_XRAY_POSTSCAN="$(printf '%s' "${ARTIFACTORY_BUILD_XRAY_POSTSCAN:-false}"     | tr '[:upper:]' '[:lower:]')"
 }
 
 # Split the locally-built ref (e.g. reg/proj/nginx:1.25-abc) into the
@@ -173,7 +179,7 @@ _artifactory_print_banner() {
   echo "  Build name:      ${_ART_BUILD_NAME}"
   echo "  Build number:    ${_ART_BUILD_NUMBER}"
   if [ "${_ART_IS_PRO}" = "true" ]; then
-    if [ "${_ART_SKIP_BUILD_SCAN:-0}" = "1" ]; then
+    if [ "${_ART_SKIP_BUILD_POSTSCAN:-0}" = "1" ]; then
       echo "  Tier:            PRO (downgraded — project '${_ART_PROJECT_KEY}' missing; build-info goes to global namespace, scans skipped)"
     else
       echo "  Tier:            PRO (project=${_ART_PROJECT_KEY})"
@@ -203,12 +209,12 @@ _artifactory_print_banner() {
 # code or env-var change.
 #
 # Sets globals when project is missing:
-#   _ART_PROJECT_FLAG=""       drops --project from all subsequent jf calls
-#   _ART_SKIP_BUILD_SCAN=1     read by _artifactory_pro_xray_postscan
-#   _ART_SKIP_PRESCAN=1        read by _artifactory_pro_xray_prescan
+#   _ART_PROJECT_FLAG=""         drops --project from all subsequent jf calls
+#   _ART_SKIP_BUILD_POSTSCAN=1   read by _artifactory_pro_xray_postscan
+#   _ART_SKIP_BUILD_PRESCAN=1    read by _artifactory_pro_xray_prescan
 _artifactory_preflight_project() {
-  _ART_SKIP_BUILD_SCAN=0
-  _ART_SKIP_PRESCAN=0
+  _ART_SKIP_BUILD_POSTSCAN=0
+  _ART_SKIP_BUILD_PRESCAN=0
 
   # Only relevant on Pro path with a non-empty project key.
   [ "${_ART_IS_PRO}" = "true" ] || return 0
@@ -273,8 +279,8 @@ _artifactory_preflight_project() {
 ──────────────────────────────────────────────────────────────────────
 EOF
       _ART_PROJECT_FLAG=""
-      _ART_SKIP_BUILD_SCAN=1
-      _ART_SKIP_PRESCAN=1
+      _ART_SKIP_BUILD_POSTSCAN=1
+      _ART_SKIP_BUILD_PRESCAN=1
       return 0
       ;;
     401|403)
@@ -326,6 +332,10 @@ _artifactory_write_build_env() {
   export IMAGE_REF="${target}"
   export IMAGE_DIGEST="${digest_ref}"
 
+  # SBOM_FILE / VULN_SCAN_FILE come from scripts/lib/artifact-names.sh
+  # (sourced by build.sh before this backend ran). Writing them here
+  # propagates the canonical filenames to every downstream stage that
+  # does `. ./build.env`, so scan/ingest jobs never hardcode names.
   cat > build.env <<EOF
 IMAGE_REF=${target}
 IMAGE_TAG=${IMAGE_TAG}
@@ -336,6 +346,8 @@ UPSTREAM_REF=${UPSTREAM_REF:-unknown}
 BASE_DIGEST=${BASE_DIGEST:-}
 GIT_SHA=${GIT_SHA:-unknown}
 CREATED=${CREATED:-}
+SBOM_FILE=${SBOM_FILE}
+VULN_SCAN_FILE=${VULN_SCAN_FILE}
 EOF
 }
 
@@ -354,8 +366,8 @@ _artifactory_pro_enrich_build_info() {
   jf rt build-add-git "${_ART_BUILD_NAME}" "${_ART_BUILD_NUMBER}" ${_ART_PROJECT_FLAG} 2>&1
 }
 
-# Optional pre-push Xray gate. When ARTIFACTORY_XRAY_PRESCAN=true, runs
-# `jf docker scan` against the locally-tagged image BEFORE pushing.
+# Optional pre-push Xray gate. When ARTIFACTORY_BUILD_XRAY_PRESCAN=true,
+# runs `jf docker scan` against the locally-tagged image BEFORE pushing.
 # Returns:
 #   0  scan clean / scanner unavailable / disabled entirely
 #   0  violations in warn mode (prints WARN, caller proceeds)
@@ -371,17 +383,17 @@ _artifactory_pro_enrich_build_info() {
 # to return exit 3 on violations. Without one the scan is informational
 # only. We pass the project flag we've already computed.
 _artifactory_pro_xray_prescan() {
-  if [ "${_ART_SKIP_PRESCAN:-0}" = "1" ]; then
+  if [ "${_ART_SKIP_BUILD_PRESCAN:-0}" = "1" ]; then
     echo ""
     echo "── Pro: Xray pre-push scan SKIPPED (project '${_ART_PROJECT_KEY}' missing — preflight downgrade) ──"
     return 0
   fi
 
-  [ "${ARTIFACTORY_XRAY_PRESCAN}" = "true" ] || return 0
+  [ "${ARTIFACTORY_BUILD_XRAY_PRESCAN}" = "true" ] || return 0
 
   if [ -z "${_ART_PROJECT_FLAG}" ]; then
     echo "" >&2
-    echo "  WARN: ARTIFACTORY_XRAY_PRESCAN=true but project_flag is empty" >&2
+    echo "  WARN: ARTIFACTORY_BUILD_XRAY_PRESCAN=true but project_flag is empty" >&2
     echo "        (no ARTIFACTORY_PROJECT or ARTIFACTORY_TEAM set). Scan will" >&2
     echo "        be informational only — set a project to enforce violations." >&2
   fi
@@ -439,9 +451,9 @@ _artifactory_pro_publish_build_info() {
   jf rt build-publish "${_ART_BUILD_NAME}" "${_ART_BUILD_NUMBER}" ${_ART_PROJECT_FLAG} 2>&1 | tail -5
 }
 
-# Optional post-push Xray build scan. Toggled by ARTIFACTORY_XRAY_POSTSCAN
-# (default true — preserves historical behaviour). Same return-code
-# contract as the pre-scan above:
+# Optional post-push Xray build scan. Toggled by
+# ARTIFACTORY_BUILD_XRAY_POSTSCAN (default true — preserves historical
+# behaviour). Same return-code contract as the pre-scan above:
 #   0  clean / disabled / scanner unavailable / warn-mode violations
 #   1  strict-mode violations (caller propagates; image is already in
 #      Artifactory at this point — the failure gates promote/deploy)
@@ -450,14 +462,14 @@ _artifactory_pro_publish_build_info() {
 # warnings regardless of fail-mode — those are scanner availability
 # blips, not policy decisions.
 _artifactory_pro_xray_postscan() {
-  if [ "${_ART_SKIP_BUILD_SCAN:-0}" = "1" ]; then
+  if [ "${_ART_SKIP_BUILD_POSTSCAN:-0}" = "1" ]; then
     echo ""
     echo "── Pro: Xray build scan SKIPPED (project '${_ART_PROJECT_KEY}' missing — preflight downgrade) ──"
     return 0
   fi
-  if [ "${ARTIFACTORY_XRAY_POSTSCAN}" != "true" ]; then
+  if [ "${ARTIFACTORY_BUILD_XRAY_POSTSCAN}" != "true" ]; then
     echo ""
-    echo "── Pro: Xray build scan skipped (ARTIFACTORY_XRAY_POSTSCAN=${ARTIFACTORY_XRAY_POSTSCAN}) ──"
+    echo "── Pro: Xray build scan skipped (ARTIFACTORY_BUILD_XRAY_POSTSCAN=${ARTIFACTORY_BUILD_XRAY_POSTSCAN}) ──"
     return 0
   fi
 

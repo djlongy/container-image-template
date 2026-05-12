@@ -2,9 +2,14 @@
 # scripts/scan/xray-sbom.sh — JFrog Xray CycloneDX SBOM emitter
 #
 # Single responsibility: run `jf docker scan --format=cyclonedx --sbom`
-# against the upstream image and produce xray-sbom.cdx.json. Hands off
-# to scripts/sbom-post.sh for vendor-neutral sink shipping (Splunk,
-# Dependency-Track, Artifactory, webhook).
+# against the upstream image and produce the canonical sbom.cdx.json.
+# Hands off to scripts/sbom-post.sh for vendor-neutral sink shipping
+# (Splunk, Dependency-Track, Artifactory, webhook).
+#
+# Output filename is the SAME as scripts/scan/syft-sbom.sh — both
+# write sbom.cdx.json by default. The artifact contract is
+# scanner-agnostic so swapping producers (Xray ↔ Syft) keeps
+# downstream consumers (Grype, sbom-post) working unchanged.
 #
 # Pairs with scripts/scan/xray-vuln.sh which produces the simple-json
 # vuln scan via a separate jf invocation.
@@ -46,7 +51,10 @@
 # Optional env:
 #   XRAY_GENERATE_SBOM    "true" (default) | "false" → no-op
 #   XRAY_SCAN_REF         override the resolved target
-#   XRAY_SBOM_FILE        output path (default xray-sbom.cdx.json)
+#   SBOM_FILE             output path (default sbom.cdx.json — the
+#                         canonical name from scripts/lib/artifact-names.sh,
+#                         shared with scan/syft-sbom.sh so swapping
+#                         producers doesn't break downstream consumers)
 #   ARTIFACTORY_PROJECT   pass-through to --project=
 #
 # Exit codes: 0 (including graceful no-ops), 1 (missing scan target).
@@ -58,6 +66,8 @@ cd "${REPO_ROOT}"
 
 # shellcheck source=../lib/load-image-env.sh
 . "${REPO_ROOT}/scripts/lib/load-image-env.sh"
+# shellcheck source=../lib/artifact-names.sh
+. "${REPO_ROOT}/scripts/lib/artifact-names.sh"
 import_bamboo_vars
 load_image_env
 
@@ -151,7 +161,13 @@ if ! docker pull "${SCAN_REF}" >/dev/null 2>/tmp/xray-sbom-pull.err; then
 fi
 
 # ── Generate SBOM ─────────────────────────────────────────────────
-SBOM_FILE_OUT="${XRAY_SBOM_FILE:-${REPO_ROOT}/xray-sbom.cdx.json}"
+# SBOM_FILE is the canonical CycloneDX filename (default sbom.cdx.json
+# from scripts/lib/artifact-names.sh; build.env override wins). Treat
+# bare names as REPO_ROOT-relative.
+case "${SBOM_FILE}" in
+  /*) SBOM_FILE_OUT="${SBOM_FILE}" ;;
+  *)  SBOM_FILE_OUT="${REPO_ROOT}/${SBOM_FILE}" ;;
+esac
 PROJECT_FLAG=""
 [ -n "${ARTIFACTORY_PROJECT:-}" ] && PROJECT_FLAG="--project=${ARTIFACTORY_PROJECT}"
 

@@ -30,6 +30,11 @@
 #   SPLUNK_HEC_TOKEN        HEC token — sent as Authorization: Splunk <tok>
 #   SPLUNK_HEC_INDEX        target index (default: main)
 #   SPLUNK_HEC_INSECURE     "true" → curl -k (self-signed cert)
+#   SPLUNK_SOURCE           envelope `source` prefix (default: pipeline);
+#                           the lib appends "-job" to mimic the
+#                           /var/log/<source>-job.log convention so the
+#                           Splunk view groups events per pipeline.
+#                           e.g. SPLUNK_SOURCE=cdss → "cdss-job"
 #   HOSTNAME                envelope `host` field; defaults to uname -n
 #
 # Why a separate lib: xray-vuln.sh and sbom-post.sh both ship to HEC
@@ -83,7 +88,7 @@ splunk_hec_post() {
   jq -nc \
     --arg sourcetype "${sourcetype}" \
     --arg index      "${index}" \
-    --arg source     "container-image-template" \
+    --arg source     "${SPLUNK_SOURCE:-pipeline}-job" \
     --arg host       "${HOSTNAME:-$(uname -n)}" \
     --slurpfile event "${event_content_file}" \
     '{

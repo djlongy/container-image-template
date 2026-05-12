@@ -370,6 +370,227 @@ out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/sbom-post.sh "${TMP_DIR}/test.c
 echo "${out}" > "${TMP_DIR}/out"
 [ "${rc}" -eq 0 ] || FAILURES+=("${CURRENT_NAME}: expected zero exit when no sinks configured, got ${rc}")
 _must_contain "no sinks configured"
+# Both Artifactory sinks must appear in the hint list so users know
+# the difference between Xray-indexed and plain archive.
+_must_contain "ARTIFACTORY_SBOM_REPO"
+_must_contain "ARTIFACTORY_SBOM_ARCHIVE_REPO"
+end_scenario
+
+scenario "sbom-post-archive-sink-graceful-skip"
+# SINK 4 must skip cleanly when ARTIFACTORY_SBOM_ARCHIVE_REPO unset.
+echo '{"bomFormat":"CycloneDX","specVersion":"1.6","components":[]}' > "${TMP_DIR}/test.cdx.json"
+out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/sbom-post.sh "${TMP_DIR}/test.cdx.json" 2>&1) ; rc=$?
+echo "${out}" > "${TMP_DIR}/out"
+_must_contain "artifactory-archive  skip"
+end_scenario
+
+# ════════════════════════════════════════════════════════════════════
+# Modular push backends — REGISTRY_KIND dispatch
+# ════════════════════════════════════════════════════════════════════
+
+scenario "modular-harbor-backend-exists"
+[ -f scripts/push-backends/harbor.sh ] || FAILURES+=("${CURRENT_NAME}: scripts/push-backends/harbor.sh missing")
+bash -n scripts/push-backends/harbor.sh || FAILURES+=("${CURRENT_NAME}: harbor.sh fails bash -n")
+grep -q '^push_to_backend()' scripts/push-backends/harbor.sh \
+  || FAILURES+=("${CURRENT_NAME}: harbor.sh must export push_to_backend()")
+echo "harbor.sh present + push_to_backend() defined" > "${TMP_DIR}/out"
+end_scenario
+
+scenario "modular-artifactory-backend-exists"
+[ -f scripts/push-backends/artifactory.sh ] || FAILURES+=("${CURRENT_NAME}: scripts/push-backends/artifactory.sh missing")
+bash -n scripts/push-backends/artifactory.sh || FAILURES+=("${CURRENT_NAME}: artifactory.sh fails bash -n")
+grep -q '^push_to_backend()' scripts/push-backends/artifactory.sh \
+  || FAILURES+=("${CURRENT_NAME}: artifactory.sh must export push_to_backend()")
+echo "artifactory.sh present + push_to_backend() defined" > "${TMP_DIR}/out"
+end_scenario
+
+scenario "registry-kind-default-resolves-to-harbor"
+# When REGISTRY_KIND is unset, dispatch must resolve to harbor.sh.
+# Strip Artifactory-derivation sources so the test exercises the
+# default (Harbor) path. Use --push to actually trigger dispatch.
+sed -i.bak -E '/^(PUSH_REGISTRY|PUSH_PROJECT|ARTIFACTORY_URL|ARTIFACTORY_PUSH_HOST|ARTIFACTORY_TEAM|REGISTRY_KIND)=/d' image.env && rm image.env.bak
+echo 'PUSH_REGISTRY="harbor.example.com"' >> image.env
+echo 'PUSH_PROJECT="apps/test"'           >> image.env
+out=$(env -i HOME="$HOME" PATH="$PATH" BUILD_DEBUG=true ./scripts/build.sh --push 2>&1) ; rc=$?
+echo "${out}" > "${TMP_DIR}/out"
+echo "${out}" | grep -E "(dispatching push|Harbor push|harbor\.sh)" | head -5
+# We expect the build to fail later (no docker daemon access in
+# regression env), but it must reach the dispatch step naming harbor.
+_must_contain "backend=harbor"
+end_scenario
+
+scenario "registry-kind-explicit-harbor"
+sed -i.bak -E '/^(PUSH_REGISTRY|PUSH_PROJECT|REGISTRY_KIND)=/d' image.env && rm image.env.bak
+echo 'PUSH_REGISTRY="harbor.example.com"' >> image.env
+echo 'PUSH_PROJECT="apps/test"'           >> image.env
+echo 'REGISTRY_KIND="harbor"'             >> image.env
+out=$(env -i HOME="$HOME" PATH="$PATH" BUILD_DEBUG=true ./scripts/build.sh --push 2>&1) ; rc=$?
+echo "${out}" > "${TMP_DIR}/out"
+_must_contain "backend=harbor"
+end_scenario
+
+scenario "registry-kind-unknown-fails-with-listing"
+# REGISTRY_KIND set to a backend that doesn't exist must fail loudly
+# AND list the available backends so the user sees the typo.
+sed -i.bak -E '/^(PUSH_REGISTRY|PUSH_PROJECT|REGISTRY_KIND)=/d' image.env && rm image.env.bak
+echo 'PUSH_REGISTRY="harbor.example.com"' >> image.env
+echo 'PUSH_PROJECT="apps/test"'           >> image.env
+echo 'REGISTRY_KIND="nexus"'              >> image.env
+out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/build.sh --push 2>&1) ; rc=$?
+echo "${out}" > "${TMP_DIR}/out"
+echo "${out}" | tail -10
+[ "${rc}" -ne 0 ] || FAILURES+=("${CURRENT_NAME}: expected non-zero exit on unknown backend")
+_must_contain "REGISTRY_KIND='nexus'"
+_must_contain "Available backends:"
+_must_contain "harbor"
+_must_contain "artifactory"
+end_scenario
+
+# ════════════════════════════════════════════════════════════════════
+# Canonical artifact filenames (scripts/lib/artifact-names.sh)
+# ════════════════════════════════════════════════════════════════════
+
+scenario "artifact-names-lib-defines-defaults"
+out=$(bash -c '. scripts/lib/artifact-names.sh; echo "SBOM_FILE=${SBOM_FILE} VULN_SCAN_FILE=${VULN_SCAN_FILE}"')
+echo "${out}" > "${TMP_DIR}/out"
+echo "${out}"
+_must_contain "SBOM_FILE=sbom.cdx.json"
+_must_contain "VULN_SCAN_FILE=vuln-scan.json"
+end_scenario
+
+scenario "artifact-names-shell-override-wins"
+# Shell-set value must win over the lib's default — that's how forks
+# customise per-job (e.g. running both Trivy and Xray in one pipeline).
+out=$(SBOM_FILE=alt.json VULN_SCAN_FILE=alt-vuln.json bash -c '. scripts/lib/artifact-names.sh; echo "SBOM_FILE=${SBOM_FILE} VULN_SCAN_FILE=${VULN_SCAN_FILE}"')
+echo "${out}" > "${TMP_DIR}/out"
+_must_contain "SBOM_FILE=alt.json"
+_must_contain "VULN_SCAN_FILE=alt-vuln.json"
+end_scenario
+
+scenario "load-image-env-snapshot-includes-canonical-names"
+# Confirm the loader's snapshot list includes SBOM_FILE / VULN_SCAN_FILE
+# so a shell override survives the `. ./image.env` round-trip.
+grep -E '\bSBOM_FILE\b' scripts/lib/load-image-env.sh > "${TMP_DIR}/out"
+grep -E '\bVULN_SCAN_FILE\b' scripts/lib/load-image-env.sh >> "${TMP_DIR}/out"
+_must_contain "SBOM_FILE"
+_must_contain "VULN_SCAN_FILE"
+end_scenario
+
+# ════════════════════════════════════════════════════════════════════
+# Modular scan scripts — existence + syntax + canonical wiring
+# ════════════════════════════════════════════════════════════════════
+
+scenario "scan-scripts-exist-and-parse"
+all_ok=1
+for s in syft-sbom xray-sbom xray-vuln grype-vuln trivy-vuln trivy-sbom; do
+  if [ ! -f "scripts/scan/${s}.sh" ]; then
+    FAILURES+=("${CURRENT_NAME}: scripts/scan/${s}.sh missing"); all_ok=0; continue
+  fi
+  if ! bash -n "scripts/scan/${s}.sh" 2>/dev/null; then
+    FAILURES+=("${CURRENT_NAME}: scripts/scan/${s}.sh fails bash -n"); all_ok=0
+  fi
+done
+[ "${all_ok}" -eq 1 ] && echo "all 6 scan scripts present + parse" > "${TMP_DIR}/out" \
+                       || echo "scan-scripts check: see failures" > "${TMP_DIR}/out"
+end_scenario
+
+scenario "scan-scripts-source-artifact-names"
+# Every scan producer must source the canonical names so a single
+# rename in artifact-names.sh propagates everywhere.
+all_ok=1
+for s in syft-sbom xray-sbom xray-vuln grype-vuln trivy-vuln trivy-sbom; do
+  if ! grep -q 'lib/artifact-names.sh' "scripts/scan/${s}.sh"; then
+    FAILURES+=("${CURRENT_NAME}: scripts/scan/${s}.sh doesn't source artifact-names.sh"); all_ok=0
+  fi
+done
+[ "${all_ok}" -eq 1 ] && echo "all scan scripts source artifact-names.sh" > "${TMP_DIR}/out" \
+                       || echo "scan-scripts artifact-names wiring check: see failures" > "${TMP_DIR}/out"
+end_scenario
+
+scenario "syft-sbom-no-target-fails-loudly"
+# Strip image.env's UPSTREAM_* so resolution chain has nothing to
+# fall back to — script must exit non-zero with the chain message.
+sed -i.bak -E '/^UPSTREAM_(REGISTRY|IMAGE|TAG)=/d' image.env && rm image.env.bak
+out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/scan/syft-sbom.sh 2>&1) ; rc=$?
+echo "${out}" > "${TMP_DIR}/out"
+[ "${rc}" -ne 0 ] || FAILURES+=("${CURRENT_NAME}: expected non-zero exit when no target available")
+_must_contain "no scan target available"
+_must_contain "Resolution chain"
+end_scenario
+
+scenario "syft-sbom-target-resolution-image-digest-wins"
+# IMAGE_DIGEST (build.env) beats UPSTREAM_REF — same chain as Xray.
+out=$(env -i HOME="$HOME" PATH="$PATH" \
+  IMAGE_DIGEST="harbor.example.com/team/img@sha256:abc" \
+  ./scripts/scan/syft-sbom.sh 2>&1 | head -3) ; rc=$?
+echo "${out}" > "${TMP_DIR}/out"
+_must_contain "→ Scan target: harbor.example.com/team/img@sha256:abc"
+end_scenario
+
+scenario "syft-sbom-source-target-mode"
+# SBOM_TARGET=source switches to dir:${REPO_ROOT} so forks scanning
+# Ansible/pip/npm sources still work.
+out=$(env -i HOME="$HOME" PATH="$PATH" \
+  SBOM_TARGET=source \
+  ./scripts/scan/syft-sbom.sh 2>&1 | head -3) ; rc=$?
+echo "${out}" > "${TMP_DIR}/out"
+_must_contain "→ Scan target: dir:"
+end_scenario
+
+scenario "grype-vuln-missing-sbom-fails"
+# Grype needs an SBOM as input — must exit non-zero with a useful hint.
+out=$(env -i HOME="$HOME" PATH="$PATH" \
+  SBOM_FILE="/tmp/definitely-not-here.cdx.json" \
+  ./scripts/scan/grype-vuln.sh 2>&1) ; rc=$?
+echo "${out}" > "${TMP_DIR}/out"
+echo "${out}" | head -5
+[ "${rc}" -ne 0 ] || FAILURES+=("${CURRENT_NAME}: expected non-zero exit on missing SBOM input")
+_must_contain "SBOM not found"
+_must_contain "syft-sbom.sh"  # pointer to a producer
+end_scenario
+
+scenario "trivy-version-safety-guard"
+# Hard-coded check in both trivy scripts must refuse compromised
+# v0.69.4-v0.69.6. Confirm by grepping the script source.
+all_ok=1
+for s in scripts/scan/trivy-vuln.sh scripts/scan/trivy-sbom.sh; do
+  if ! grep -q '0\.69\.4|0\.69\.5|0\.69\.6' "${s}"; then
+    FAILURES+=("${CURRENT_NAME}: ${s} missing compromised-version guard"); all_ok=0
+  fi
+  if ! grep -q 'TRIVY_VERSION:-0\.69\.3' "${s}"; then
+    FAILURES+=("${CURRENT_NAME}: ${s} not pinned to safe v0.69.3 default"); all_ok=0
+  fi
+done
+[ "${all_ok}" -eq 1 ] && echo "trivy scripts pinned + guarded" > "${TMP_DIR}/out" \
+                       || echo "trivy safety check: see failures" > "${TMP_DIR}/out"
+end_scenario
+
+scenario "trivy-vuln-no-target-fails-loudly"
+sed -i.bak -E '/^UPSTREAM_(REGISTRY|IMAGE|TAG)=/d' image.env && rm image.env.bak
+out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/scan/trivy-vuln.sh 2>&1) ; rc=$?
+echo "${out}" > "${TMP_DIR}/out"
+[ "${rc}" -ne 0 ] || FAILURES+=("${CURRENT_NAME}: expected non-zero exit when no target")
+_must_contain "no scan target available"
+end_scenario
+
+scenario "scan-scripts-write-canonical-filenames"
+# Verify each producer script's output-resolution code references the
+# canonical env var (SBOM_FILE for SBOM producers, VULN_SCAN_FILE for
+# vuln scanners). Catches future regressions where someone hardcodes a
+# custom name and breaks the swap-out contract.
+all_ok=1
+for s in syft-sbom xray-sbom trivy-sbom; do
+  if ! grep -q '"\${SBOM_FILE}"' "scripts/scan/${s}.sh"; then
+    FAILURES+=("${CURRENT_NAME}: scripts/scan/${s}.sh doesn't honour \${SBOM_FILE}"); all_ok=0
+  fi
+done
+for s in xray-vuln grype-vuln trivy-vuln; do
+  if ! grep -q '"\${VULN_SCAN_FILE}"' "scripts/scan/${s}.sh"; then
+    FAILURES+=("${CURRENT_NAME}: scripts/scan/${s}.sh doesn't honour \${VULN_SCAN_FILE}"); all_ok=0
+  fi
+done
+[ "${all_ok}" -eq 1 ] && echo "all scan scripts honour canonical names" > "${TMP_DIR}/out" \
+                       || echo "canonical-names wiring check: see failures" > "${TMP_DIR}/out"
 end_scenario
 
 # ════════════════════════════════════════════════════════════════════

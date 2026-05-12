@@ -6,20 +6,30 @@
 #
 # Pipeline shape (5 stages, sign commented out, promote dropped):
 #
-#   prescan      → xray-vuln-prescan, xray-sbom-prescan
-#                  (scan UPSTREAM_REF, fail-fast on policy violation
-#                   if XRAY_FAIL_ON_SEVERITY is set + allow_failure
-#                   flipped to false on xray-vuln-prescan)
-#   build        → docker build + push to PUSH_REGISTRY
-#   postscan     → xray-vuln-postscan, xray-sbom-postscan
-#                  (scan the BUILT image — IMAGE_DIGEST from build.env)
-#                  + sbom (Syft when approved), grype, grype-db-sync
+#   prescan      → scan UPSTREAM_REF (BEFORE build). Three SBOM producers
+#                   + two vuln scanners run in parallel; downstream stages
+#                   pick up whichever sbom/vuln-scan.json they need via
+#                   canonical SBOM_FILE/VULN_SCAN_FILE names.
+#                     xray-vuln-prescan, syft-sbom-prescan,
+#                     xray-sbom-prescan
+#                  (DORMANT, commented:
+#                     trivy-vuln-prescan, trivy-sbom-prescan)
+#   build        → docker build + push via REGISTRY_KIND dispatch
+#                   (scripts/push-backends/<harbor|artifactory>.sh).
+#                   Emits build.env with SBOM_FILE/VULN_SCAN_FILE so
+#                   postscan jobs source the canonical filenames.
+#   postscan     → scan the BUILT image (IMAGE_DIGEST from build.env).
+#                   Each scan script is one job — single-purpose,
+#                   swappable, parallel:
+#                     SBOM producers : syft-sbom-postscan, xray-sbom-postscan
+#                     Vuln scanners  : grype-vuln, xray-vuln-postscan
+#                     Optional       : grype-db-sync (CVE DB mirror)
+#                  (DORMANT, commented:
+#                     trivy-vuln-postscan, trivy-sbom-postscan)
 #   sign         → cosign-sign (DORMANT — commented out)
-#   ingest       → sbom-ingest (sbom-post.sh ships Syft SBOM)
-#
-#   (trivy block is present but commented out — uncomment when Trivy
-#    is unbanned for business use. Xray covers vuln scan + SBOM in
-#    the meantime; Grype reads the Syft SBOM when Syft is approved.)
+#   ingest       → sbom-ingest (sbom-post.sh ships sbom.cdx.json to
+#                   the configured sinks: webhook / DT / Artifactory
+#                   Xray-indexed / Artifactory archive / Splunk HEC)
 #
 # Variable precedence (canonical sources):
 #   1. image.env (committed)  — non-secret per-fork canonical config
@@ -97,6 +107,16 @@ variables:
   DOCKER_HOST: tcp://docker:2375
   DOCKER_TLS_CERTDIR: ""
   DOCKER_BUILDKIT: "1"
+
+  # ── Canonical artifact filenames (the cross-stage contract) ─────
+  # Mirror the defaults in scripts/lib/artifact-names.sh. CI YAML
+  # can't `source` shell files, so the names are duplicated here AND
+  # in the lib — but they almost never change (the whole point of
+  # canonical names is stability). If you ever rename them, update
+  # both. Build.sh writes these into build.env so postscan jobs that
+  # do `. ./build.env` pick them up automatically.
+  SBOM_FILE: "sbom.cdx.json"
+  VULN_SCAN_FILE: "vuln-scan.json"
 
   # ── Closed-network / air-gap configuration ──────────────────────
   # Every runtime dependency below can be overridden via CI variables
@@ -245,12 +265,14 @@ build:
   rules: *build-rules
 
 # ═══════════════════════════════════════════════════════════════════
-# SCAN — SBOM generation
+# POSTSCAN — Syft SBOM of the BUILT image
 # ═══════════════════════════════════════════════════════════════════
-# Syft generates the CycloneDX SBOM from the pushed image digest.
-# This is the single source of truth for the rest of the pipeline:
-# Grype consumes it, cosign attests it, sbom-post.sh ships it.
-sbom:
+# Writes the canonical sbom.cdx.json (filename comes from build.env's
+# SBOM_FILE which the build backend wrote from scripts/lib/artifact-names.sh).
+# Swap this stage's script for scripts/scan/xray-sbom.sh (or
+# trivy-sbom.sh) and the downstream Grype + sbom-post stages keep
+# working — they read the same SBOM_FILE.
+syft-sbom-postscan:
   stage: postscan
   image: ${ALPINE_IMAGE}
   needs:
@@ -258,63 +280,37 @@ sbom:
       artifacts: true
   before_script:
     - *install-tools
-    - |
-      mkdir -p "${HOME}/.local/bin"
-      export PATH="${HOME}/.local/bin:${PATH}"
-      if ! command -v syft >/dev/null 2>&1; then
-        curl -sSfL "${SYFT_INSTALLER_URL}" | sh -s -- -b "${HOME}/.local/bin" "${SYFT_VERSION}"
-      fi
-      syft version
   script:
-    # Log in so syft can pull the image manifest by digest.
+    - . ./build.env
+    - bash ./scripts/scan/syft-sbom.sh
+  artifacts:
+    paths:
+      - ${SBOM_FILE}
+    reports:
+      cyclonedx: ${SBOM_FILE}
+    expire_in: 1 month
+  rules: *build-rules
+
+# ═══════════════════════════════════════════════════════════════════
+# PRESCAN — Syft SBOM of UPSTREAM_REF (before build runs)
+# ═══════════════════════════════════════════════════════════════════
+# Same script, different target. Useful when you want early visibility
+# on the upstream's component graph without waiting for the build.
+syft-sbom-prescan:
+  stage: prescan
+  image: ${ALPINE_IMAGE}
+  needs: []
+  before_script:
+    - *install-tools
+  script:
     - |
-      # Write a config.json that covers BOTH Harbor and (optionally)
-      # Artifactory. Downstream tools (syft, cosign) use this to
-      # authenticate image pulls regardless of which backend the build
-      # stage pushed to. Order doesn't matter — each host key points
-      # to a separate auth entry.
-      mkdir -p ~/.docker
-      AUTHS=""
-      if [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ]; then
-        A=$(printf '%s' "${PUSH_REGISTRY_USER}:${PUSH_REGISTRY_PASSWORD}" | base64 -w0)
-        AUTHS="${AUTHS}\"${PUSH_REGISTRY}\":{\"auth\":\"${A}\"},"
-      fi
-      if [ "${REGISTRY_KIND:-}" = "artifactory" ] && [ -n "${ARTIFACTORY_USER:-}" ]; then
-        ART_SECRET="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
-        ART_HOST="${ARTIFACTORY_PUSH_HOST:-}"
-        if [ -z "${ART_HOST}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
-          ART_HOST="${ARTIFACTORY_URL#https://}"
-          ART_HOST="${ART_HOST#http://}"
-          ART_HOST="${ART_HOST%%/*}"
-        fi
-        if [ -n "${ART_HOST}" ] && [ -n "${ART_SECRET}" ]; then
-          A=$(printf '%s' "${ARTIFACTORY_USER}:${ART_SECRET}" | base64 -w0)
-          AUTHS="${AUTHS}\"${ART_HOST}\":{\"auth\":\"${A}\"},"
-        fi
-      fi
-      AUTHS="${AUTHS%,}"
-      printf '{"auths":{%s}}\n' "${AUTHS}" > ~/.docker/config.json
-    - |
-      echo "→ Generating SBOM for ${IMAGE_DIGEST:-${IMAGE_REF}}"
-      SCAN_TARGET="${IMAGE_DIGEST:-${IMAGE_REF}}"
-      syft "${SCAN_TARGET}" \
-        -o cyclonedx-json=sbom.cdx.json \
-        -o spdx-json=sbom.spdx.json \
-        -o syft-json=sbom.syft.json
-      echo "→ SBOM generated:"
-      ls -la sbom.*.json
-      # Quick component count for the pipeline log
-      if command -v jq >/dev/null 2>&1; then
-        echo "  components: $(jq '.components | length' sbom.cdx.json)"
-      fi
+      export SBOM_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+      bash ./scripts/scan/syft-sbom.sh
   artifacts:
     paths:
       - sbom.cdx.json
-      - sbom.spdx.json
-      - sbom.syft.json
-    reports:
-      cyclonedx: sbom.cdx.json
     expire_in: 1 month
+    when: always
   rules: *build-rules
 
 # ═══════════════════════════════════════════════════════════════════
@@ -338,80 +334,34 @@ grype-db-sync:
     - ./scripts/mirror-grype-db.sh
 
 # ═══════════════════════════════════════════════════════════════════
-# SCAN — vulnerability scanning (Grype, SBOM-first)
+# POSTSCAN — Grype vulnerability scan (consumes Syft SBOM)
 # ═══════════════════════════════════════════════════════════════════
 # Grype reads the CycloneDX SBOM directly (no image re-pull) and
-# matches components against its vulnerability database. This is the
-# replacement for Trivy while Trivy is banned for business use.
-#
-# Air-gap: when ARTIFACTORY_GRYPE_DB_REPO is set, the grype-db-sync
-# job populates the mirror and this job fetches the DB from there
-# instead of from grype.anchore.io.
-grype:
+# matches components against its vulnerability database. Air-gap:
+# when ARTIFACTORY_GRYPE_DB_REPO is set, the grype-db-sync job
+# populates the mirror and this job fetches the DB from there instead
+# of from grype.anchore.io.
+grype-vuln:
   stage: postscan
   image: ${ALPINE_IMAGE}
   needs:
     - job: build
       artifacts: true
-    - job: sbom
+    - job: syft-sbom-postscan
       artifacts: true
     - job: grype-db-sync
       optional: true
   before_script:
     - *install-tools
-    - |
-      mkdir -p "${HOME}/.local/bin"
-      export PATH="${HOME}/.local/bin:${PATH}"
-      if ! command -v grype >/dev/null 2>&1; then
-        curl -sSfL "${GRYPE_INSTALLER_URL}" | sh -s -- -b "${HOME}/.local/bin" "${GRYPE_VERSION}"
-      fi
-      grype version
-    # When a mirror repo is configured, point Grype at it. Credentials
-    # are embedded in the URL so Grype's DB client (which doesn't
-    # support Basic auth headers natively) can authenticate.
-    - |
-      if [ -n "${ARTIFACTORY_GRYPE_DB_REPO:-}" ] && [ -n "${ARTIFACTORY_URL:-}" ]; then
-        _art_host="${ARTIFACTORY_URL#https://}"
-        _art_host="${_art_host#http://}"
-        _art_host="${_art_host%%/*}"
-        _art_secret="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
-        export GRYPE_DB_UPDATE_URL="https://${ARTIFACTORY_USER}:${_art_secret}@${_art_host}/artifactory/${ARTIFACTORY_GRYPE_DB_REPO}/${GRYPE_DB_MIRROR_SUBPATH}/latest.json"
-        export GRYPE_DB_AUTO_UPDATE=true
-        echo "→ Grype DB source: ${ARTIFACTORY_URL}/artifactory/${ARTIFACTORY_GRYPE_DB_REPO}/${GRYPE_DB_MIRROR_SUBPATH}/latest.json"
-      fi
   script:
-    - |
-      echo "→ Scanning SBOM for vulnerabilities (Grype)"
-      # Full JSON for downstream ingestion / cosign attestation
-      grype sbom:sbom.cdx.json \
-        --output json \
-        --file grype-report.json \
-        --fail-on "" \
-        || true
-      # Human-readable table for the pipeline log
-      grype sbom:sbom.cdx.json --output table || true
-
-      # Count by severity for the log summary
-      if command -v jq >/dev/null 2>&1; then
-        echo ""
-        echo "→ Vulnerability summary:"
-        for sev in Critical High Medium Low Negligible Unknown; do
-          count=$(jq "[.matches[] | select(.vulnerability.severity==\"${sev}\")] | length" grype-report.json)
-          echo "    ${sev}: ${count}"
-        done
-      fi
-
-      # Gate: fail the pipeline on new Critical CVEs (tune as needed).
-      # Uncomment when you want the gate to actually block:
-      #
-      # CRIT=$(jq '[.matches[] | select(.vulnerability.severity=="Critical")] | length' grype-report.json)
-      # if [ "${CRIT}" -gt 0 ]; then
-      #   echo "ERROR: ${CRIT} critical vulnerabilities found" >&2
-      #   exit 1
-      # fi
+    - . ./build.env
+    # All install / DB-mirror / scan / severity-gate logic lives in the
+    # script. Set GRYPE_FAIL_ON_SEVERITY="critical" (or "critical,high")
+    # in image.env or a CI variable to make this a hard gate.
+    - bash ./scripts/scan/grype-vuln.sh
   artifacts:
     paths:
-      - grype-report.json
+      - ${VULN_SCAN_FILE}
     expire_in: 1 month
   rules: *build-rules
 
@@ -479,7 +429,7 @@ xray-vuln-prescan:
       bash ./scripts/scan/xray-vuln.sh
   artifacts:
     paths:
-      - xray-scan.json
+      - ${VULN_SCAN_FILE}
     expire_in: 1 month
     when: always
 
@@ -493,7 +443,7 @@ xray-sbom-prescan:
       bash ./scripts/scan/xray-sbom.sh
   artifacts:
     paths:
-      - xray-sbom.cdx.json
+      - ${SBOM_FILE}
     expire_in: 1 month
     when: always
 
@@ -501,7 +451,7 @@ xray-sbom-prescan:
 # POSTSCAN — Xray on the BUILT image (IMAGE_DIGEST), audit ingestion
 # ═══════════════════════════════════════════════════════════════════
 # Runs AFTER build. Scans what consumers will actually pull, including
-# cert injection / Dockerfile fork-edit customisations. The
+# any cert injection / Dockerfile editable-region customisations. The
 # scripts default to scanning IMAGE_DIGEST (from build.env via dotenv
 # artifact import), so no XRAY_SCAN_REF override needed.
 xray-vuln-postscan:
@@ -514,7 +464,7 @@ xray-vuln-postscan:
     - bash ./scripts/scan/xray-vuln.sh
   artifacts:
     paths:
-      - xray-scan.json
+      - ${VULN_SCAN_FILE}
     expire_in: 1 month
     when: always
 
@@ -528,45 +478,92 @@ xray-sbom-postscan:
     - bash ./scripts/scan/xray-sbom.sh
   artifacts:
     paths:
-      - xray-sbom.cdx.json
+      - ${SBOM_FILE}
     expire_in: 1 month
     when: always
 
 # ═══════════════════════════════════════════════════════════════════
-# SCAN — Trivy (DISABLED: banned for business use)
+# PRE/POSTSCAN — Trivy vuln + SBOM (DORMANT: banned for business use)
 # ═══════════════════════════════════════════════════════════════════
-# Uncomment this entire block when Trivy is re-permitted. Grype
-# coverage overlaps heavily, so running both is optional — keep this
-# scaffold here so re-enablement is a single block uncomment.
+# Uncomment any/all four jobs below to re-enable Trivy. The scripts pin
+# to v0.69.3 (the last safe pre-compromise binary release) and refuse
+# v0.69.4–v0.69.6 even if the installer mirror serves them — see the
+# security note at the top of scripts/scan/trivy-vuln.sh.
 #
-# trivy:
-#   stage: scan
-#   image: alpine:3.20
+# Each job emits the canonical artifact (vuln-scan.json / sbom.cdx.json),
+# so swapping Trivy in for Xray or Grype is a one-line script-name
+# change in the CI YAML. Both Xray + Grype cover the same ground in
+# the meantime so Trivy isn't required.
+#
+# trivy-vuln-prescan:
+#   stage: prescan
+#   image: ${ALPINE_IMAGE}
+#   needs: []
+#   before_script:
+#     - *install-tools
+#   script:
+#     - |
+#       export TRIVY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+#       bash ./scripts/scan/trivy-vuln.sh
+#   artifacts:
+#     paths:
+#       - vuln-scan.json
+#     expire_in: 1 month
+#     when: always
+#   rules: *build-rules
+#
+# trivy-sbom-prescan:
+#   stage: prescan
+#   image: ${ALPINE_IMAGE}
+#   needs: []
+#   before_script:
+#     - *install-tools
+#   script:
+#     - |
+#       export TRIVY_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+#       bash ./scripts/scan/trivy-sbom.sh
+#   artifacts:
+#     paths:
+#       - sbom.cdx.json
+#     expire_in: 1 month
+#     when: always
+#   rules: *build-rules
+#
+# trivy-vuln-postscan:
+#   stage: postscan
+#   image: ${ALPINE_IMAGE}
 #   needs:
 #     - job: build
 #       artifacts: true
 #   before_script:
 #     - *install-tools
-#     - |
-#       if ! command -v trivy >/dev/null 2>&1; then
-#         curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-#           | sh -s -- -b /usr/local/bin v0.56.2
-#       fi
-#       trivy --version
 #   script:
-#     - |
-#       echo "→ Scanning image with Trivy"
-#       trivy image --format json --output trivy-report.json \
-#         --severity CRITICAL,HIGH,MEDIUM \
-#         "${IMAGE_DIGEST:-${IMAGE_REF}}"
-#       trivy image --severity CRITICAL,HIGH "${IMAGE_DIGEST:-${IMAGE_REF}}"
+#     - . ./build.env
+#     - bash ./scripts/scan/trivy-vuln.sh
 #   artifacts:
 #     paths:
-#       - trivy-report.json
+#       - ${VULN_SCAN_FILE}
 #     expire_in: 1 month
-#   rules:
-#     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-#     - if: '$CI_COMMIT_TAG'
+#   rules: *build-rules
+#
+# trivy-sbom-postscan:
+#   stage: postscan
+#   image: ${ALPINE_IMAGE}
+#   needs:
+#     - job: build
+#       artifacts: true
+#   before_script:
+#     - *install-tools
+#   script:
+#     - . ./build.env
+#     - bash ./scripts/scan/trivy-sbom.sh
+#   artifacts:
+#     paths:
+#       - ${SBOM_FILE}
+#     reports:
+#       cyclonedx: ${SBOM_FILE}
+#     expire_in: 1 month
+#   rules: *build-rules
 
 # ═══════════════════════════════════════════════════════════════════
 # SIGN — cosign sign + SBOM attestation  (DORMANT — no cosign infra at work yet)
@@ -587,9 +584,9 @@ xray-sbom-postscan:
 #   needs:
 #     - job: build
 #       artifacts: true
-#     - job: sbom
+#     - job: syft-sbom-postscan
 #       artifacts: true
-#     - job: grype
+#     - job: grype-vuln
 #       artifacts: true
 #   before_script:
 #     - *install-tools
@@ -644,16 +641,16 @@ xray-sbom-postscan:
 #         -a "git.commit=${CI_COMMIT_SHA}" \
 #         "${TARGET}"
 #
-#       if [ -f sbom.cdx.json ]; then
+#       if [ -f "${SBOM_FILE}" ]; then
 #         echo "→ cosign attest (CycloneDX SBOM)"
 #         cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
-#           --type cyclonedx --predicate sbom.cdx.json "${TARGET}"
+#           --type cyclonedx --predicate "${SBOM_FILE}" "${TARGET}"
 #       fi
 #
-#       if [ -f grype-report.json ]; then
-#         echo "→ cosign attest (Grype vulnerability report)"
+#       if [ -f "${VULN_SCAN_FILE}" ]; then
+#         echo "→ cosign attest (vuln scan report)"
 #         cosign attest --key "${COSIGN_KEY}" --yes --tlog-upload=false \
-#           --type vuln --predicate grype-report.json "${TARGET}"
+#           --type vuln --predicate "${VULN_SCAN_FILE}" "${TARGET}"
 #       fi
 #   rules:
 #     - if: '$FORCE_ALL == "true"'
@@ -674,12 +671,17 @@ sbom-ingest:
   needs:
     - job: build
       artifacts: true
-    - job: sbom
+    # Default consumer is syft-sbom-postscan — change to
+    # xray-sbom-postscan (or trivy-sbom-postscan when re-enabled) to
+    # ship a different producer's SBOM. All write the same SBOM_FILE
+    # so sbom-post.sh doesn't care which one ran.
+    - job: syft-sbom-postscan
       artifacts: true
   before_script:
     - *install-tools     # also sources image.env so sbom-post sees ARTIFACTORY_*, etc.
   script:
-    - bash ./scripts/sbom-post.sh sbom.cdx.json
+    - . ./build.env
+    - bash ./scripts/sbom-post.sh "${SBOM_FILE}"
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_COMMIT_TAG'

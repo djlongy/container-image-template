@@ -29,23 +29,6 @@
 #                       Package upgrades / extra installs / file drops are
 #                       NOT a build.sh concern — add those directly to the
 #                       Dockerfile in the marked fork-edit region.
-#   SBOM_GENERATE       default: false — opt-in. When true, syft emits a
-#                       CycloneDX JSON next to the built image. Generation
-#                       and shipping are intentionally decoupled: this
-#                       script ONLY writes the file. scripts/sbom-post.sh
-#                       is a separate, standalone stage (wired in as the
-#                       sbom-ingest job in .gitlab-ci.yml). Leave this
-#                       off when CI's dedicated sbom stage is already
-#                       running — turn it on for local dev and for
-#                       non-docker forks (Ansible / pip / npm source).
-#   SBOM_TARGET         default: image — scan the built image (needs push
-#                       to resolve IMAGE_DIGEST, falls back to FULL_IMAGE).
-#                       Set to "source" to scan the working directory
-#                       instead — useful for forks that ship Ansible,
-#                       pip, npm or go source rather than container images.
-#   SBOM_FILE           default: <image>-<tag>.cdx.json — override if
-#                       you need a specific filename. Suffix must remain
-#                       .cdx.json for Artifactory Xray SBOM-import.
 #   CRANE_URL           default: auto-detected for host OS/arch —
 #                       override to point at an internal mirror for
 #                       air-gapped runners.
@@ -90,6 +73,8 @@ cd "${REPO_ROOT}"
 # message on missing image.env.
 # shellcheck source=lib/load-image-env.sh
 . "${REPO_ROOT}/scripts/lib/load-image-env.sh"
+# shellcheck source=lib/artifact-names.sh
+. "${REPO_ROOT}/scripts/lib/artifact-names.sh"
 
 # ════════════════════════════════════════════════════════════════════
 # PHASE 0 — Argument parsing
@@ -121,13 +106,22 @@ All behavioural toggles are env-driven. See image.env.example for the
 full list. Commonly-used flags:
 
   REGISTRY_KIND=artifactory   use scripts/push-backends/artifactory.sh
+                              (default "harbor" → push-backends/harbor.sh)
   INJECT_CERTS=true           bake certs/*.crt into the trust store
-  SBOM_GENERATE=true          emit <image>-<tag>.cdx.json after build
   ARTIFACTORY_PRO=true        enable Pro-tier push path
-  ARTIFACTORY_XRAY_PRESCAN=true
-                              jf docker scan BEFORE push (admin gate)
+  ARTIFACTORY_BUILD_XRAY_PRESCAN=true
+                              jf docker scan inside the build job
+                              BEFORE push (admin gate; default false)
+  ARTIFACTORY_BUILD_XRAY_POSTSCAN=true
+                              jf build-scan inside the build job
+                              AFTER push (default false)
   ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS=true
                               fail build on Xray policy violation
+
+Note: BUILD_ in the var name marks these as in-build scans run by the
+push backend. The standalone scripts/scan/xray-{vuln,sbom}.sh are
+separate CI stages — same Xray engine, different pipeline placement.
+Both default OFF — opt in only when an Xray licence is provisioned.
 EOF
 }
 
@@ -201,11 +195,9 @@ _build_apply_defaults_and_normalise() {
   ORIGINAL_USER="${ORIGINAL_USER:-root}"
   VENDOR="${VENDOR:-example.com}"
 
-  INJECT_CERTS="$(printf '%s' "${INJECT_CERTS}"          | tr '[:upper:]' '[:lower:]')"
-  SBOM_GENERATE="$(printf '%s' "${SBOM_GENERATE:-false}" | tr '[:upper:]' '[:lower:]')"
-  SBOM_TARGET="$(printf '%s'   "${SBOM_TARGET:-image}"   | tr '[:upper:]' '[:lower:]')"
+  INJECT_CERTS="$(printf '%s' "${INJECT_CERTS}" | tr '[:upper:]' '[:lower:]')"
 
-  _dbg "resolved: INJECT_CERTS=${INJECT_CERTS} SBOM_GENERATE=${SBOM_GENERATE}"
+  _dbg "resolved: INJECT_CERTS=${INJECT_CERTS}"
 }
 
 # ════════════════════════════════════════════════════════════════════
@@ -498,32 +490,36 @@ _build_docker_build() {
     label_args+=(--label "org.opencontainers.image.url=${SOURCE_URL}")
   fi
 
-  # --provenance=false --sbom=false: force buildx to emit a FLAT
-  # single-arch v2 distribution manifest (config + layers in the tag
-  # dir) instead of an OCI image index wrapping the manifest +
-  # attestation manifest. The latter happens by default on:
+  # Detect buildx and toggle the attestation flags accordingly.
   #
-  #   - Docker Desktop / Colima (vz-rosetta) with the containerd
-  #     image store enabled — supports native index storage
-  #   - buildx >= 0.13 — defaults to `--provenance=mode=min`
+  # When buildx is present (Docker Desktop, Colima vz-rosetta, modern
+  # Docker Engine with the buildx plugin) we pass `--provenance=false
+  # --sbom=false` to force a FLAT single-arch v2 distribution manifest
+  # (config + layers in the tag dir) instead of an OCI image index
+  # wrapping the manifest + an attestation manifest. The index lands
+  # in JFrog as <tag>/list.manifest.json with the layer blobs at
+  # <repo>/<image>/sha256:<digest>/ rather than in the tag dir, which
+  # makes our Free-tier build-info merger (lib/build-info-merge.py)
+  # report "1 artifact, 0 dependencies (fallback)" instead of the
+  # proper "manifest + config + N layers" count.
   #
-  # The index landing in JFrog as <tag>/list.manifest.json puts the
-  # actual layer blobs in <repo>/<image>/sha256:<digest>/ rather than
-  # in the tag dir, which makes our Free-tier build-info merger
-  # (lib/build-info-merge.py) see one file in the tag dir and report
-  # "1 artifact, 0 dependencies (fallback)" instead of the proper
-  # "manifest + config + N layers" count.
+  # When buildx is NOT installed (some hosted CI runners ship plain
+  # Docker Engine), `docker build` rejects those flags as unknown,
+  # so we fall back to a vanilla `docker build` — non-buildx Docker
+  # never produces OCI indices anyway, so the flags wouldn't have
+  # served any purpose there.
   #
   # We don't consume buildx's provenance/SBOM attestations — Xray
-  # scans cover provenance separately and Syft + sbom-post.sh cover
-  # SBOMs separately — so disabling these flags is no real loss.
-  # If you ever want the buildx-generated attestations back AND
-  # correct artifact counts, the alternative is teaching the merger
-  # to walk the OCI index → resolve per-arch manifest → fetch blobs
-  # from the digest path (see scripts/lib/build-info-merge.py
-  # `_compute_inherited_blob_digests`).
-  echo "→ docker build"
-  docker build --provenance=false --sbom=false \
+  # covers provenance separately and Syft/Trivy/Xray + sbom-post.sh
+  # cover SBOMs as their own stages — so disabling them is lossless.
+  local _build_cmd=(docker build)
+  if docker buildx version >/dev/null 2>&1; then
+    _build_cmd=(docker buildx build --provenance=false --sbom=false --load)
+    echo "→ docker buildx build (provenance/sbom disabled)"
+  else
+    echo "→ docker build (buildx not detected — flat manifest by default)"
+  fi
+  "${_build_cmd[@]}" \
     "${build_args[@]}" "${label_args[@]}" -t "${FULL_IMAGE}" .
   echo "→ build complete: ${FULL_IMAGE}"
 
@@ -533,103 +529,23 @@ _build_docker_build() {
 }
 
 # ════════════════════════════════════════════════════════════════════
-# PHASE 8 — Push + build.env
+# PHASE 8 — Push + build.env (delegated to push backend)
 # ════════════════════════════════════════════════════════════════════
-# REGISTRY_KIND=artifactory delegates to the backend, which handles
-# retag, push, build-info, property tagging, AND writes build.env.
-# Default (unset) is a plain docker push with a local build.env write.
-
-_build_push_artifactory() {
-  local backend="${REPO_ROOT}/scripts/push-backends/artifactory.sh"
-  if [ ! -f "${backend}" ]; then
-    echo "ERROR: REGISTRY_KIND=artifactory but ${backend} not found" >&2
-    return 1
-  fi
-  # shellcheck disable=SC1090
-  . "${backend}"
-  push_to_backend "${FULL_IMAGE}" || return 1
-}
-
-_build_push_default() {
-  echo ""
-  echo "→ docker push ${FULL_IMAGE}"
-  local push_output push_digest
-  push_output=$(docker push "${FULL_IMAGE}" 2>&1) || {
-    echo "${push_output}" >&2
-    echo "ERROR: docker push failed" >&2
-    return 1
-  }
-  echo "${push_output}"
-
-  IMAGE_DIGEST=""
-  push_digest=$(printf '%s' "${push_output}" | grep -oE 'sha256:[0-9a-f]{64}' | head -1)
-  if [ -n "${push_digest}" ]; then
-    IMAGE_DIGEST="${PUSH_REGISTRY}/${PUSH_PROJECT}/${IMAGE_NAME}@${push_digest}"
-    echo "→ pushed: ${IMAGE_DIGEST}"
-  fi
-  # Export for downstream SBOM generation without re-parsing build.env.
-  export IMAGE_DIGEST IMAGE_REF="${FULL_IMAGE}"
-
-  cat > build.env <<EOF
-IMAGE_REF=${FULL_IMAGE}
-IMAGE_TAG=${FULL_TAG}
-IMAGE_DIGEST=${IMAGE_DIGEST}
-IMAGE_NAME=${IMAGE_NAME}
-UPSTREAM_TAG=${UPSTREAM_TAG}
-UPSTREAM_REF=${UPSTREAM_REF}
-BASE_DIGEST=${BASE_DIGEST}
-GIT_SHA=${GIT_SHA}
-CREATED=${CREATED}
-EOF
-}
-
-# ════════════════════════════════════════════════════════════════════
-# PHASE 7.5 — Docker login (image.env values, not just CI shell env)
-# ════════════════════════════════════════════════════════════════════
-# Login is done HERE in build.sh (not in the CI yaml's before_script)
-# so credentials can flow from image.env → load_image_env → push.
-# Previously the CI yaml's before_script hardcoded the login using its
-# own shell env, which meant PUSH_REGISTRY/USER/PASSWORD HAD to be CI
-# variables — image.env values for those would never reach the login
-# step. Moving the login here makes image.env the canonical source for
-# everything except the password (which still belongs in CI as a
-# masked secret).
+# Every push backend lives at scripts/push-backends/<kind>.sh and
+# exports a single function: push_to_backend "<built-local-ref>".
+# That function is responsible for:
+#   1. docker login to its target host
+#   2. docker push (or jf docker push, etc.)
+#   3. writing build.env with the canonical fields IMAGE_REF, IMAGE_TAG,
+#      IMAGE_DIGEST, IMAGE_NAME, UPSTREAM_TAG, UPSTREAM_REF, BASE_DIGEST,
+#      GIT_SHA, CREATED
 #
-# Two paths matched to the push backend selector:
-#   REGISTRY_KIND=artifactory → login to ARTIFACTORY_PUSH_HOST
-#   anything else            → login to PUSH_REGISTRY (Harbor baseline)
+# Adding a new backend = drop a new file in push-backends/ that
+# exposes push_to_backend. No edits to build.sh required. Swap by
+# changing REGISTRY_KIND in image.env.
 #
-# Both no-op cleanly when the corresponding USER/PASSWORD pair is
-# empty (e.g. unauthenticated pulls / scratchpad runs).
-_build_docker_login() {
-  if [ "${WANT_PUSH}" -ne 1 ]; then
-    _dbg "WANT_PUSH=0 — skipping docker login"
-    return 0
-  fi
-  if ! command -v docker >/dev/null 2>&1; then
-    _dbg "docker CLI not on PATH — skipping login (push will fail)"
-    return 0
-  fi
-
-  if [ "${REGISTRY_KIND_LC}" = "artifactory" ]; then
-    local _host="${ARTIFACTORY_PUSH_HOST:-${PUSH_REGISTRY:-}}"
-    local _user="${ARTIFACTORY_USER:-}"
-    local _secret="${ARTIFACTORY_TOKEN:-${ARTIFACTORY_PASSWORD:-}}"
-    if [ -n "${_host}" ] && [ -n "${_user}" ] && [ -n "${_secret}" ]; then
-      echo "→ docker login ${_host} (Artifactory backend)"
-      printf '%s' "${_secret}" | docker login "${_host}" -u "${_user}" --password-stdin
-    else
-      _dbg "Artifactory creds incomplete (host=${_host} user=${_user:+set}) — skipping login"
-    fi
-  else
-    if [ -n "${PUSH_REGISTRY:-}" ] && [ -n "${PUSH_REGISTRY_USER:-}" ] && [ -n "${PUSH_REGISTRY_PASSWORD:-}" ]; then
-      echo "→ docker login ${PUSH_REGISTRY} (default backend)"
-      printf '%s' "${PUSH_REGISTRY_PASSWORD}" | docker login "${PUSH_REGISTRY}" -u "${PUSH_REGISTRY_USER}" --password-stdin
-    else
-      _dbg "Default-backend creds incomplete (registry=${PUSH_REGISTRY:-} user=${PUSH_REGISTRY_USER:+set}) — skipping login"
-    fi
-  fi
-}
+# REGISTRY_KIND defaults to "harbor" (plain docker push). Other
+# shipped backends: "artifactory".
 
 _build_push_and_emit_env() {
   if [ "${WANT_PUSH}" -ne 1 ]; then
@@ -637,89 +553,22 @@ _build_push_and_emit_env() {
     return 0
   fi
 
-  _dbg "dispatching push: backend=${REGISTRY_KIND_LC:-default} target=${FULL_IMAGE}"
-  if [ "${REGISTRY_KIND_LC}" = "artifactory" ]; then
-    _build_push_artifactory || return 1
-  else
-    _build_push_default || return 1
+  local kind="${REGISTRY_KIND_LC:-harbor}"
+  local backend="${REPO_ROOT}/scripts/push-backends/${kind}.sh"
+  if [ ! -f "${backend}" ]; then
+    echo "ERROR: REGISTRY_KIND='${kind}' but ${backend} not found" >&2
+    echo "       Available backends:" >&2
+    ls "${REPO_ROOT}/scripts/push-backends/" 2>/dev/null | sed 's/\.sh$//' | sed 's/^/         /' >&2
+    return 1
   fi
+
+  _dbg "dispatching push: backend=${kind} target=${FULL_IMAGE}"
+  # shellcheck disable=SC1090
+  . "${backend}"
+  push_to_backend "${FULL_IMAGE}" || return 1
 
   echo "→ wrote build.env"
   sed 's/^/    /' build.env
-}
-
-# ════════════════════════════════════════════════════════════════════
-# PHASE 9 — SBOM generation (opt-in, decoupled from shipping)
-# ════════════════════════════════════════════════════════════════════
-# Emits a CycloneDX JSON next to the built image. Filename follows
-# Artifactory Xray's expected <name>.cdx.json convention so it's
-# auto-indexed when whichever stage does the upload picks it up.
-#
-# Off by default on purpose — the CI pipeline already has a dedicated
-# `sbom` stage (see .gitlab-ci.yml) that does this against the pushed
-# digest, and a separate `sbom-ingest` stage that ships via
-# scripts/sbom-post.sh. Running both would duplicate work.
-#
-# Turn SBOM_GENERATE=true on for:
-#   - Local dev runs where you want a scanable BOM without the pipeline
-#   - Forks that build non-docker artifacts (Ansible, pip, npm, go
-#     source) and don't have a separate sbom CI stage
-#
-# Shipping stays the domain of scripts/sbom-post.sh as a standalone
-# stage — do not chain it here.
-
-_build_install_syft() {
-  command -v syft >/dev/null 2>&1 && return 0
-
-  local _url="${SYFT_INSTALLER_URL:-https://raw.githubusercontent.com/anchore/syft/main/install.sh}"
-  local _ver="${SYFT_VERSION:-v1.14.0}"
-  echo ""
-  echo "→ syft not on PATH — installing ${_ver} from ${_url}"
-  mkdir -p "${REPO_ROOT}/.bin"
-  if curl -fsSL --max-time 120 "${_url}" \
-       | sh -s -- -b "${REPO_ROOT}/.bin" "${_ver}" >/dev/null 2>&1 \
-     && [ -x "${REPO_ROOT}/.bin/syft" ]; then
-    export PATH="${REPO_ROOT}/.bin:${PATH}"
-    echo "  ✓ syft installed ($(${REPO_ROOT}/.bin/syft version 2>&1 | head -1))"
-    return 0
-  fi
-  echo "  WARN: syft install failed — skipping SBOM generation" >&2
-  return 1
-}
-
-_build_generate_sbom() {
-  [ "${SBOM_GENERATE}" = "true" ] || return 0
-
-  _build_install_syft || return 0
-  command -v syft >/dev/null 2>&1 || return 0
-
-  local basename scan_target
-  basename="${IMAGE_NAME##*/}-${FULL_TAG}"
-  SBOM_FILE="${SBOM_FILE:-${basename}.cdx.json}"
-
-  case "${SBOM_TARGET}" in
-    source)  scan_target="dir:${REPO_ROOT}" ;;
-    image|*) scan_target="${IMAGE_DIGEST:-${FULL_IMAGE}}" ;;
-  esac
-
-  echo ""
-  echo "→ syft: generating CycloneDX SBOM for ${scan_target}"
-  if ! syft "${scan_target}" -o cyclonedx-json="${SBOM_FILE}"; then
-    echo "  WARN: syft failed — no SBOM produced" >&2
-    return 0
-  fi
-
-  echo "→ SBOM: ${SBOM_FILE} ($(wc -c < "${SBOM_FILE}") bytes)"
-  if command -v jq >/dev/null 2>&1; then
-    echo "        components: $(jq '.components | length' "${SBOM_FILE}")"
-  fi
-  # Expose SBOM_FILE to downstream stages (sbom-ingest, etc.) via
-  # build.env when it exists. No shipping here — sbom-post.sh runs
-  # as its own stage.
-  if [ -f build.env ] && ! grep -q "^SBOM_FILE=" build.env; then
-    echo "SBOM_FILE=${SBOM_FILE}" >> build.env
-  fi
-  echo "  (ship via scripts/sbom-post.sh ${SBOM_FILE} in a separate stage)"
 }
 
 # ════════════════════════════════════════════════════════════════════
@@ -748,7 +597,7 @@ if [ "${WANT_DRY_RUN}" -eq 1 ]; then
 fi
 
 _build_docker_build
-_build_docker_login
 _build_push_and_emit_env
 
-_build_generate_sbom
+# SBOM generation lives in scripts/scan/syft-sbom.sh as its own stage —
+# call it after build (or as a CI postscan job) when you want a BOM.

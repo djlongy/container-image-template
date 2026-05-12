@@ -1,41 +1,30 @@
 # container-image-template
 
-A minimal, fork-per-image template for building **one** container image
-through a DevSecOps pipeline. Ships with a working nginx example that
-exercises the full flow: upstream pull, optional cert injection, OCI
-labels via BuildKit, dual SBOM tracks (Syft and JFrog Xray), Grype +
-Xray vulnerability scans, optional cosign signing scaffold, and
-pluggable SBOM/scan ingestion (Splunk HEC, Dependency-Track,
-Artifactory, generic webhook). Bespoke per-image work (package
-upgrades, extra installs, ENV/HEALTHCHECK lines) goes directly in
-the Dockerfile's marked fork-edit region — no separate extension
-surface, no DISTRO selector, no remediate stage.
+A minimal template for building **one** container image from an
+upstream base through a DevSecOps pipeline. Ships with a working
+nginx example that exercises the full flow: upstream pull, optional
+cert injection, OCI labels via BuildKit, dual SBOM tracks (Syft and
+JFrog Xray), Grype + Xray vulnerability scans, optional cosign
+signing scaffold, and pluggable SBOM/scan ingestion (Splunk HEC,
+Dependency-Track, Artifactory, generic webhook). Bespoke per-image
+work (package upgrades, extra installs, ENV/HEALTHCHECK lines) goes
+directly in the Dockerfile's marked editable region — no separate
+extension surface, no DISTRO selector, no remediate stage.
 
-**When to fork this repo vs. use the monorepo** ([container-images](../container-images)):
-
-| Situation | Use |
-|---|---|
-| You are re-tagging N ready-made upstream images and want shared pipeline logic | **container-images** (monorepo) |
-| You have a bespoke / custom-built image that needs image-specific Dockerfile work | **this template** (fork per image) |
-| N > 3 | monorepo |
-| N = 1 and the Dockerfile is non-trivial | this template |
-
-Features — everything in the monorepo's fleet pipeline, minus the
-fleet fabric:
+Features:
 
 - **Cert injection**: optional CA cert stage, picks up anything in
   `certs/` or a PEM string from the `CA_CERT` CI variable. Stage is
   distro-agnostic — appends to both `ca-certificates.crt` and
   `cert.pem`, then runs `update-ca-certificates` if present
-- **Bespoke per-image work**: edit the Dockerfile's marked fork-edit
+- **Bespoke per-image work**: edit the Dockerfile's marked editable
   region directly. Use it for `apk upgrade` / `apt-get upgrade` (CVE
   remediation), extra packages, config drops, healthchecks, ENV.
-  No env-var toggles, no separate extension scripts — the file every
-  fork already owns is the customisation surface
+  No env-var toggles, no separate extension scripts — the Dockerfile
+  is the customisation surface
 - **Upstream-version tagging**: pushes at
   `<image>:<UPSTREAM_TAG>-<gitShort>` (e.g. `nginx:1.25.3-alpine-a1b2c3d`).
-  The upstream tag IS the version — no second version axis. Matches
-  the container-images monorepo convention exactly.
+  The upstream tag IS the version — no second version axis.
 - **Full OCI label coverage via BuildKit**: static labels in the
   Dockerfile, dynamic labels (revision, created, base.digest, source)
   passed via `docker buildx build --label`
@@ -63,9 +52,9 @@ fleet fabric:
   upstream version pins
 - **GitLab + Bamboo**: two inline pipelines at 1:1 parity, both
   invoke the same `scripts/build.sh` and `scripts/scan/*.sh` —
-  add stages by adding YAML, never by forking the script logic
+  add stages by adding YAML, never by duplicating script logic
 
-## Quick start — fork and rebrand
+## Quick start
 
 **One file defines what this repo builds.** Everything about the
 image — upstream registry/image/tag, behavior toggles — lives in
@@ -76,11 +65,10 @@ No internal semver.
 
 `image.env.example` is a **template only**. The build never reads it
 — if `image.env` doesn't exist the build fails fast with a clear "copy
-the template" message. (Previous versions silently fell back, which
-masked dev-vs-CI config drift; we made it strict on purpose.)
+the template" message.
 
 ```bash
-# 1. Clone as a new per-image repo
+# 1. Clone the repo
 git clone <this-repo-url> my-app
 cd my-app
 
@@ -96,18 +84,18 @@ $EDITOR image.env
 #    VENDOR               your company / team
 
 # 3. (Optional) Add bespoke per-image work directly in the Dockerfile
-#    — find the "FORK EDITS GO HERE" region between the certs stage
-#    and the final USER flip. Drop in `RUN apk upgrade`, extra
-#    package installs, COPY of static configs, HEALTHCHECK, etc.
+#    — find the marked editable region between the certs stage and
+#    the final USER flip. Drop in `RUN apk upgrade`, extra package
+#    installs, COPY of static configs, HEALTHCHECK, etc.
 
-# 4. Commit image.env + Dockerfile (both travel with the fork)
+# 4. Commit image.env + Dockerfile
 git add image.env Dockerfile && git commit -m 'configure for <my-image>'
 
 # 5. Sanity-check locally (no push)
 ./scripts/build.sh
 
 # 6. Push to GitLab / Bamboo / GitHub and set CI variables
-#    (secrets only — PUSH_REGISTRY_PASSWORD etc. — see below)
+#    (secrets only — see below)
 ```
 
 ### image.env resolution order
@@ -122,16 +110,16 @@ template you copy from on first checkout. If you delete `image.env`,
 the build fails. Secrets stay in CI plan vars (never committed to
 `image.env`).
 
-### What you edit when forking, vs. what stays generic
+### What you edit, vs. what stays generic
 
-| File | Edit when forking? | Notes |
+| File | Edit? | Notes |
 |---|---|---|
-| `image.env` | **Always** (created from `image.env.example`) | Whole image definition's behavioural toggles + targets live here |
+| `image.env` | **Always** (created from `image.env.example`) | All behavioural toggles + targets for this image live here |
 | `image.env.example` | Only when adding new template-level documentation | Template / reference only — never sourced |
-| `Dockerfile` | **Often** — fork-edit region between certs stage and final USER | Drop `RUN apk upgrade`, `RUN apk add curl jq`, `COPY config/`, `HEALTHCHECK`, etc. directly. The region is clearly marked; everything outside it is template-owned and should not be edited |
+| `Dockerfile` | **Often** — editable region between certs stage and final USER | Drop `RUN apk upgrade`, `RUN apk add curl jq`, `COPY config/`, `HEALTHCHECK`, etc. directly. The region is clearly marked; everything outside it is template-owned and should not be edited |
 | `scripts/build.sh` | Never | Reads `image.env`, invokes buildx, handles backend dispatch |
 | `scripts/sbom-post.sh` | Only to add new SBOM sinks | Generic; 4 sinks built in (webhook, DT, Artifactory, Splunk HEC) |
-| `scripts/push-backends/artifactory.sh` | Never | Ported from monorepo, same layout templates |
+| `scripts/push-backends/artifactory.sh` | Never | Layout-template driven; per-deployment config goes in `image.env` |
 | `.gitlab-ci.yml`, `bamboo-specs/bamboo.yaml` | Only to change pipeline structure | Default flow: build → [sbom, grype, xray-vuln, xray-sbom] → sbom-ingest |
 | `renovate.json` | Only to add more Renovate hints | Custom manager already wired for `UPSTREAM_TAG` in `image.env` |
 
@@ -146,15 +134,28 @@ where they came from.
 
 **Truly secret (must be CI-vars, masked, never committed):**
 
-| Variable | Required | Purpose |
+Pick the row that matches your push backend — they're mutually
+exclusive. The default Harbor path uses `PUSH_REGISTRY_PASSWORD`;
+`REGISTRY_KIND=artifactory` uses the Artifactory creds and ignores
+`PUSH_REGISTRY_PASSWORD` entirely.
+
+| Variable | When required | Purpose |
 |---|---|---|
-| `PUSH_REGISTRY_PASSWORD` | ✅ (masked) | Push password or token for `PUSH_REGISTRY` |
-| `ARTIFACTORY_PASSWORD` or `ARTIFACTORY_TOKEN` | ⬜ (masked) | Required when `REGISTRY_KIND=artifactory`. Token preferred |
-| `XRAY_ARTIFACTORY_TOKEN` | ⬜ (masked) | Only when scan-side Artifactory differs from push-side |
-| `SPLUNK_HEC_TOKEN` | ⬜ (masked) | Only when shipping events to Splunk |
-| `DEPENDENCY_TRACK_API_KEY` | ⬜ (masked) | Only when shipping SBOMs to Dependency-Track |
-| `SBOM_WEBHOOK_AUTH_HEADER` | ⬜ (masked) | Only when the generic SBOM webhook needs auth |
-| `COSIGN_KEY` | ⬜ (masked, file-type) | Only when restoring the dormant cosign-sign job |
+| `PUSH_REGISTRY_PASSWORD` | Default (Harbor `docker push` to `PUSH_REGISTRY`) | Push password / token. Not used when `REGISTRY_KIND=artifactory` |
+| `ARTIFACTORY_USER` | When `REGISTRY_KIND=artifactory` | Service-account username (see "JFrog Cloud gotcha" below for the username encoding) |
+| `ARTIFACTORY_TOKEN` *or* `ARTIFACTORY_PASSWORD` | When `REGISTRY_KIND=artifactory` | Token preferred; basic-auth password also works |
+| `XRAY_ARTIFACTORY_TOKEN` | Optional | Only when scan-side Artifactory differs from push-side |
+| `SPLUNK_HEC_TOKEN` | Optional | Only when shipping events to Splunk |
+| `DEPENDENCY_TRACK_API_KEY` | Optional | Only when shipping SBOMs to Dependency-Track |
+| `SBOM_WEBHOOK_AUTH_HEADER` | Optional | Only when the generic SBOM webhook needs auth |
+| `COSIGN_KEY` | Optional (masked, file-type) | Only when restoring the dormant cosign-sign job |
+
+**Bare-minimum to push via the Artifactory backend:** export
+`ARTIFACTORY_USER` and `ARTIFACTORY_TOKEN` (or `ARTIFACTORY_PASSWORD`)
+in the shell, set everything else in `image.env`, then run
+`./scripts/build.sh --push`. No `PUSH_REGISTRY_PASSWORD`, no
+`PUSH_REGISTRY_USER`, no separate registry login — the backend
+handles its own `docker login` and pushes through `jf docker push`.
 
 **CI-runtime images (must be CI-vars — YAML reads at pipeline-load time):**
 
@@ -247,12 +248,11 @@ vuln scan JSON with sourcetype `jfrog:xray:scan`.
 
 ### Optional: push backend switch (Harbor ↔ Artifactory)
 
-Same pattern as the monorepo. The default path does a plain
-`docker push` to `PUSH_REGISTRY` (Harbor baseline, zero extra config).
-Set `REGISTRY_KIND=artifactory` to delegate the push step to
-`scripts/push-backends/artifactory.sh`, which handles layout template
-resolution, `jf rt bp` build-info publishing, and `jf rt set-props`
-metadata tagging on the manifest:
+The default path does a plain `docker push` to `PUSH_REGISTRY`
+(Harbor baseline, zero extra config). Set `REGISTRY_KIND=artifactory`
+to delegate the push step to `scripts/push-backends/artifactory.sh`,
+which handles layout template resolution, `jf rt bp` build-info
+publishing, and `jf rt set-props` metadata tagging on the manifest:
 
 | Variable | Purpose |
 |---|---|
@@ -264,14 +264,14 @@ metadata tagging on the manifest:
 | `ARTIFACTORY_TEAM` | Team acronym — referenced by layout templates |
 | `ARTIFACTORY_ENVIRONMENT` | `dev` \| `prod` (drives `ARTIFACTORY_REPO_SUFFIX`) |
 | `ARTIFACTORY_PUSH_HOST` | Docker push hostname for subdomain layouts |
-| `ARTIFACTORY_IMAGE_REF` | Template for the push URL (see monorepo's `global.env.example` for 5 named presets) |
+| `ARTIFACTORY_IMAGE_REF` | Template for the push URL (see `image.env.example` for the supported placeholders) |
 | `ARTIFACTORY_MANIFEST_PATH` | Template for the REST storage path used by `set-props` |
 
-The fallback layout (no templates set) is Layout A from the monorepo:
+The fallback layout (no templates set) is:
 `<host>/<team>/<image>:<tag>` → `<team>-docker-<suffix>/<image>/<tag>`.
-If you've already configured layouts in the monorepo, the same
-template strings work here unchanged — just paste them into your
-group-level CI variables.
+Override `ARTIFACTORY_IMAGE_REF` and `ARTIFACTORY_MANIFEST_PATH` in
+`image.env` (or as group-level CI variables) when you need a
+different layout.
 
 > **⚠️ GitLab CI variable-expansion gotcha.** GitLab performs variable
 > substitution on CI variable **values** before injecting them into
@@ -417,10 +417,10 @@ run here, scanning the upstream's tag verbatim.
 
 **`postscan` (IMAGE_DIGEST)** — runs AFTER build. Scans what consumers
 actually pull, including any remediation, cert injection, or
-Dockerfile fork-edit customisations applied during build. Xray vuln +
-Xray SBOM both default to scanning `IMAGE_DIGEST` from `build.env`
-(via GitLab's dotenv artifact import / Bamboo's `. ./build.env`).
-Same scripts as prescan — different target.
+Dockerfile editable-region customisations applied during build. Xray
+vuln + Xray SBOM both default to scanning `IMAGE_DIGEST` from
+`build.env` (via GitLab's dotenv artifact import / Bamboo's
+`. ./build.env`). Same scripts as prescan — different target.
 
 The scripts are vendor-symmetric: `scripts/scan/xray-vuln.sh` and
 `scripts/scan/xray-sbom.sh` both honor a resolution chain (`$1` >
@@ -466,7 +466,7 @@ human-in-the-loop check is the gate.
 
 There is **no extension surface, no hook script, no DISTRO selector,
 no remediate stage**. Bespoke per-image work goes in the Dockerfile's
-clearly-marked fork-edit region, between the cert-injection stage
+clearly-marked editable region, between the cert-injection stage
 and the final `USER ${ORIGINAL_USER}` flip:
 
 ```dockerfile
@@ -491,7 +491,7 @@ HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://localhost/ || exit 
 # ═══════════════════════════════════════════════════════════════════
 ```
 
-The fork-edit region inherits `USER root` from the certs stage above
+The editable region inherits `USER root` from the certs stage above
 it — apk/apt/chown/COPY all work without an explicit `USER root`. The
 `ORIGINAL_USER` flip happens AFTER your edits, so the final image runs
 as the upstream user.
@@ -500,20 +500,13 @@ For images where OS-level package upgrades don't apply (distroless,
 scratch, busybox, statically-linked bases), simply leave the region
 empty.
 
-Earlier versions used a `scripts/remediate/${DISTRO}.sh` indirection
-plus a `scripts/extend/customise.sh` hook. Both are removed: Bamboo's
-docker plugin doesn't reliably resolve nested ARG-gated stages, and
-the extension hook drifted out of sync with what forks actually
-needed. Editing the file every fork already owns is simpler and
-survives every CI runner.
-
 ## Tagging convention
 
 We're not the upstream — we're a **variant** of the upstream. We
 pulled `nginx:1.25.3-alpine`, optionally injected a corp CA and
-applied any fork-edit RUN/COPY lines, and produced something that's
-no longer bit-for-bit identical to what's on Docker Hub. The tagging
-convention makes that delineation explicit.
+applied any RUN/COPY lines from the editable region, and produced
+something that's no longer bit-for-bit identical to what's on Docker
+Hub. The tagging convention makes that delineation explicit.
 
 ```
 <registry>/<project>/<image>:<UPSTREAM_TAG>-<gitShort>
@@ -530,11 +523,10 @@ harbor.example.com/base-images/nginx:1.25.3-alpine-a1b2c3d
   logic, cert rotation, label tweaks, etc. each get their own
   traceable artifact even when the upstream tag is unchanged.
 
-Matches the container-images monorepo convention exactly. The OCI
-`org.opencontainers.image.version` label on the image is **also**
-set to `<UPSTREAM_TAG>-<gitShort>` (not just the bare upstream tag)
-so tools inspecting the image can tell at a glance that it's a
-rebuild, not an untouched upstream.
+The OCI `org.opencontainers.image.version` label on the image is
+**also** set to `<UPSTREAM_TAG>-<gitShort>` (not just the bare
+upstream tag) so tools inspecting the image can tell at a glance
+that it's a rebuild, not an untouched upstream.
 
 ## OCI labels
 
@@ -544,7 +536,7 @@ set keys we explicitly want to own:
 
 | Label | Source |
 |---|---|
-| `org.opencontainers.image.version` | `${UPSTREAM_TAG}-${gitShort}` — matches the pushed tag exactly. This makes it explicit that the image is a **variant** of the upstream (cert-injected / fork-edited), not the untouched upstream |
+| `org.opencontainers.image.version` | `${UPSTREAM_TAG}-${gitShort}` — matches the pushed tag exactly. This makes it explicit that the image is a **variant** of the upstream (cert-injected / editable-region customised), not the untouched upstream |
 | `org.opencontainers.image.revision` | `git rev-parse HEAD` |
 | `org.opencontainers.image.created` | `date -u` at build time |
 | `org.opencontainers.image.base.name` | `UPSTREAM_REGISTRY/UPSTREAM_IMAGE:UPSTREAM_TAG` |
@@ -567,25 +559,31 @@ reports the upstream tag, which is what OCI consumers expect.
 container-image-template/
 ├── image.env                  # ★ Per-fork canonical config (REQUIRED, committed)
 ├── image.env.example          # Template — copy to image.env, then edit. NEVER sourced
-├── Dockerfile                 # base → certs-{false,true} AS final → fork-edit region → USER
+├── Dockerfile                 # base → certs-{false,true} AS final → editable region → USER
 ├── renovate.json              # Custom manager tracks UPSTREAM_TAG in image.env
 ├── certs/                     # Gitignored *.crt; populated at build time
 │   └── .gitkeep
 ├── scripts/
-│   ├── build.sh               # Resolves tags + OCI labels, docker login, buildx, push
+│   ├── build.sh               # Orchestrator: tags + OCI labels + buildx, dispatches push backend
 │   ├── sbom-post.sh           # 4 SBOM sinks: webhook / DT / Artifactory Xray / Splunk HEC
 │   ├── mirror-grype-db.sh     # Optional: mirror Anchore Grype CVE DB to Artifactory
 │   ├── lib/                   # Shared functions sourced by other scripts
 │   │   ├── load-image-env.sh  # image.env loader + bamboo_* importer + _dbg helper
+│   │   ├── artifact-names.sh  # Canonical SBOM_FILE / VULN_SCAN_FILE contract (single source of truth)
 │   │   ├── install-jf.sh      # Sudoless jf installer (binary | .deb | .rpm)
 │   │   ├── docker-login.sh    # Multi-registry login for scan jobs
 │   │   ├── splunk-hec.sh      # Generic Splunk HEC envelope poster
 │   │   └── build-info-merge.py  # Free-tier build-info merger (artifactory.sh, Pro skips it)
-│   ├── scan/
-│   │   ├── xray-vuln.sh       # `jf docker scan --format=simple-json` → xray-scan.json + Splunk
-│   │   └── xray-sbom.sh       # `jf docker scan --format=cyclonedx --sbom` → sbom-post handoff
-│   ├── push-backends/
-│   │   └── artifactory.sh     # REGISTRY_KIND=artifactory backend (layout templates, Pro/Free)
+│   ├── push-backends/         # ★ MODULAR — pick one via REGISTRY_KIND, delete the rest
+│   │   ├── harbor.sh          # REGISTRY_KIND=harbor (default) — plain docker push
+│   │   └── artifactory.sh     # REGISTRY_KIND=artifactory — layout templates, Pro/Free
+│   ├── scan/                  # ★ MODULAR — pick the producer per stage, delete unused
+│   │   ├── syft-sbom.sh       # Syft → sbom.cdx.json + sbom-post handoff
+│   │   ├── xray-sbom.sh       # `jf docker scan --format=cyclonedx --sbom` → sbom.cdx.json
+│   │   ├── trivy-sbom.sh      # Trivy → sbom.cdx.json (DORMANT — pinned to safe v0.69.3)
+│   │   ├── xray-vuln.sh       # `jf docker scan --format=simple-json` → vuln-scan.json + Splunk
+│   │   ├── grype-vuln.sh      # Grype reads SBOM_FILE → vuln-scan.json + severity gate
+│   │   └── trivy-vuln.sh      # Trivy → vuln-scan.json (DORMANT — pinned to safe v0.69.3)
 │   └── test/
 │       └── regression.sh      # local scenarios — INJECT_CERTS/CA_CERT/precedence/backends/
 │                              # no-creds/argv/scan-target. Run with: bash scripts/test/regression.sh
@@ -611,9 +609,18 @@ $EDITOR image.env       # populate UPSTREAM_*, INJECT_CERTS, etc.
 ./scripts/build.sh
 
 # 3. Build + push. build.sh handles its own docker login (after sourcing
-#    image.env + applying any shell overrides). Set PUSH_REGISTRY_PASSWORD
-#    in the env or rely on a pre-existing daemon login.
+#    image.env + applying any shell overrides). Pick the env block that
+#    matches your push backend:
+#
+#    Default (Harbor) — needs PUSH_REGISTRY_USER + PUSH_REGISTRY_PASSWORD:
 export PUSH_REGISTRY_PASSWORD='...'   # password / token (don't commit)
+#
+#    Artifactory backend (REGISTRY_KIND=artifactory in image.env) —
+#    needs only ARTIFACTORY_USER + ARTIFACTORY_TOKEN/PASSWORD; the
+#    backend logs in to ARTIFACTORY_PUSH_HOST itself:
+export ARTIFACTORY_USER='svc-deploy'
+export ARTIFACTORY_TOKEN='...'        # token preferred (don't commit)
+
 ./scripts/build.sh --push
 
 # Verbose mode (logs every config decision):
