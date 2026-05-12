@@ -171,7 +171,6 @@ stages:
         - Grype DB Sync     # opt-in air-gap mirror (no-op without
                             # ARTIFACTORY_GRYPE_DB_REPO). Mirrors
                             # GitLab's grype-db-sync job.
-        - Runtime Smoke
         # - Trivy Vuln Postscan   # DORMANT — same caveat as Prescan
         # - Trivy SBOM Postscan   #   variants above.
   # - Sign:           # COMMENTED OUT — no cosign infra at work yet.
@@ -357,50 +356,6 @@ Grype Vuln:
       location: .
       pattern: vuln-scan.json
       shared: true
-  requirements:
-    - system.docker.executable
-
-# ═══════════════════════════════════════════════════════════════════
-# POSTSCAN — Runtime smoke test (actually start the container)
-# ═══════════════════════════════════════════════════════════════════
-# Scans + pushes prove the manifest is valid; they don't prove the
-# image RUNS. Pulls the pushed digest, `docker run -d`s it, waits a
-# few seconds, and verifies State.Status. Catches the class of bug
-# where the cert sidecar / editable region silently breaks the
-# entrypoint binary or image library paths.
-Runtime Smoke:
-  tasks:
-    - artifact-download:
-        artifacts:
-          - name: build-env
-            destination: .
-    - script:
-        interpreter: BASH
-        scripts:
-          - |-
-            set -euo pipefail
-            # set -a wraps the sourcing so plain KEY=VALUE lines (dotenv-clean)
-            # auto-export into spawned `bash ./scripts/...` subshells. build.env
-            # has NO `export ` prefix because GitLab's dotenv parser rejects it.
-            set -a; . ./build.env; set +a
-            [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
-
-            # Relay creds for the multi-registry pull. Smoke needs to
-            # pull the pushed digest; multi-registry login lib reads
-            # whatever creds are in scope.
-            export HARBOR_USER="${bamboo_svc_harbor_user:-${bamboo_HARBOR_USER:-}}"
-            export HARBOR_PASSWORD="${bamboo_svc_harbor_password:-${bamboo_HARBOR_PASSWORD:-}}"
-            export ARTIFACTORY_TOKEN="${bamboo_svc_artifactory_token:-${bamboo_ARTIFACTORY_TOKEN:-}}"
-            export ARTIFACTORY_USER="${bamboo_svc_artifactory_user:-${bamboo_ARTIFACTORY_USER:-}}"
-
-            # `|| true` mirrors GitLab's `allow_failure: true` on
-            # runtime-smoke. The smoke test is best-effort — if the
-            # container won't start because of a deliberately broken
-            # entrypoint (rare upstream bug), don't block the whole
-            # plan. Set RUNTIME_SMOKE_HEALTHCHECK / RUNTIME_HEALTH_TIMEOUT
-            # in image.env if you want stricter behaviour, and remove
-            # the `|| true` to make it a hard gate.
-            bash ./scripts/scan/runtime-smoke.sh || true
   requirements:
     - system.docker.executable
 

@@ -16,12 +16,12 @@
 #
 #   docker build \
 #     -f airgap/alpine-cit-tools/Dockerfile \
-#     -t harbor.mgt.newen.au/shared/base/alpine-cit-tools:3.20 \
+#     -t harbor.example.com/shared/base/alpine-cit-tools:3.20 \
 #     airgap/alpine-cit-tools
 #
 # ── Push ─────────────────────────────────────────────────────────────
 #
-#   docker push harbor.mgt.newen.au/shared/base/alpine-cit-tools:3.20
+#   docker push harbor.example.com/shared/base/alpine-cit-tools:3.20
 #
 # Then set ALPINE_IMAGE in the GitLab project CI variables (or Bamboo
 # global variables) to that same ref. The install-tools block detects
@@ -32,7 +32,7 @@
 #
 #   ALPINE_BASE     base image to derive from. Default: alpine:3.20
 #                   On airgap rebuild, set this to your mirror, e.g.
-#                   --build-arg ALPINE_BASE=harbor.mgt.newen.au/docker-hub/library/alpine:3.20
+#                   --build-arg ALPINE_BASE=harbor.example.com/docker-hub/library/alpine:3.20
 #
 #   CRANE_VERSION   go-containerregistry release tag (no leading v).
 #   CRANE_URL       full URL to the crane tarball. Default: GitHub release.

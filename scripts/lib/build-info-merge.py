@@ -49,8 +49,6 @@ INCLUDE_PREFIXES = [
     "SBOM_", "VULN_SCAN_FILE",
     # Sinks
     "SPLUNK_", "DEPENDENCY_TRACK_",
-    # Runtime smoke
-    "RUNTIME_",
     # CI-injected
     "CI_", "GITLAB_", "GITHUB_", "BAMBOO_", "BUILD_",
     "RUNNER_", "JOB_", "PIPELINE_",

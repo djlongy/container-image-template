@@ -523,7 +523,7 @@ end_scenario
 
 scenario "scan-scripts-exist-and-parse"
 all_ok=1
-for s in syft-sbom xray-sbom xray-vuln grype-vuln trivy-vuln trivy-sbom runtime-smoke; do
+for s in syft-sbom xray-sbom xray-vuln grype-vuln trivy-vuln trivy-sbom; do
   if [ ! -f "scripts/scan/${s}.sh" ]; then
     FAILURES+=("${CURRENT_NAME}: scripts/scan/${s}.sh missing"); all_ok=0; continue
   fi
@@ -531,18 +531,8 @@ for s in syft-sbom xray-sbom xray-vuln grype-vuln trivy-vuln trivy-sbom runtime-
     FAILURES+=("${CURRENT_NAME}: scripts/scan/${s}.sh fails bash -n"); all_ok=0
   fi
 done
-[ "${all_ok}" -eq 1 ] && echo "all 7 scan scripts present + parse" > "${TMP_DIR}/out" \
+[ "${all_ok}" -eq 1 ] && echo "all 6 scan scripts present + parse" > "${TMP_DIR}/out" \
                        || echo "scan-scripts check: see failures" > "${TMP_DIR}/out"
-end_scenario
-
-scenario "runtime-smoke-fails-without-image-ref"
-# Strip IMAGE_REF/DIGEST from env + no build.env in scope → must fail loudly.
-[ -f build.env ] && mv build.env build.env.bak
-out=$(env -i HOME="$HOME" PATH="$PATH" ./scripts/scan/runtime-smoke.sh 2>&1) ; rc=$?
-[ -f build.env.bak ] && mv build.env.bak build.env
-echo "${out}" > "${TMP_DIR}/out"
-[ "${rc}" -ne 0 ] || FAILURES+=("${CURRENT_NAME}: expected non-zero exit when no IMAGE_REF/DIGEST")
-_must_contain "no IMAGE_DIGEST or IMAGE_REF available"
 end_scenario
 
 scenario "scan-scripts-source-artifact-names"
