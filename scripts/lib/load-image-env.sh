@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # scripts/lib/load-image-env.sh — single source of truth for image.env loading
 #
-# Sourced by every script that needs to read behavioural config:
-#   build.sh
-#   scan/xray-vuln.sh
-#   scan/xray-sbom.sh
-#   sbom-post.sh
+# Sourced by every script that needs to read behavioural config —
+# build.sh, every scan/* script, sbom-post.sh, etc. Add a new
+# script that needs config? Just `. scripts/lib/load-image-env.sh
+# && load_image_env` at the top.
 #
-# Provides three functions and one logging helper:
+# Provides:
 #
 #   _dbg <msg>            — print '[debug] msg' to stderr when
 #                           BUILD_DEBUG=true; otherwise no-op. Safe under
@@ -26,6 +25,10 @@
 #                           override image.env values; empty-set shell
 #                           vars don't (so a stray `VAR=` in the agent
 #                           env can't clobber the file value).
+#                           Snapshot list is AUTO-DERIVED from image.env
+#                           (greps `^[# ]*VAR=` patterns) plus a small
+#                           EXTRAS list for shell-only vars — adding a
+#                           new var to image.env is one-place edit.
 #
 # Centralising means each script self-loads its config — same precedence
 # everywhere, same debug logs everywhere, same "fail with clear hint"

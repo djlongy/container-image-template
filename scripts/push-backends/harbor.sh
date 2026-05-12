@@ -104,20 +104,25 @@ _harbor_write_build_env() {
 
   # SBOM_FILE / VULN_SCAN_FILE come from scripts/lib/artifact-names.sh
   # (sourced by build.sh before this backend ran). Writing them here
-  # propagates the canonical filenames to every downstream stage that
-  # does `. ./build.env`, so scan/ingest jobs never hardcode names.
+  # propagates the canonical filenames to every downstream stage.
+  #
+  # `export ` prefix is critical: without it, `. ./build.env` only
+  # creates SHELL vars that don't propagate to `bash ./script.sh`
+  # subshells. GitLab CI's dotenv injection still works either way
+  # (dotenv parses both forms), but local and Bamboo flows that
+  # source-then-spawn need the export.
   cat > build.env <<EOF
-IMAGE_REF=${target}
-IMAGE_TAG=${FULL_TAG}
-IMAGE_DIGEST=${digest_ref}
-IMAGE_NAME=${IMAGE_NAME}
-UPSTREAM_TAG=${UPSTREAM_TAG:-unknown}
-UPSTREAM_REF=${UPSTREAM_REF:-unknown}
-BASE_DIGEST=${BASE_DIGEST:-}
-GIT_SHA=${GIT_SHA:-unknown}
-CREATED=${CREATED:-}
-SBOM_FILE=${SBOM_FILE}
-VULN_SCAN_FILE=${VULN_SCAN_FILE}
+export IMAGE_REF=${target}
+export IMAGE_TAG=${FULL_TAG}
+export IMAGE_DIGEST=${digest_ref}
+export IMAGE_NAME=${IMAGE_NAME}
+export UPSTREAM_TAG=${UPSTREAM_TAG:-unknown}
+export UPSTREAM_REF=${UPSTREAM_REF:-unknown}
+export BASE_DIGEST=${BASE_DIGEST:-}
+export GIT_SHA=${GIT_SHA:-unknown}
+export CREATED=${CREATED:-}
+export SBOM_FILE=${SBOM_FILE}
+export VULN_SCAN_FILE=${VULN_SCAN_FILE}
 EOF
 }
 

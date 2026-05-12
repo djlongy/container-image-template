@@ -322,20 +322,25 @@ _artifactory_write_build_env() {
 
   # SBOM_FILE / VULN_SCAN_FILE come from scripts/lib/artifact-names.sh
   # (sourced by build.sh before this backend ran). Writing them here
-  # propagates the canonical filenames to every downstream stage that
-  # does `. ./build.env`, so scan/ingest jobs never hardcode names.
+  # propagates the canonical filenames to every downstream stage.
+  #
+  # `export ` prefix is critical: without it, `. ./build.env` only
+  # creates SHELL vars that don't propagate to `bash ./script.sh`
+  # subshells. GitLab CI's dotenv injection still works either way
+  # (dotenv parses both forms), but local and Bamboo flows that
+  # source-then-spawn need the export.
   cat > build.env <<EOF
-IMAGE_REF=${target}
-IMAGE_TAG=${IMAGE_TAG}
-IMAGE_DIGEST=${digest_ref}
-IMAGE_NAME=${IMAGE_NAME}
-UPSTREAM_TAG=${UPSTREAM_TAG:-unknown}
-UPSTREAM_REF=${UPSTREAM_REF:-unknown}
-BASE_DIGEST=${BASE_DIGEST:-}
-GIT_SHA=${GIT_SHA:-unknown}
-CREATED=${CREATED:-}
-SBOM_FILE=${SBOM_FILE}
-VULN_SCAN_FILE=${VULN_SCAN_FILE}
+export IMAGE_REF=${target}
+export IMAGE_TAG=${IMAGE_TAG}
+export IMAGE_DIGEST=${digest_ref}
+export IMAGE_NAME=${IMAGE_NAME}
+export UPSTREAM_TAG=${UPSTREAM_TAG:-unknown}
+export UPSTREAM_REF=${UPSTREAM_REF:-unknown}
+export BASE_DIGEST=${BASE_DIGEST:-}
+export GIT_SHA=${GIT_SHA:-unknown}
+export CREATED=${CREATED:-}
+export SBOM_FILE=${SBOM_FILE}
+export VULN_SCAN_FILE=${VULN_SCAN_FILE}
 EOF
 }
 
@@ -440,8 +445,9 @@ _artifactory_pro_publish_build_info() {
 }
 
 # Optional post-push Xray build scan. Toggled by
-# ARTIFACTORY_BUILD_XRAY_POSTSCAN (default true — preserves historical
-# behaviour). Same return-code contract as the pre-scan above:
+# ARTIFACTORY_BUILD_XRAY_POSTSCAN (default false — opt in only when
+# a Pro/Xray licence is provisioned). Same return-code contract as
+# the pre-scan above:
 #   0  clean / disabled / scanner unavailable / warn-mode violations
 #   1  strict-mode violations (caller propagates; image is already in
 #      Artifactory at this point — the failure gates promote/deploy)

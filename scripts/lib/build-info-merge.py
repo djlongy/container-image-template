@@ -32,16 +32,34 @@ import os
 import time
 
 
+# Prefixes whose matching env vars get included in build-info's
+# `properties.env.<name>` map sent to Artifactory. Keep this aligned
+# with the var families documented in image.env.example.
 INCLUDE_PREFIXES = [
-    "REGISTRY_KIND", "PUSH_REGISTRY", "PUSH_PROJECT",
-    "ARTIFACTORY_", "IMAGE_", "UPSTREAM_", "DISTRO", "REMEDIATE",
-    "INJECT_CERTS", "ORIGINAL_USER", "VENDOR", "PLATFORM",
-    "APK_MIRROR", "APT_MIRROR", "BASE_DIGEST", "GIT_SHA", "CREATED",
+    # Backend selectors + namespaces
+    "REGISTRY_KIND", "HARBOR_", "ARTIFACTORY_", "XRAY_",
+    # Image identity / OCI labels
+    "IMAGE_", "UPSTREAM_", "ORIGINAL_USER", "VENDOR", "AUTHORS",
+    "BASE_DIGEST", "GIT_SHA", "CREATED", "PLATFORM", "APPEND_GIT_SHORT",
+    # Cert sidecar
+    "CERT_BUILDER_IMAGE",
+    # Tool installs (versions + air-gap mirrors)
+    "CRANE_URL", "SYFT_", "GRYPE_", "TRIVY_", "JF_",
+    # Canonical artifact filenames
+    "SBOM_", "VULN_SCAN_FILE",
+    # Sinks
+    "SPLUNK_", "DEPENDENCY_TRACK_",
+    # Runtime smoke
+    "RUNTIME_",
+    # CI-injected
     "CI_", "GITLAB_", "GITHUB_", "BAMBOO_", "BUILD_",
     "RUNNER_", "JOB_", "PIPELINE_",
+    # Shell / OS context
     "USER", "HOME", "SHELL", "PWD", "PATH", "LANG",
     "HOSTNAME", "LOGNAME",
+    # Container runtime context
     "DOCKER_", "BUILDKIT",
+    # Source-control conventions
     "SOURCE", "TAG", "VCS_REF",
 ]
 # EXCLUDE wins over INCLUDE. Keep VAULT_* out of build-info: token + CA +

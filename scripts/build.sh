@@ -3,16 +3,23 @@
 #
 # Computes the pushed tag as <UPSTREAM_TAG>-<gitShort>, pulls the
 # upstream base digest for supply-chain labels, invokes
-# `docker build` with the full OCI label set, optionally pushes,
-# and emits build.env for downstream CI stages.
+# `docker build` with the full OCI label set, optionally pushes via
+# the selected backend, and emits build.env for downstream CI stages.
 #
 # Usage:
 #   ./scripts/build.sh            # build only, load into local daemon
-#   ./scripts/build.sh --push     # build + push to HARBOR_REGISTRY
+#   ./scripts/build.sh --push     # build + push via REGISTRY_KIND backend
 #
-# Required env (fail fast if any are missing on --push):
-#   HARBOR_REGISTRY       destination registry host
-#   HARBOR_PROJECT        destination project / path prefix
+# Required env when --push:
+#   REGISTRY_KIND         "harbor" (default) | "artifactory"
+#   then per-backend (validated by scripts/push-backends/<kind>.sh):
+#     harbor      → HARBOR_REGISTRY, HARBOR_PROJECT, HARBOR_USER, HARBOR_PASSWORD
+#     artifactory → ARTIFACTORY_URL, ARTIFACTORY_USER,
+#                   ARTIFACTORY_TOKEN | ARTIFACTORY_PASSWORD,
+#                   ARTIFACTORY_TEAM
+#   Each backend's require_env runs as a pre-flight in
+#   _build_validate_backend BEFORE docker build, so missing creds fail
+#   fast (~1s) instead of after a 30s+ docker build.
 #
 # Optional env (with defaults):
 #   UPSTREAM_REGISTRY   default: docker.io/library
