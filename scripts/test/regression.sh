@@ -500,13 +500,21 @@ _must_contain "SBOM_FILE=alt.json"
 _must_contain "VULN_SCAN_FILE=alt-vuln.json"
 end_scenario
 
-scenario "load-image-env-snapshot-includes-canonical-names"
-# Confirm the loader's snapshot list includes SBOM_FILE / VULN_SCAN_FILE
-# so a shell override survives the `. ./image.env` round-trip.
-grep -E '\bSBOM_FILE\b' scripts/lib/load-image-env.sh > "${TMP_DIR}/out"
-grep -E '\bVULN_SCAN_FILE\b' scripts/lib/load-image-env.sh >> "${TMP_DIR}/out"
-_must_contain "SBOM_FILE"
-_must_contain "VULN_SCAN_FILE"
+scenario "load-image-env-snapshot-preserves-canonical-names"
+# Confirm a shell-set override of SBOM_FILE / VULN_SCAN_FILE survives
+# the `. ./image.env` round-trip — a behavioural test (not a static
+# grep), so the loader can auto-derive its snapshot list from
+# image.env without breaking the test when the names move around.
+out=$(env -i HOME="$HOME" PATH="$PATH" \
+        SBOM_FILE="custom.cdx.json" \
+        VULN_SCAN_FILE="custom-vuln.json" \
+        BUILD_DEBUG=true \
+        ./scripts/build.sh --dry-run 2>&1)
+echo "${out}" > "${TMP_DIR}/out"
+# After load_image_env runs, the [debug] line confirms the shell
+# value was snapshotted and re-applied.
+_must_contain "shell-set override captured: SBOM_FILE"
+_must_contain "shell-set override captured: VULN_SCAN_FILE"
 end_scenario
 
 # ════════════════════════════════════════════════════════════════════

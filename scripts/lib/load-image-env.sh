@@ -98,44 +98,40 @@ load_image_env() {
     return 1
   fi
 
+  # ── Build the snapshot list ─────────────────────────────────────
+  # Auto-derive from image.env itself by grepping every line that
+  # mentions a `VAR=` (active or commented). That way ADDING A NEW
+  # VAR TO image.env IS A ONE-PLACE EDIT — no need to also update
+  # this loader. Only true for vars that exist in image.env (the
+  # one file actually sourced); image.env.example is a template
+  # only and is intentionally NOT scanned.
+  #
+  # Augmented with an EXTRAS list for vars that flow only via shell
+  # / CI (never appear in image.env as a `VAR=` line) but still need
+  # shell-precedence over file values when they DO get set:
+  #   - CA_CERT (CI-only secret)
+  #   - IMAGE_REF / IMAGE_DIGEST / IMAGE_TAG / UPSTREAM_REF
+  #     (build.env outputs / build.sh derived values)
+  #   - SBOM_SCAN_REF / TRIVY_SCAN_REF / TRIVY_SEVERITY_FILTER
+  #     (scan-time overrides documented in scan-script docstrings)
+  #   - XRAY_ARTIFACTORY_PASSWORD (alternative to TOKEN, masked CI var)
+  #   - XRAY_SCAN_FORMAT (scan-time override)
+  # Add to EXTRAS when a new var is ONLY set in shell/CI, never in image.env.
+  local __extras="CA_CERT \
+                  IMAGE_REF IMAGE_DIGEST IMAGE_TAG UPSTREAM_REF \
+                  SBOM_SCAN_REF TRIVY_SCAN_REF TRIVY_SEVERITY_FILTER \
+                  XRAY_ARTIFACTORY_PASSWORD XRAY_SCAN_FORMAT"
+
   local __v __line __SHELL_OVERRIDES=""
-  for __v in IMAGE_NAME \
-             UPSTREAM_REGISTRY UPSTREAM_IMAGE UPSTREAM_TAG UPSTREAM_REF \
-             ORIGINAL_USER \
-             HARBOR_REGISTRY HARBOR_PROJECT HARBOR_USER HARBOR_PASSWORD \
-             VENDOR AUTHORS BUILD_DEBUG \
-             CA_CERT \
-             REGISTRY_KIND \
-             ARTIFACTORY_URL ARTIFACTORY_USER ARTIFACTORY_PASSWORD ARTIFACTORY_TOKEN \
-             ARTIFACTORY_PRO ARTIFACTORY_PROJECT \
-             ARTIFACTORY_TEAM ARTIFACTORY_ENVIRONMENT ARTIFACTORY_PUSH_HOST \
-             ARTIFACTORY_IMAGE_REF ARTIFACTORY_MANIFEST_PATH \
-             ARTIFACTORY_BUILD_NAME ARTIFACTORY_BUILD_NUMBER ARTIFACTORY_PROPERTIES \
-             ARTIFACTORY_SBOM_REPO ARTIFACTORY_SBOM_ARCHIVE_REPO \
-             ARTIFACTORY_GRYPE_DB_REPO \
-             ARTIFACTORY_XRAY_FAIL_ON_VIOLATIONS \
-             ARTIFACTORY_BUILD_XRAY_PRESCAN ARTIFACTORY_BUILD_XRAY_POSTSCAN \
-             XRAY_ARTIFACTORY_URL XRAY_ARTIFACTORY_USER \
-             XRAY_ARTIFACTORY_PASSWORD XRAY_ARTIFACTORY_TOKEN \
-             XRAY_GENERATE_SBOM XRAY_SCAN_FORMAT \
-             XRAY_SCAN_REF SBOM_SCAN_REF XRAY_FAIL_ON_SEVERITY \
-             IMAGE_REF IMAGE_DIGEST IMAGE_TAG \
-             CRANE_URL CERT_BUILDER_IMAGE \
-             SYFT_INSTALLER_URL SYFT_VERSION \
-             GRYPE_INSTALLER_URL GRYPE_VERSION \
-             GRYPE_FAIL_ON_SEVERITY GRYPE_DB_MIRROR_SUBPATH \
-             TRIVY_VERSION TRIVY_INSTALLER_URL TRIVY_BINARY_URL \
-             TRIVY_FAIL_ON_SEVERITY TRIVY_SCAN_REF TRIVY_SEVERITY_FILTER \
-             JF_BINARY_URL JF_DEB_URL JF_RPM_URL JF_INSTALL_DIR \
-             SBOM_TARGET SBOM_FILE VULN_SCAN_FILE \
-             RUNTIME_SMOKE_SECONDS RUNTIME_SMOKE_HEALTHCHECK \
-             RUNTIME_HEALTH_TIMEOUT RUNTIME_SMOKE_LOGS RUNTIME_SMOKE_ENV \
-             APPEND_GIT_SHORT \
-             SBOM_WEBHOOK_URL SBOM_WEBHOOK_AUTH_HEADER \
-             DEPENDENCY_TRACK_URL DEPENDENCY_TRACK_API_KEY DEPENDENCY_TRACK_PROJECT \
-             SPLUNK_HEC_URL SPLUNK_HEC_TOKEN SPLUNK_HEC_INDEX \
-             SPLUNK_HEC_SOURCETYPE SPLUNK_SBOM_SOURCETYPE SPLUNK_HEC_INSECURE \
-             SPLUNK_SOURCE; do
+  local __known
+  __known=$(
+    {
+      grep -oE '^[# ]*[A-Z][A-Z0-9_]+=' image.env 2>/dev/null \
+        | sed -E 's/^[# ]*//; s/=$//'
+      printf '%s\n' ${__extras}
+    } | sort -u
+  )
+  for __v in ${__known}; do
     if [ -n "${!__v-}" ]; then
       __SHELL_OVERRIDES="${__SHELL_OVERRIDES}${__v}=$(printf '%q' "${!__v}")"$'\n'
       _dbg "shell-set override captured: ${__v}"
