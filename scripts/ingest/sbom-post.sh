@@ -104,7 +104,10 @@ load_image_env
 
 # Pull build.env if the build job exported one — gives sinks IMAGE_REF,
 # IMAGE_DIGEST, IMAGE_TAG, IMAGE_NAME, GIT_SHA for richer metadata.
-[ -f build.env ] && . ./build.env
+# build.env is dotenv-clean (no `export ` prefix — required so GitLab's
+# reports.dotenv parser accepts it), so wrap sourcing with set -a/set +a
+# to make each assignment auto-exported (subshells inherit it).
+[ -f build.env ] && { set -a; . ./build.env; set +a; }
 
 _TMP=$(mktemp -d)
 trap 'rm -rf "${_TMP}"' EXIT

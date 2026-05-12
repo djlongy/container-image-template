@@ -106,23 +106,26 @@ _harbor_write_build_env() {
   # (sourced by build.sh before this backend ran). Writing them here
   # propagates the canonical filenames to every downstream stage.
   #
-  # `export ` prefix is critical: without it, `. ./build.env` only
-  # creates SHELL vars that don't propagate to `bash ./script.sh`
-  # subshells. GitLab CI's dotenv injection still works either way
-  # (dotenv parses both forms), but local and Bamboo flows that
-  # source-then-spawn need the export.
+  # Plain KEY=VALUE — NO `export ` prefix. GitLab's dotenv parser
+  # (artifacts.reports.dotenv) rejects lines that start with `export `
+  # because it treats "export KEY" as the key name and fails on the
+  # space ("Key can contain only letters, digits and '_'").
+  # For bash subshell propagation (local + Bamboo), every consumer
+  # wraps `. ./build.env` with `set -a; ...; set +a` so each assignment
+  # auto-exports. GitLab dotenv-injects vars into downstream jobs as
+  # env automatically, so the `. ./build.env` is just belt-and-braces.
   cat > build.env <<EOF
-export IMAGE_REF=${target}
-export IMAGE_TAG=${FULL_TAG}
-export IMAGE_DIGEST=${digest_ref}
-export IMAGE_NAME=${IMAGE_NAME}
-export UPSTREAM_TAG=${UPSTREAM_TAG:-unknown}
-export UPSTREAM_REF=${UPSTREAM_REF:-unknown}
-export BASE_DIGEST=${BASE_DIGEST:-}
-export GIT_SHA=${GIT_SHA:-unknown}
-export CREATED=${CREATED:-}
-export SBOM_FILE=${SBOM_FILE}
-export VULN_SCAN_FILE=${VULN_SCAN_FILE}
+IMAGE_REF=${target}
+IMAGE_TAG=${FULL_TAG}
+IMAGE_DIGEST=${digest_ref}
+IMAGE_NAME=${IMAGE_NAME}
+UPSTREAM_TAG=${UPSTREAM_TAG:-unknown}
+UPSTREAM_REF=${UPSTREAM_REF:-unknown}
+BASE_DIGEST=${BASE_DIGEST:-}
+GIT_SHA=${GIT_SHA:-unknown}
+CREATED=${CREATED:-}
+SBOM_FILE=${SBOM_FILE}
+VULN_SCAN_FILE=${VULN_SCAN_FILE}
 EOF
 }
 

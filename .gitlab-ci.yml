@@ -290,7 +290,11 @@ syft-sbom-postscan:
   before_script:
     - *install-tools
   script:
-    - . ./build.env
+    # set -a wraps the sourcing so plain KEY=VALUE lines (dotenv-clean)
+    # auto-export into the spawned `bash ./scripts/...` subshell. GitLab
+    # also dotenv-injects these vars into the job env via reports.dotenv,
+    # so this is belt-and-braces (works without dotenv too).
+    - set -a; . ./build.env; set +a
     - bash ./scripts/scan/syft-sbom.sh
   artifacts:
     paths:
@@ -363,7 +367,7 @@ grype-vuln:
   before_script:
     - *install-tools
   script:
-    - . ./build.env
+    - set -a; . ./build.env; set +a
     # All install / DB-mirror / scan / severity-gate logic lives in the
     # script. Set GRYPE_FAIL_ON_SEVERITY="critical" (or "critical,high")
     # in image.env or a CI variable to make this a hard gate.
@@ -401,7 +405,7 @@ runtime-smoke:
     # registry helper handles both Harbor + Artifactory targets.
     - . ./scripts/lib/docker-login.sh && docker_login_for_xray_scan || true
   script:
-    - . ./build.env
+    - set -a; . ./build.env; set +a
     - bash ./scripts/scan/runtime-smoke.sh
   rules: *build-rules
   # Smoke is best-effort by default — flip to false when you want it
@@ -583,7 +587,7 @@ xray-sbom-postscan:
 #   before_script:
 #     - *install-tools
 #   script:
-#     - . ./build.env
+#     - set -a; . ./build.env; set +a
 #     - bash ./scripts/scan/trivy-vuln.sh
 #   artifacts:
 #     paths:
@@ -600,7 +604,7 @@ xray-sbom-postscan:
 #   before_script:
 #     - *install-tools
 #   script:
-#     - . ./build.env
+#     - set -a; . ./build.env; set +a
 #     - bash ./scripts/scan/trivy-sbom.sh
 #   artifacts:
 #     paths:
@@ -725,7 +729,7 @@ sbom-ingest:
   before_script:
     - *install-tools     # also sources image.env so sbom-post sees ARTIFACTORY_*, etc.
   script:
-    - . ./build.env
+    - set -a; . ./build.env; set +a
     - bash ./scripts/ingest/sbom-post.sh "${SBOM_FILE}"
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
